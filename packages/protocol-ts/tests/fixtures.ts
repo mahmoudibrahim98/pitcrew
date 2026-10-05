@@ -170,5 +170,47 @@ export const boardDraft: import('../index.ts').BoardDraft = {
   "state": "proposed",
   "workstream": "01J00000000000000000000000"
 };
+export const conversation: import('../index.ts').Conversation = {
+  "agent": "01J00000000000000000000000",
+  "engine": "claude",
+  "id": "01J00000000000000000000000",
+  "session": "01J00000000000000000000000",
+  "started": 42,
+  "turns": [
+    {
+      "answer": "DEMO-1 moved on in ses_01J00000000000000000000000.",
+      "asked": 42,
+      "ended": 12042,
+      "question": "What did my agents do today?",
+      "references": [
+        {
+          "label": "DEMO-1 Synthetic task",
+          "target": {
+            "id": "01J00000000000000000000000",
+            "key": "DEMO-1",
+            "kind": "task"
+          },
+          "text": "DEMO-1"
+        }
+      ],
+      "session": "01J00000000000000000000000",
+      "state": "answered",
+      "suggestions": [
+        {
+          "key": "DEMO-1",
+          "kind": "move_task",
+          "label": "Move DEMO-1 to review",
+          "task": "01J00000000000000000000000",
+          "to": "review"
+        }
+      ],
+      "usage": {
+        "answer_bytes": 52,
+        "duration_ms": 12000,
+        "tool_runs": 3
+      }
+    }
+  ]
+};
 export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };
 export const filteredImport: import('../index.ts').ImportFilter = { mode: 'filtered', since: '2026-01-01' };

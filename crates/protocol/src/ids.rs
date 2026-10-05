@@ -140,6 +140,10 @@ ulid_id!(
     /// A board draft: one agent drafting a workstream's board from its history.
     DraftId, "drf"
 );
+ulid_id!(
+    /// An Orchestrator conversation: a person's questions and the answers to them.
+    ConversationId, "cnv"
+);
 
 /// A short project key used in task keys, such as `CMP` in `CMP-104`.
 ///

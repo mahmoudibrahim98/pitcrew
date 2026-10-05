@@ -70,6 +70,19 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     pitcrew_protocol::board::StartDraft::export_all(&config)?;
     pitcrew_protocol::board::UsageEstimate::export_all(&config)?;
     pitcrew_protocol::ids::DraftId::export_all(&config)?;
+    // The Orchestrator (api-v1.md, "Orchestrator").
+    pitcrew_protocol::orchestrator::AnswerReference::export_all(&config)?;
+    pitcrew_protocol::orchestrator::AnswerSuggestion::export_all(&config)?;
+    pitcrew_protocol::orchestrator::AnswerUsage::export_all(&config)?;
+    pitcrew_protocol::orchestrator::Conversation::export_all(&config)?;
+    pitcrew_protocol::orchestrator::EngineStatus::export_all(&config)?;
+    pitcrew_protocol::orchestrator::Orchestrator::export_all(&config)?;
+    pitcrew_protocol::orchestrator::OrchestratorLimits::export_all(&config)?;
+    pitcrew_protocol::orchestrator::OrchestratorTurn::export_all(&config)?;
+    pitcrew_protocol::orchestrator::Question::export_all(&config)?;
+    pitcrew_protocol::orchestrator::ReferenceTarget::export_all(&config)?;
+    pitcrew_protocol::orchestrator::TurnState::export_all(&config)?;
+    pitcrew_protocol::ids::ConversationId::export_all(&config)?;
     api::ReadCursor::export_all(&config)?;
     api::MoveCursor::export_all(&config)?;
     api::Caller::export_all(&config)?;
@@ -368,6 +381,47 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
             reviewed: None,
             accepted: Vec::new(),
             rejected: Vec::new(),
+        },
+    )?;
+    // An Orchestrator conversation, its turn answered with a reference and a suggestion.
+    fixture(
+        &config,
+        &mut examples,
+        "conversation",
+        pitcrew_protocol::orchestrator::Conversation {
+            id: "01J00000000000000000000000".parse()?,
+            engine: model::Engine::Claude,
+            agent: "01J00000000000000000000000".parse()?,
+            started: 42,
+            session: Some("01J00000000000000000000000".parse()?),
+            turns: vec![pitcrew_protocol::orchestrator::OrchestratorTurn {
+                question: "What did my agents do today?".into(),
+                asked: 42,
+                session: "01J00000000000000000000000".parse()?,
+                state: pitcrew_protocol::orchestrator::TurnState::Answered,
+                answer: "DEMO-1 moved on in ses_01J00000000000000000000000.".into(),
+                references: vec![pitcrew_protocol::orchestrator::AnswerReference {
+                    text: "DEMO-1".into(),
+                    target: pitcrew_protocol::orchestrator::ReferenceTarget::Task {
+                        id: "01J00000000000000000000000".parse()?,
+                        key: "DEMO-1".parse()?,
+                    },
+                    label: "DEMO-1 Synthetic task".into(),
+                }],
+                suggestions: vec![pitcrew_protocol::orchestrator::AnswerSuggestion::MoveTask {
+                    task: "01J00000000000000000000000".parse()?,
+                    key: "DEMO-1".parse()?,
+                    to: model::TaskStatus::Review,
+                    label: "Move DEMO-1 to review".into(),
+                }],
+                usage: Some(pitcrew_protocol::orchestrator::AnswerUsage {
+                    duration_ms: 12_000,
+                    tool_runs: 3,
+                    answer_bytes: 52,
+                }),
+                ended: Some(12_042),
+                note: None,
+            }],
         },
     )?;
     // Request dimensions may be omitted even though Rust serializes their defaults.

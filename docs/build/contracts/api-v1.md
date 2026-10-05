@@ -22,15 +22,23 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
 - A WebSocket cannot set headers from a browser, so WebSocket routes take the token as a
   subprotocol: `Sec-WebSocket-Protocol: pitcrew.v1, pitcrew.bearer.<token>`. The server answers
   with `pitcrew.v1`.
-- Two scopes (`TokenScope`):
+- Three scopes (`TokenScope`):
   - `device`, a person's desktop: every route.
   - `agent`, an agent or hook: only routes marked **agent** below.
     - **Reads** on those routes see the whole workspace, so agents can coordinate.
     - **Writes** are limited to the agent's **own** tasks (it is the assignee, or holds the task's
       active dispatch) and its own sessions. A write on anything else is `403 forbidden`.
+  - `reader`, an agent that may only read: the Orchestrator's CLI (see "Orchestrator"). Only
+    `GET` and `HEAD` requests, on the routes marked **agent** or **read** below (`403` on the
+    others). **Every other request of a reader to a route is `403 forbidden`** before its body is
+    read: any `POST`, `PUT`, `PATCH` or `DELETE`, and any WebSocket upgrade (the stream,
+    terminals); as for anyone, a route or method that does not exist is `404`. Its reads see what
+    those routes show anyone. Reader tokens start `pcr_` (device `pcd_`, agent `pca_`), and name
+    an agent and its owner, as agent tokens do.
   - The hub stamps `author` (the caller) and, for agents, `on_behalf_of` (the owner) from the
-    token, never from the body.
-- Mock tokens: `dev-device-token` (acts as `@sam`) and `dev-agent-token` (acts as `@writer`).
+    token, never from the body. A reader never authors an event.
+- Mock tokens: `dev-device-token` (acts as `@sam`), `dev-agent-token` (acts as `@writer`) and
+  `dev-reader-token` (a reader acting as `@office`, for `@sam`).
 
 ## Errors
 
@@ -132,13 +140,13 @@ the task key (`PAP-4`).
 |---|---|---|
 | `GET /v1/host/info` | → `HostInfo` | No auth. Check `protocol_min ≤ yours ≤ protocol` before anything else. |
 | `GET /v1/me` | → `Member` | The token's member. **agent** `404` before setup (see below). |
-| `GET /v1/workspace` | → `{ "workspace": Workspace, "rev": u64, "setup_needed": bool }` | `rev` is the current event revision. `setup_needed` is `true` while the workspace has no person (a fresh hub); omitted means `false`. |
+| `GET /v1/workspace` | → `{ "workspace": Workspace, "rev": u64, "setup_needed": bool }` | `rev` is the current event revision. `setup_needed` is `true` while the workspace has no person (a fresh hub); omitted means `false`. **read** |
 | `POST /v1/setup` | `Setup` → `{ "workspace": Workspace, "me": Member, "machine": Machine }` | The first run (see below). Device tokens only. |
-| `GET /v1/machines` | → `Machine[]` | |
+| `GET /v1/machines` | → `Machine[]` | **read** |
 | `POST /v1/machines/{id}/scan` | → lines of `ScanFrame` (200) | Scans the machine's agent homes for onboarding. Device tokens only. See "Machine scan". |
 | `GET /v1/members` | → `Member[]` | **agent** |
-| `GET /v1/personas` | → `Persona[]` | |
-| `GET /v1/teams` | → `Team[]` | |
+| `GET /v1/personas` | → `Persona[]` | **read** |
+| `GET /v1/teams` | → `Team[]` | **read** |
 
 #### The first run: `POST /v1/setup`
 
@@ -180,11 +188,11 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 
 | Method and path | Body → response | Notes |
 |---|---|---|
-| `GET /v1/projects` | → `Project[]` | |
-| `GET /v1/projects/{id}` | → `Project` | |
+| `GET /v1/projects` | → `Project[]` | **read** |
+| `GET /v1/projects/{id}` | → `Project` | **read** |
 | `POST /v1/projects` | `NewProject` → `Project` (201) | See below. `409 conflict` if the key is in use. Emits `project_created`. |
-| `GET /v1/workstreams?project=` | → `Workstream[]` | |
-| `GET /v1/workstreams/{id}` | → `Workstream` | |
+| `GET /v1/workstreams?project=` | → `Workstream[]` | **read** |
+| `GET /v1/workstreams/{id}` | → `Workstream` | **read** |
 | `POST /v1/workstreams` | `NewWorkstream` → `Workstream` (201) | See below. `404 not_found` for an unknown project. Emits `workstream_created`. |
 | `PATCH /v1/workstreams/{id}` | `{ "status"?, "health"? }` → `Workstream` | Emits `workstream_changed`. |
 
@@ -304,8 +312,8 @@ another person's agent or one with no owner (explicit sharing may come later).
 
 | Method and path | Body → response | Notes |
 |---|---|---|
-| `GET /v1/sessions?machine=&workstream=&task=&state=` | → `Session[]` | |
-| `GET /v1/sessions/{id}` | → `Session` | |
+| `GET /v1/sessions?machine=&workstream=&task=&state=` | → `Session[]` | **read** |
+| `GET /v1/sessions/{id}` | → `Session` | **read** |
 | `GET /v1/sessions/{id}/transcript?before=&limit=` | → `TranscriptPage` | See "Transcript paging". |
 | `POST /v1/sessions` | `StartSession` → `Session` (202) | Starts a new session. Emits `session_discovered`. See below. |
 | `POST /v1/sessions/{id}/send` | `{ "text": String }` → 204 | Types text and presses Enter. |
@@ -387,9 +395,9 @@ when that visit began; arriving live events remain new until another visit.
 | `GET /v1/asks?to=&state=` | → `Ask[]` | The Inbox is `?to=<me>&state=open`. **agent** |
 | `POST /v1/asks` | `{ "kind", "to", "title", "body"?, "options"?, "task"?, "session"?, "receipts"? }` → `Ask` (201) | Emits `ask_raised`. **agent** |
 | `POST /v1/asks/{id}/answer` | `{ "option"?: usize, "text"?: String }` → `Ask` | See below. Emits `ask_answered`. **agent** |
-| `GET /v1/briefs` | → `Brief[]` | The briefs in force, each with its pending proposal in `proposal` when it has one. See "Briefs". |
+| `GET /v1/briefs` | → `Brief[]` | The briefs in force, each with its pending proposal in `proposal` when it has one. See "Briefs". **read** |
 | `PUT /v1/briefs/{project\|workstream}/{id}` | `{ "text", "next"?, "pinned" }` → `Brief` | A person's brief, or a proposal they accept. See "Briefs". Emits `brief_accepted`. |
-| `GET /v1/events?before=&limit=&project=&workstream=&task=&session=` | → `{ "events": Event[], "from_rev": u64, "to_rev": u64, "at_start": bool }` | See below. |
+| `GET /v1/events?before=&limit=&project=&workstream=&task=&session=` | → `{ "events": Event[], "from_rev": u64, "to_rev": u64, "at_start": bool }` | See below. **read** |
 
 **Briefs.** The brief in force for a project or workstream is the one its newest `brief_accepted`
 put there. Its **pending proposal** is the newest `brief_proposed` for that target, if it is newer
@@ -443,10 +451,10 @@ the previous page. Default limit 100, max 500;
 
 | Method and path | Body → response | Notes |
 |---|---|---|
-| `GET /v1/recaps/blocks?session=&task=&workstream=&project=&before=&limit=` | → `BlocksPage` | Activity blocks, newest first, each with its line. See "Recap blocks". |
-| `GET /v1/recaps/days?workstream=\|project=&tz=&before=&limit=` | → `DaysPage` | Day paragraphs, newest day first. See "Recap days". |
+| `GET /v1/recaps/blocks?session=&task=&workstream=&project=&before=&limit=` | → `BlocksPage` | Activity blocks, newest first, each with its line. See "Recap blocks". **read** |
+| `GET /v1/recaps/days?workstream=\|project=&tz=&before=&limit=` | → `DaysPage` | Day paragraphs, newest day first. See "Recap days". **read** |
 
-Both need a device token, like the activity log they summarise. The types are in
+Both need a device token (or a reader token), like the activity log they summarise. The types are in
 `crates/protocol/src/recap.rs`; the recap engine (`crates/recap`, stream F) computes them.
 
 **Recap types.**
@@ -758,6 +766,130 @@ Task[] }`.
 
 **The CLI**: `pitcrew board submit <draft>` reads the proposal's JSON on stdin, refuses one over
 32 KiB or that is not a JSON object before sending it, and posts it with the agent's token.
+
+### Orchestrator
+
+The Orchestrator panel answers a person's questions about their work across projects, sessions
+and machines (what each agent did today, what is blocked, where something was decided, which
+session touched a file), with links to what it used. **No API keys:** each question runs as a
+session of an agent CLI the person already uses (their choice of engine, remembered), started by
+the hub in a private scratch folder with a versioned prompt and a **reader** token (see "Transport
+and auth"): it finds things with the `pitcrew` CLI's read verbs and cannot change anything. **Any
+action comes back as a suggestion the person clicks.** Types: `crates/protocol/src/orchestrator.rs`.
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/orchestrator` | → `Orchestrator` | The caller's own: the engines, the remembered one, the bounds, and their conversations, newest first. |
+| `POST /v1/orchestrator/questions` | `Question` → `Conversation` (202) | A new conversation, or a follow-up in `conversation`. Emits `session_discovered` when it starts a session. |
+| `POST /v1/orchestrator/conversations/{id}/cancel` | → `Conversation` | Stops the answer under way: its CLI gets Esc. |
+| `DELETE /v1/orchestrator/conversations` | → 204 | Clears the caller's history, and ends their Orchestrator session. |
+
+All four are for device tokens only (`403` for agent and reader tokens), and see only the caller's
+own conversations: another person's are `404`. Ids in paths are bare ULIDs (`cnv_…` is accepted
+too). **The conversations are not events:** the hub keeps them per person in its state directory
+(`orchestrator.json`, private to its user), never on the stream or in the activity log, so a
+clear forgets them. Only the sessions that answer are in the log, as any session is.
+
+**`Orchestrator`**: `{ "engines": EngineStatus[], "engine"?: Engine, "limits": OrchestratorLimits,
+"conversations": Conversation[] }`.
+- `EngineStatus` is `{ "engine", "installed": bool }` for `claude`, `codex` and `opencode`:
+  whether that CLI is on the hub machine's `PATH`, where questions run. No engine installed is the
+  panel's "nothing to ask with" state, which points to signing in to an agent CLI. Whether a CLI
+  is signed in is not known here (PitCrew never reads a CLI's login): a CLI that waits for its
+  login or for its folder to be trusted shows it in its session's terminal.
+- `engine`: the engine the caller chose last for a new conversation, the next one's default
+  (absent before the first).
+- `OrchestratorLimits`: `{ "question_chars": 4000, "answer_bytes": 16384, "answer_seconds": 300,
+  "turns": 20, "conversations": 20 }`: the longest question, answer and wait, the most questions
+  in one conversation, and the most conversations kept (the oldest are forgotten first).
+
+**Asking** (`Question`: `{ "text", "engine"?: Engine, "conversation"?: ConversationId, "agent"?:
+MemberId }`), refusals first, with nothing changed:
+- `404` an unknown `conversation` (or another person's); `400` a malformed body, or a `text` that
+  is empty or over `question_chars` once control and hidden characters are dropped and it is
+  trimmed (a follow-up's line breaks become spaces: it is typed into the CLI);
+- `400` an unknown agent, a person as the agent, or none named when the caller has no back office
+  (`@office`, the default); `403` an agent the caller does not own;
+- `409` while one of the caller's answers is under way (one at a time: cancel it first), a
+  conversation at its `turns`, or an engine whose CLI is not installed (`installed: false`);
+- `503` when no session can start: no runner attached, the hub has no machine of its own, or it is
+  not live.
+
+Without `conversation` it is a new conversation, in `engine` (else the remembered one, else
+`claude`), which becomes the remembered one; the caller's other Orchestrator session ends first
+(one at a time per person). With `conversation` it is a follow-up in that conversation's engine
+(`engine` is ignored): if the conversation's session lives, the question is typed into it (the
+runner's `SendText`); if it has ended, a new session starts, whose prompt carries the
+conversation's last questions and answers (at most 6 KiB, cut and marked as data).
+
+A new session is stored first (`session_discovered`: title `Orchestrator`, state `starting`, the
+agent named, linked to nothing), then its CLI starts in the caller's scratch folder on the hub's
+own machine (`scratch/orchestrator-<member>` in the state directory: made if missing, private to
+the daemon's user) with the CLI's own default permission mode (never a persona's), and the prompt
+(`crates/office/prompts/orchestrator/v1.md`, `orchestrator/v1`: the workspace, the person, today's
+date, the read verbs, how to cite and how to suggest, then the question) as its first prompt. Its
+CLI gets a **reader** token for the agent and its owner (`PITCREW_TOKEN_FILE`:
+`agents/<agent>.reader.token`), as a dispatch's gets an agent token. For Claude Code the folder
+holds `.claude/settings.json`, which allows `pitcrew`'s read verbs and denies editing files and
+the web. A start the runner refuses or fails ends the session and answers as a dispatch does
+(`409`, `503` or `500`); the turn is then `failed`. The answer is `202` with the conversation, its
+new turn `answering`.
+
+**`Conversation`**: `{ "id", "engine", "agent", "started", "session"?: SessionId, "turns":
+OrchestratorTurn[] }`; `session` is the session that answers it while that lives (absent once it
+has ended). **`OrchestratorTurn`**: `{ "question", "asked", "session", "state": TurnState,
+"answer", "references": AnswerReference[], "suggestions": AnswerSuggestion[], "usage"?:
+AnswerUsage, "ended"?, "note"? }`.
+
+**The answer streams from the session's transcript.** The hub follows every answering turn about
+once a second: its `answer` is the assistant's text after the turn's prompt in the session's
+transcript (as `GET /v1/sessions/{id}/transcript` reads it), so far. `TurnState`:
+- `answering`, until one of:
+- `answered` at the transcript's turn end;
+- `too_long` once the answer passes `answer_bytes`: it is cut there, and the CLI gets Esc;
+- `timed_out` once `answer_seconds` have passed since it was asked: the CLI gets Esc;
+- `canceled` by a cancel;
+- `failed` when the session ends, or its start fails, first (`note` says why).
+
+`usage` (`AnswerUsage`, from the transcript, once the turn has ended): `{ "duration_ms",
+"tool_runs", "answer_bytes" }`: how long it took, the tools its CLI ran, and the answer's size.
+The panel shows it under each answer, and polls `GET /v1/orchestrator` about once a second while a
+turn answers.
+
+**References** are what an answer cites, found in its text and checked against the hub: a session
+as `ses_…`, a task as its key (`PAP-4`) or `tsk_…`, a workstream as `wst_…`, a project as
+`prj_…`, and a recap as `recap:wst_…` or `recap:prj_…`, with `@YYYY-MM-DD` for one day. Each
+known one, once (at most 50), is an `AnswerReference`: `{ "text", "target": ReferenceTarget,
+"label" }`, where `text` is the reference exactly as the answer has it, `label` a short name for
+it (a session's title, a task's key and title, a workstream's or project's name), and
+`ReferenceTarget` one of `{ "kind": "session", "id" }`, `{ "kind": "task", "id", "key" }`,
+`{ "kind": "workstream", "id", "project" }`, `{ "kind": "project", "id" }` and
+`{ "kind": "recap", "project", "workstream"?, "date"? }`. Unknown ones, sessions the import choice
+hides, and anything else stay text.
+
+**Suggestions** are the answer's lines `Suggestion: move <task> to <status>` and
+`Suggestion: open <reference>` (a list item's `- ` allowed before them), checked as references
+are; each one that holds (at most 10) is taken out of `answer` and becomes an `AnswerSuggestion`:
+`{ "kind": "move_task", "task", "key", "to": TaskStatus, "label" }` or `{ "kind": "open",
+"target": ReferenceTarget, "label" }`. Other lines stay text. **A suggestion does nothing by
+itself**: the panel shows it, and only the person's click acts, as the person, through the usual
+route (`POST /v1/tasks/{id}/move`, after they confirm) or by opening the page.
+
+**Cancel**: `404` unknown; `409` when no turn of it is answering; `503` when its CLI cannot be
+reached (nothing changes). Otherwise its CLI gets Esc and the turn is `canceled`.
+
+**Clear**: the caller's conversations are forgotten, and their Orchestrator session ends
+(`EndSession`, graceful). The remembered engine stays. The sessions stay in the log, and their
+transcripts in their CLI's own folder, as any session's do.
+
+**The CLI's read verbs** (all `GET`s; the reader token can do nothing else), each with `--json`:
+`pitcrew search <words…>` (projects, workstreams, tasks, sessions and recent recap lines whose
+text has every word), `pitcrew session list [--since today|<YYYY-MM-DD>] [--state …]
+[--workstream <id>] [--task <task>]`, `pitcrew session show <id>`, `pitcrew recap blocks
+[--session|--task|--workstream|--project <id>] [--limit <n>]`, `pitcrew recap days --workstream
+<id>|--project <id> [--limit <n>]`, `pitcrew activity [--session|--task|--workstream|--project
+<id>] [--limit <n>]`, and the existing `pitcrew task list` and `pitcrew task show`. Text output
+names things by the ids an answer cites (`ses_…`, `wst_…`, `prj_…`, task keys, `recap:…`).
 
 ## Live updates: `GET /v1/stream?since=<rev>` (WebSocket, device tokens)
 

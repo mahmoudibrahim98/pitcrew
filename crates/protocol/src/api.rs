@@ -68,7 +68,7 @@ pub struct HostInfo {
     pub capabilities: Vec<Capability>,
 }
 
-/// The two kinds of token (ADR-0006).
+/// The kinds of token (ADR-0006).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +77,10 @@ pub enum TokenScope {
     Device,
     /// An agent or hook. It is limited to agent verbs, for its owner's workspace.
     Agent,
+    /// An agent that may only read: the Orchestrator's CLI (api-v1.md, "Orchestrator"). `GET`s on
+    /// the routes marked **agent** or **read**, and nothing else: every other request is refused
+    /// before it reaches a route. Like an agent token, it names an agent and its owner.
+    Reader,
 }
 
 /// Machine-readable error codes.
@@ -145,6 +149,12 @@ impl Caller {
     #[must_use]
     pub fn is_person(&self) -> bool {
         self.scope == TokenScope::Device
+    }
+
+    /// Whether this caller may only read (a [`TokenScope::Reader`] token).
+    #[must_use]
+    pub fn reads_only(&self) -> bool {
+        self.scope == TokenScope::Reader
     }
 }
 
