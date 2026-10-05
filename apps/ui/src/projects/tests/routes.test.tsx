@@ -138,7 +138,7 @@ describe('the projects feature, wired into the shell', () => {
 
     fireEvent.click(screen.getByRole('radio', { name: 'Tasks' }));
     fireEvent.click(await screen.findByRole('button', { name: /Run seeds/ }));
-    const drawer = await screen.findByRole('dialog', { name: 'Run seeds' });
+    const drawer = await screen.findByRole('dialog', { name: /^Run seeds/ });
     expect(router.state.location.pathname).toBe(
       `/w/${WORKSPACE}/projects/${demo.paper}/workstreams/${demo.seedRuns}`,
     );
