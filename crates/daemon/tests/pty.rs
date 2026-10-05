@@ -534,7 +534,22 @@ fn start_claude(daemon: &Daemon, cwd: &str, token: &str) -> Value {
         }),
     );
     assert_eq!(reply.status, 202, "{}\n{}", reply.body, daemon.stderr());
-    reply.json()
+    let initial = reply.json();
+    assert!(initial["terminal"].is_string(), "{initial}");
+    let until = Instant::now() + WAIT;
+    loop {
+        let session = daemon
+            .get(
+                &format!("/v1/sessions/{}", initial["id"].as_str().unwrap()),
+                Some(token),
+            )
+            .json();
+        if session["native_id"].as_str().is_some_and(|s| !s.is_empty()) {
+            return session;
+        }
+        assert!(Instant::now() < until, "transcript adoption: {session}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A session's terminal.
@@ -1023,4 +1038,165 @@ fn a_missing_ptyd_means_no_runtime_and_a_clear_log_line() {
         "nothing made for the endpoint"
     );
     assert!(!tmp.path().join("nowhere").exists());
+}
+
+#[test]
+fn an_unnamed_start_without_a_prompt_answers_with_a_terminal_before_its_transcript() {
+    let Some(rig) = Rig::new("no-prompt") else {
+        return;
+    };
+    let gate = rig.bin.join("write-transcript");
+    if cfg!(windows) {
+        let path = rig.bin.join("claude.ps1");
+        let script = std::fs::read_to_string(&path).unwrap().replace("$dir = Join-Path", &format!("while (-not [IO.File]::Exists('{}')) {{ Start-Sleep -Milliseconds 50 }}\n$dir = Join-Path", gate.display()));
+        std::fs::write(path, script).unwrap();
+    } else {
+        let path = rig.bin.join("claude");
+        let script = std::fs::read_to_string(&path).unwrap().replace(
+            "dir=",
+            &format!(
+                "while [ ! -f '{}' ]; do sleep 0.05; done\ndir=",
+                gate.display()
+            ),
+        );
+        std::fs::write(path, script).unwrap();
+    }
+    let endpoint = rig.endpoint("new").to_str().unwrap().to_owned();
+    let mut daemon = rig.start(&["--demo", "--ptyd-endpoint", &endpoint]);
+    let token = daemon.device_token();
+    let options = daemon.get(
+        &format!("/v1/machines/{}/session-options", id::LAPTOP),
+        Some(&token),
+    );
+    assert_eq!(options.status, 200, "{}", options.body);
+    assert!(
+        options.json()["engines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["engine"] == "claude"
+                && e["permission_modes"] == json!(["default", "accept_edits", "plan"]))
+    );
+    let before = daemon.get("/v1/sessions", Some(&token)).json();
+    for (engine, mode) in [
+        ("codex", "plan"),
+        ("opencode", "accept_edits"),
+        ("claude", "bypass_permissions"),
+    ] {
+        let refused = daemon.post("/v1/sessions", Some(&token), &json!({"machine": id::LAPTOP, "engine": engine, "cwd": rig.work, "permission_mode": mode}));
+        assert_eq!(refused.status, 400, "{}", refused.body);
+    }
+    // Only the synthetic Claude CLI is installed in the rig. Options say whether Codex is absent.
+    if !options.json()["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["engine"] == "codex")
+    {
+        let refused = daemon.post(
+            "/v1/sessions",
+            Some(&token),
+            &json!({"machine": id::LAPTOP, "engine": "codex", "cwd": rig.work}),
+        );
+        assert_eq!(refused.status, 400, "{}", refused.body);
+        assert!(refused.body.contains("not installed"));
+    }
+    #[cfg(windows)]
+    for prompt in [
+        "line\nbreak",
+        "\"",
+        "%",
+        "!",
+        "^",
+        "&",
+        "|",
+        "<",
+        ">",
+        "(",
+        ")",
+    ] {
+        let refused = daemon.post(
+            "/v1/sessions",
+            Some(&token),
+            &json!({"machine": id::LAPTOP, "engine": "claude", "cwd": rig.work, "brief": prompt}),
+        );
+        assert_eq!(refused.status, 400, "{}", refused.body);
+        assert!(refused.body.contains("batch wrapper"));
+    }
+    assert_eq!(
+        daemon.get("/v1/sessions", Some(&token)).json(),
+        before,
+        "preflight leaves no sessions"
+    );
+    let start = daemon.post("/v1/sessions", Some(&token), &json!({"machine": id::LAPTOP, "engine": "claude", "cwd": rig.work, "title": "  A chosen title  "}));
+    assert_eq!(start.status, 202, "{}", start.body);
+    let session = start.json();
+    let id = session["id"].as_str().unwrap();
+    assert_eq!(session["native_id"], "");
+    assert_eq!(session["state"], "starting");
+    assert_eq!(session["title"], "A chosen title");
+    let terminal = terminal_of(&session);
+    assert!(
+        observer(&rig, Path::new(&endpoint))
+            .info(terminal)
+            .unwrap()
+            .alive
+    );
+    assert_eq!(
+        daemon
+            .post(
+                &format!("/v1/sessions/{id}/send"),
+                Some(&token),
+                &json!({"text":"first prompt"})
+            )
+            .status,
+        204
+    );
+    std::fs::write(&gate, b"go").unwrap();
+    let until = Instant::now() + WAIT;
+    loop {
+        let found = daemon
+            .get(&format!("/v1/sessions/{id}"), Some(&token))
+            .json();
+        if found["native_id"].as_str().is_some_and(|s| !s.is_empty()) {
+            assert_eq!(found["title"], "A chosen title");
+            assert_eq!(terminal_of(&found), terminal);
+            break;
+        }
+        assert!(Instant::now() < until, "{found}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for entry in std::fs::read_dir(rig.homes.join(".claude/projects/-tmp-pitcrew-work")).unwrap() {
+        let path = entry.unwrap().path();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(600)),
+            )
+            .unwrap();
+    }
+    daemon.stop();
+    let daemon = rig.start(&["--ptyd-endpoint", &endpoint]);
+    let found = daemon
+        .get(&format!("/v1/sessions/{id}"), Some(&token))
+        .json();
+    assert_eq!(
+        found["state"], "working",
+        "an old transcript's known live terminal survives restart: {found}"
+    );
+    assert_eq!(found["title"], "A chosen title");
+    assert_eq!(terminal_of(&found), terminal);
+    assert_eq!(
+        daemon
+            .post(
+                &format!("/v1/sessions/{id}/end"),
+                Some(&token),
+                &json!({"mode":"kill"})
+            )
+            .status,
+        204
+    );
 }

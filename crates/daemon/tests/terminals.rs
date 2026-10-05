@@ -750,7 +750,22 @@ done
             }),
         );
         assert_eq!(reply.status, 202, "{}\n{}", reply.body, daemon.stderr());
-        reply.json()
+        let initial = reply.json();
+        assert!(initial["terminal"].is_string(), "{initial}");
+        let until = Instant::now() + WAIT;
+        loop {
+            let session = daemon
+                .get(
+                    &format!("/v1/sessions/{}", initial["id"].as_str().unwrap()),
+                    Some(token),
+                )
+                .json();
+            if session["native_id"].as_str().is_some_and(|s| !s.is_empty()) {
+                return session;
+            }
+            assert!(Instant::now() < until, "transcript adoption: {session}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The windows of the server on `socket`: `<window id> <terminal tag> <name>`.
