@@ -1419,6 +1419,7 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'write_proposed':
       return { task: body.data.write.task };
     case 'write_started':
+    case 'write_retry_requested':
     case 'write_finished':
       return { task: body.data.task };
   }

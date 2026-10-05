@@ -148,11 +148,18 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   credential here.
 - **Outward writes** (`/v1/writes…`, `src/writes.ts`), by the daemon's rules: after every request
   that may change something, a pass proposes what a person's change implies upstream (an
-  `approval` ask from the integration's own sync member, with `write_proposed`), records a denial as not sent, and "sends" an approved or
-  retried write once. The fixtures' answer to its method and URL decides it (2xx sent, else failed
-  with that status; no exchange at all is a failure too). A sent write changes the mock's copy of
-  upstream, so the next sync agrees; a created issue becomes the task's source. Every request
-  "sent" is kept (`sentRequests`) for the tests.
+  `approval` ask from the integration's own sync member, with `write_proposed`; a title or
+  description only when upstream's is held exactly, labels as a change), records a denial as not
+  sent, and "sends" an approved write, or a failed one a person asked to retry
+  (`write_retry_requested`), once: it starts only from the integration's own member's approval
+  answered "Send" by a person; an edit, close or reopen is first checked against the issue's
+  fixture as upstream has it now (a change since sends nothing), and a retried create or comment
+  first looks for its earlier attempt; links are kept only on the integration's web origin. The
+  fixtures' answer to each method and URL decides it (2xx sent, else failed with that status; no
+  exchange at all is a failure too; a `since=` parameter is ignored, as the daemon's fixture
+  transport does). A sent write changes the mock's copy of upstream, so the next sync agrees; a
+  created issue becomes the task's source. Every request "sent", reads included, is kept
+  (`sentRequests`) for the tests.
 - **Terminals.** `GET /v1/sessions/{id}/terminal` replays a short ANSI screen, echoes keystrokes,
   accepts `{"type":"resize"}` and ignores unknown control types (malformed JSON closes with 1007),
   sends `{"type":"truncated"}` before the replay for sessions that ran over a day, and sends

@@ -1,8 +1,11 @@
-// API v1 "Outward writes: every one approved first", on both targets, over the recorded fixtures
-// in apps/mock-hub/fixtures (the daemon reads them with `--integration-fixtures`; its `gh` is the
-// runner's stand-in). Nothing reaches GitHub. Writes run in the background on the daemon, so the
-// suite polls for each outcome.
+// API v1 "Outward writes: every one approved first", on both targets, over the runner's copy of
+// the recorded fixtures in apps/mock-hub/fixtures (PITCREW_CONFORMANCE_FIXTURES; the daemon reads
+// it with `--integration-fixtures`, its `gh` the runner's stand-in), again for each request, so the
+// test changes what upstream says by adding a file that sorts first. Nothing reaches GitHub.
+// Writes run in the background on the daemon, so the suite polls for each outcome.
 import assert from 'node:assert/strict';
+import { renameSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { list, schemas } from './schema.mjs';
@@ -11,7 +14,8 @@ const base = process.env.PITCREW_CONFORMANCE_URL;
 const person = process.env.PITCREW_CONFORMANCE_PERSON;
 const agent = process.env.PITCREW_CONFORMANCE_AGENT;
 const second = process.env.PITCREW_CONFORMANCE_SECOND_PERSON;
-assert.ok(base && person && agent, 'Set PITCREW_CONFORMANCE_URL, _PERSON and _AGENT');
+const fixtures = process.env.PITCREW_CONFORMANCE_FIXTURES;
+assert.ok(base && person && agent && fixtures, 'Set PITCREW_CONFORMANCE_URL, _PERSON, _AGENT and _FIXTURES');
 const missing = '01J00000000000000000000000';
 
 async function call(path, { method = 'GET', body, token = person } = {}) {
@@ -54,6 +58,13 @@ async function pending(task) {
   assert.fail('no write was proposed');
 }
 const answer = (ask, option) => expect(200, `/v1/asks/${ask}/answer`, { method: 'POST', body: { option } });
+
+/** From now on, upstream answers `GET url` with `body`: a fixture file that sorts first. */
+const changed = join(fixtures, '0-writes.fixture');
+function upstreamSays(url, body) {
+  writeFileSync(`${changed}.tmp`, `GET ${url} HTTP/1.1\nAccept: application/json\n\nHTTP/1.1 200\n\n${JSON.stringify(body)}\n`);
+  renameSync(`${changed}.tmp`, changed);
+}
 
 test('outward writes: approved first, sent once, results recorded', { timeout: 180000 }, async () => {
   // Who may call.
@@ -147,9 +158,24 @@ test('outward writes: approved first, sent once, results recorded', { timeout: 1
   const failed = await until(comment.proposal.ask, (w) => w.state === 'failed', 'the comment did not fail');
   assert.equal(failed.result.status, 422);
   assert.equal(failed.attempts, 1);
+  // A retry is a person's logged request; before sending the comment again, the hub looks
+  // upstream for the earlier attempt (none here), so it is sent once more and fails again.
   const retried = await expect(202, `/v1/writes/${comment.proposal.ask}/retry`, { method: 'POST' });
   schemas.upstreamWrite(retried);
   await until(comment.proposal.ask, (w) => w.attempts === 2 && w.state === 'failed', 'the retry was not sent');
+  // As if the second attempt had reached GitHub though its answer was lost: the next retry finds
+  // it upstream and records it as sent, without commenting twice.
+  try {
+    upstreamSays('https://api.github.com/repos/example-org/demo-repo/issues/8/comments?per_page=100', [
+      { id: 702, body: 'Synthetic comment.', created_at: '2099-01-01T00:00:00Z', html_url: 'https://github.com/example-org/demo-repo/issues/8#issuecomment-702' },
+    ]);
+    await expect(202, `/v1/writes/${comment.proposal.ask}/retry`, { method: 'POST' });
+    const found = await until(comment.proposal.ask, (w) => w.state === 'sent', 'the earlier attempt was not found');
+    assert.equal(found.attempts, 3);
+    assert.equal(found.result.url, 'https://github.com/example-org/demo-repo/issues/8#issuecomment-702');
+  } finally {
+    rmSync(changed, { force: true });
+  }
 
   // The task's writes, and their events in its activity.
   const all = await expect(200, `/v1/writes?task=${task.id}`);
@@ -160,11 +186,11 @@ test('outward writes: approved first, sent once, results recorded', { timeout: 1
       ['create_issue', 'not_sent'],
       ['create_issue', 'sent'],
       ['close', 'sent'],
-      ['comment', 'failed'],
+      ['comment', 'sent'],
     ],
   );
   const failedOnly = await expect(200, `/v1/writes?task=${task.id}&state=failed&state=not_sent`);
-  assert.deepEqual(failedOnly.map((w) => w.state), ['not_sent', 'failed']);
+  assert.deepEqual(failedOnly.map((w) => w.state), ['not_sent']);
   const events = await expect(200, `/v1/events?limit=200`);
   schemas.events(events);
   const kinds = events.events
@@ -182,9 +208,15 @@ test('outward writes: approved first, sent once, results recorded', { timeout: 1
     'write_proposed',
     'write_started',
     'write_finished',
+    'write_retry_requested',
+    'write_started',
+    'write_finished',
+    'write_retry_requested',
     'write_started',
     'write_finished',
   ]);
+  const requested = events.events.filter((e) => e.body.type === 'write_retry_requested' && e.body.data.ask === comment.proposal.ask);
+  assert.ok(requested.every((e) => e.body.data.by === integration.added_by && e.author === integration.added_by));
 
   // An approval an agent raises itself sends nothing.
   const crafted = await expect(201, '/v1/asks', {

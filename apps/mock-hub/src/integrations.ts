@@ -100,9 +100,18 @@ function upstreamOf(hub: Hub): Upstream {
   return fixtures(state(hub).fixtures);
 }
 
-/** The recorded answer to `method url`, if the fixtures hold one now. */
+/**
+ * The recorded answer to `method url`, if the fixtures hold one now: its URL, else its URL without
+ * a `since=` parameter, as the daemon's fixture transport answers.
+ */
 export function exchange(hub: Hub, method: string, url: string): Exchange | undefined {
-  return upstreamOf(hub).get(`${method} ${url}`);
+  const upstream = upstreamOf(hub);
+  const exact = upstream.get(`${method} ${url}`);
+  if (exact !== undefined) return exact;
+  const [base, query] = url.split('?', 2);
+  if (query === undefined) return undefined;
+  const kept = query.split('&').filter((pair) => !pair.startsWith('since='));
+  return upstream.get(`${method} ${kept.length === 0 ? base : `${base}?${kept.join('&')}`}`);
 }
 
 function json(exchange: Exchange | undefined): unknown {
@@ -221,12 +230,20 @@ export function changeUpstream(hub: Hub, key: string, change: Overlay): void {
   map.set(key, { ...map.get(key), ...change });
 }
 
-function withOverlay(hub: Hub, item: Item): Item {
+/** `item` with what sent writes changed laid over it. */
+export function withOverlay(hub: Hub, item: Item): Item {
   const change = overlays.get(hub)?.get(item.key);
   if (change === undefined) return item;
   const out: Item = { ...item };
-  if (change.title !== undefined) out.title = change.title;
-  if (change.body !== undefined) out.body = change.body;
+  // What PitCrew sent is exactly what upstream then holds.
+  if (change.title !== undefined) {
+    out.title = change.title;
+    out.titleExact = true;
+  }
+  if (change.body !== undefined) {
+    out.body = change.body;
+    out.bodyExact = true;
+  }
   if (change.labels !== undefined) out.labels = [...change.labels].sort();
   if (change.parent !== undefined) out.parent = change.parent;
   if (change.open !== undefined) out.open = change.open;
@@ -627,6 +644,39 @@ export interface Item {
   open: boolean;
   /** Its milestone's or epic's key. */
   parent?: string;
+  /** Whether the hub holds `title` exactly as upstream has it (the daemon's `title_lossless`). */
+  titleExact: boolean;
+  /** Whether `body` is upstream's whole body or description (the daemon's `body_lossless`). */
+  bodyExact: boolean;
+}
+
+/** Whether `text` reaches the hub as is: nothing hidden to strip, and within `max` characters. */
+function exact(text: string, max: number): boolean {
+  return !HIDDEN.test(text) && [...text].length <= max;
+}
+
+/** ADF as PitCrew writes it: one paragraph of plain text per non-empty line. */
+export function adf(text: string): unknown {
+  return {
+    type: 'doc',
+    version: 1,
+    content: text
+      .split('\n')
+      .filter((l) => l.trim() !== '')
+      .map((l) => ({ type: 'paragraph', content: [{ type: 'text', text: l }] })),
+  };
+}
+
+/** The daemon's `description_is_lossless`: `text` is the whole description `raw`. */
+export function descriptionExact(raw: unknown, text: string): boolean {
+  if (raw === undefined || raw === null) return text === '';
+  if (typeof raw === 'string') return raw === text && exact(raw, 65_536);
+  return isRecord(raw) && JSON.stringify(adf(text)) === JSON.stringify(raw) && exact(text, 65_536);
+}
+
+/** The labels the hub holds of upstream's (the daemon's `fit_labels`). */
+export function heldLabels(labels: string[]): string[] {
+  return fitLabels(labels);
 }
 
 function fit(text: string, max: number): string {
@@ -643,7 +693,7 @@ function fitLabels(labels: string[]): string[] {
   return out;
 }
 
-function adfText(node: unknown, out: string[] = []): string[] {
+export function adfText(node: unknown, out: string[] = []): string[] {
   if (isRecord(node)) {
     if (typeof node['text'] === 'string') out.push(node['text']);
     if (Array.isArray(node['content'])) {
@@ -687,13 +737,16 @@ function readGithub(upstream: Upstream, settings: Extract<IntegrationSettings, {
       if (!isRecord(i) || i['pull_request'] !== undefined || typeof i['title'] !== 'string') continue;
       const milestone = isRecord(i['milestone']) ? `${repo}#milestone:${String(i['milestone']['number'])}` : undefined;
       const labels = Array.isArray(i['labels']) ? i['labels'].flatMap((l) => (isRecord(l) && typeof l['name'] === 'string' ? [l['name']] : [])) : [];
+      const body = typeof i['body'] === 'string' ? i['body'] : '';
       const item: Item = {
         key: `${repo}#${String(i['number'])}`,
         url: typeof i['html_url'] === 'string' ? i['html_url'] : `https://github.com/${repo}/issues/${String(i['number'])}`,
         title: i['title'],
-        body: typeof i['body'] === 'string' ? i['body'] : '',
+        body,
         labels: [...labels].sort(),
         open: i['state'] !== 'closed',
+        titleExact: exact(i['title'], 512) && fit(i['title'], 500) === i['title'],
+        bodyExact: exact(body, 65_536),
       };
       if (milestone !== undefined) item.parent = milestone;
       out.items.push(item);
@@ -740,6 +793,8 @@ function readJira(upstream: Upstream, settings: Extract<IntegrationSettings, { k
         body: description,
         labels: Array.isArray(f['labels']) ? f['labels'].filter((l): l is string => typeof l === 'string').sort() : [],
         open: category !== 'done',
+        titleExact: exact(summary, 512) && fit(summary, 500) === summary,
+        bodyExact: descriptionExact(f['description'], description),
       };
       if (isRecord(f['parent']) && typeof f['parent']['key'] === 'string') item.parent = f['parent']['key'];
       out.items.push(item);

@@ -432,6 +432,7 @@ export type EventBody =
     }
   | { type: 'write_proposed'; data: { write: WriteProposal } }
   | { type: 'write_started'; data: { ask: AskId; task?: TaskId; attempt: number } }
+  | { type: 'write_retry_requested'; data: { ask: AskId; task?: TaskId; by: MemberId } }
   | { type: 'write_finished'; data: { ask: AskId; task?: TaskId; result: WriteResult } };
 
 // ─── API (api.rs) ───────────────────────────────────────────────────────────────────────────────
@@ -794,7 +795,12 @@ export type CloseReason = 'completed' | 'not_planned';
 export interface WriteFields {
   title?: string;
   body?: string;
+  /** A new issue's whole label list; in `before`, upstream's labels as last read. */
   labels?: string[];
+  /** Labels an `update` adds; the issue's others are kept. */
+  add_labels?: string[];
+  /** Labels an `update` removes. */
+  remove_labels?: string[];
   milestone?: string;
   epic?: string;
   state?: IssueState;
@@ -830,6 +836,8 @@ export interface UpstreamWrite {
   answered_by?: MemberId;
   finished_at?: TimestampMs;
   result?: WriteResult;
+  /** The person whose retry waits to be sent. */
+  retry_requested_by?: MemberId;
 }
 
 /** The options of every approval ask: the first sends. */

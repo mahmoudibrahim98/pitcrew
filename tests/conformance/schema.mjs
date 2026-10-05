@@ -194,6 +194,8 @@ const writeFields = object({
   'title?': text,
   'body?': text,
   'labels?': list(text),
+  'add_labels?': list(text),
+  'remove_labels?': list(text),
   'milestone?': text,
   'epic?': text,
   'state?': enumeration('open', 'closed'),
@@ -227,6 +229,7 @@ const upstreamWrite = object({
   'answered_by?': id,
   'finished_at?': integer,
   'result?': writeResult,
+  'retry_requested_by?': id,
 });
 const eventData = {
   safety_changed: object({ settings: object({ permission_mode: enumeration("default", "plan", "accept_edits", "bypass_permissions"), back_office_enabled: bool, back_office_caps: object({ max_auto_accept_per_hour: integer }) }) }),
@@ -310,6 +313,7 @@ const eventData = {
   decision_recorded: object({ 'workstream?': id, text, 'why?': text, receipts: list(receipt) }),
   write_proposed: object({ write: writeProposal }),
   write_started: object({ ask: id, 'task?': id, attempt: integer }),
+  write_retry_requested: object({ ask: id, 'task?': id, by: id }),
   write_finished: object({ ask: id, 'task?': id, result: writeResult }),
 };
 const eventBody = (v) => {

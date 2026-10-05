@@ -106,8 +106,11 @@ agent (`403`), unknown ids `404`, malformed requests `400`; a hub task in a work
 milestone 2 that asks to create an issue (an `approval` ask with exactly what will be sent),
 denied (recorded as not sent, never started), asked again and approved (sent once; the new issue
 `#8` becomes the task's source; a second create is `409`); a move to `done` that the hub turns into
-a proposal to close the issue, approved and sent; a comment upstream refuses (`422` in the
-fixtures), failed, and a retry that sends it once more; a retry by a person the ask is not
-addressed to (`403`) and of a sent write (`409`); the task's writes and their events in order; and
-an approval ask an agent raised itself, which proposes nothing. The daemon sends writes in the
+a proposal to close the issue, approved and sent (after reading the issue as upstream has it
+now); a comment upstream refuses (`422` in the fixtures), failed, and a retry (a logged
+`write_retry_requested`) that looks upstream for the earlier attempt, finds none and sends it once
+more; then, with the fixture copy saying the comment is there after all, a second retry that finds
+it and records it as sent without commenting again; a retry by a person the ask is not addressed
+to (`403`) and of a sent write (`409`); the task's writes and their events in order; and an
+approval ask an agent raised itself, which proposes nothing. The daemon sends writes in the
 background, so the test polls for each outcome.
