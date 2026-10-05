@@ -591,7 +591,9 @@ check('brief edit/read', async () => {
   );
 });
 check('events backwards pagination/revision bounds', async () => {
-  const newest = await api('/v1/events', 200, schemas.events);
+  // Compare the complete seed + edit history, beyond the default 100-event page.
+  const newest = await api('/v1/events?limit=500', 200, schemas.events);
+  assert.equal(newest.at_start, true);
   let page = await api('/v1/events?limit=1', 200, schemas.events);
   const ids = [];
   let before = Infinity;

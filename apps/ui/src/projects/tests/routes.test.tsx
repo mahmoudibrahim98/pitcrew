@@ -120,7 +120,7 @@ describe('the projects feature, wired into the shell', () => {
     expect((await screen.findAllByText('@sam')).length).toBeGreaterThan(1);
   });
 
-  it('opens a project with tabs, then a workstream, then a task — each with its own URL', async () => {
+  it('opens a project, a workstream, a task drawer, then the full task URL', async () => {
     const router = renderApp(`/w/${WORKSPACE}/projects/${demo.paper}`);
     await heading('Paper · Diffusion study');
     expect(router.state.location.pathname).toBe(`/w/${WORKSPACE}/projects/${demo.paper}`);
@@ -138,6 +138,11 @@ describe('the projects feature, wired into the shell', () => {
 
     fireEvent.click(screen.getByRole('radio', { name: 'Tasks' }));
     fireEvent.click(await screen.findByRole('button', { name: /Run seeds/ }));
+    const drawer = await screen.findByRole('dialog', { name: 'Run seeds' });
+    expect(router.state.location.pathname).toBe(
+      `/w/${WORKSPACE}/projects/${demo.paper}/workstreams/${demo.seedRuns}`,
+    );
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Open full page' }));
     await heading(/^PAP-4 · Run seeds/);
     // `openTask` takes the task's id (every component calls it that way); the route resolves by
     // either id or key — see `task-page.tsx` and `src/shell/paths.ts`, `task(ws, task)`.
