@@ -250,3 +250,8 @@ machines return 503. Session start accepts and validates an optional title and r
 synthetic terminal without waiting for a transcript, matching the real daemon's launch flow.
 
 Onboarding hooks use synthetic in-memory configuration text, person/machine-bound previews, stale refusal and idempotent confirmation. The mock never opens agent homes. Device-only safety read/save validates the same settings as the daemon and appends `safety_changed` on change.
+
+Session starts apply the workspace safety default when permission mode is omitted, reject raw
+title controls before trimming, refuse non-local machines with 503, and link an explicit
+workstream immediately (manual basis). Session options include first-prompt constraints; the
+synthetic Unix CLIs have none.

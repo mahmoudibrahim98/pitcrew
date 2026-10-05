@@ -15,6 +15,8 @@ const MAX_STATUS_CHARS: usize = 120;
 
 /// A quiet active state gets at most five minutes of transcript/hook evidence.
 pub(crate) const ACTIVE_LEASE_MS: TimestampMs = 5 * 60 * 1000;
+/// Tool runs and permission decisions can be quiet for much longer than streamed output.
+pub(crate) const WAIT_LEASE_MS: TimestampMs = 60 * 60 * 1000;
 
 pub(crate) fn active_until(facts: &Facts, modified: TimestampMs) -> Option<TimestampMs> {
     matches!(
@@ -22,9 +24,13 @@ pub(crate) fn active_until(facts: &Facts, modified: TimestampMs) -> Option<Times
         SessionState::Working | SessionState::Waiting | SessionState::Starting
     )
     .then(|| {
-        modified
-            .max(facts.reported_at.unwrap_or(0))
-            .saturating_add(ACTIVE_LEASE_MS)
+        modified.max(facts.reported_at.unwrap_or(0)).saturating_add(
+            if facts.state == SessionState::Waiting || !facts.open_calls.is_empty() {
+                WAIT_LEASE_MS
+            } else {
+                ACTIVE_LEASE_MS
+            },
+        )
     })
 }
 
@@ -424,7 +430,7 @@ fn relative_to(path: &str, cwd: Option<&str>) -> String {
 mod tests {
     use super::*;
 
-    fn use_(offset: u64, id: &str, tool: &str) -> TranscriptItem {
+    pub(super) fn use_(offset: u64, id: &str, tool: &str) -> TranscriptItem {
         TranscriptItem::ToolUse {
             at: 1,
             call_id: id.into(),
@@ -435,7 +441,7 @@ mod tests {
         }
     }
 
-    fn result(offset: u64, id: &str, is_error: bool) -> TranscriptItem {
+    pub(super) fn result(offset: u64, id: &str, is_error: bool) -> TranscriptItem {
         TranscriptItem::ToolResult {
             at: 2,
             call_id: id.into(),
@@ -445,7 +451,7 @@ mod tests {
         }
     }
 
-    fn run_with(facts: &mut Facts, items: &[TranscriptItem]) -> Vec<Derived> {
+    pub(super) fn run_with(facts: &mut Facts, items: &[TranscriptItem]) -> Vec<Derived> {
         let mut out = Vec::new();
         let ctx = Ctx {
             session: SessionId::new(),
@@ -745,8 +751,43 @@ mod tests {
 mod liveness_tests {
     use super::*;
     #[test]
+    fn quiet_tools_and_waiting_have_one_hour_but_completed_tools_return_to_five_minutes() {
+        let now = WAIT_LEASE_MS * 2;
+        let mut tools = Facts::default();
+        super::tests::run_with(&mut tools, &[super::tests::use_(0, "call", "Bash")]);
+        assert_eq!(
+            expire(&mut tools, now - WAIT_LEASE_MS + 1, false, now),
+            None
+        );
+        let mut persisted: Facts =
+            serde_json::from_str(&serde_json::to_string(&tools).unwrap()).unwrap();
+        assert_eq!(
+            expire(&mut persisted, now - WAIT_LEASE_MS, false, now),
+            Some(SessionState::Working)
+        );
+        super::tests::run_with(&mut tools, &[super::tests::result(1, "call", false)]);
+        assert!(tools.open_calls.is_empty());
+        assert_eq!(
+            expire(&mut tools, now - ACTIVE_LEASE_MS, false, now),
+            Some(SessionState::Working)
+        );
+        let mut waiting = Facts {
+            state: SessionState::Waiting,
+            ..Facts::default()
+        };
+        assert_eq!(
+            expire(&mut waiting, now - WAIT_LEASE_MS + 1, false, now),
+            None
+        );
+        assert_eq!(
+            expire(&mut waiting, now - WAIT_LEASE_MS, false, now),
+            Some(SessionState::Waiting)
+        );
+    }
+
+    #[test]
     fn leases_use_writes_hooks_and_live_terminals_without_inventing_activity() {
-        let now = 1_800_000;
+        let now = 7_200_000;
         for state in [
             SessionState::Working,
             SessionState::Waiting,
@@ -777,7 +818,16 @@ mod liveness_tests {
             let mut restarted: Facts =
                 serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
             assert_eq!(
-                expire(&mut restarted, now - ACTIVE_LEASE_MS, false, now),
+                expire(
+                    &mut restarted,
+                    now - if state == SessionState::Waiting {
+                        WAIT_LEASE_MS
+                    } else {
+                        ACTIVE_LEASE_MS
+                    },
+                    false,
+                    now
+                ),
                 Some(state)
             );
             assert_eq!(restarted.state, SessionState::Idle);

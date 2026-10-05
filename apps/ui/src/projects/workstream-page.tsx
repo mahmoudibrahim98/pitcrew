@@ -84,7 +84,7 @@ export function WorkstreamPage() {
           <h1 className="text-2xl font-semibold">{workstream?.name ?? 'Loading…'}</h1>
           {workstream !== undefined && (
             <>
-              <StartSessionButton locations={workstream.locations} />
+              <StartSessionButton workstream={workstream.id} locations={workstream.locations} />
               <StatusPill tone={WORKSTREAM_STATUS[workstream.status].tone}>
                 {WORKSTREAM_STATUS[workstream.status].label}
               </StatusPill>

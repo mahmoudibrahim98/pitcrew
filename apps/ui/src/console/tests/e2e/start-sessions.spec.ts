@@ -16,12 +16,14 @@ for (const entry of ['new', 'list', 'workstream']) {
     expect(options.status()).toBe(200);
     expect((await options.json()).engines.some((e: { engine: string }) => e.engine === 'claude')).toBe(true);
     let path = `/w/${ws}/console`;
+    let workstream: string | undefined;
     if (entry === 'workstream') {
       const created = await request.post(`${HUB_URL}/v1/workstreams`, { headers, data: {
         project, name: `Synthetic session launch ${Date.now()}`, locations: [{ machine: machine.id, path: cwd }],
       } });
       expect(created.status()).toBe(201);
-      path = `/w/${ws}/projects/${project}/workstreams/${(await created.json()).id}`;
+      workstream = (await created.json()).id;
+      path = `/w/${ws}/projects/${project}/workstreams/${workstream}`;
     }
     await page.goto(path);
     if (entry === 'new') {
@@ -40,6 +42,10 @@ for (const entry of ['new', 'list', 'workstream']) {
     const session = await started.json();
     try {
       expect(session.terminal).toBeTruthy();
+      if (workstream !== undefined) {
+        expect(session.workstream).toBe(workstream);
+        expect(session.link_basis).toBe('manual');
+      }
       await expect(page).toHaveURL(new RegExp(`/console/${session.id}\\?view=terminal$`));
       await expect(page.getByRole('radio', { name: 'Terminal', exact: true })).toBeChecked();
       const found = await request.get(`${HUB_URL}/v1/sessions/${session.id}`, { headers });

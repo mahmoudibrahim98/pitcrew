@@ -1080,6 +1080,8 @@ check('session launch options are machine-scoped and person-only', async () => {
   for (const e of options.engines) {
     assert.ok(['claude', 'codex', 'opencode'].includes(e.engine));
     assert.ok(e.permission_modes.includes('default'));
+    assert.ok(Array.isArray(e.first_prompt_forbidden));
+    assert.ok(e.first_prompt_forbidden.every((c) => typeof c === 'string' && [...c].length === 1));
     assert.ok(!e.permission_modes.includes('bypass_permissions'));
     if (e.engine === 'codex') assert.ok(!e.permission_modes.includes('plan'));
     if (e.engine === 'opencode') assert.deepEqual(e.permission_modes, ['default']);
@@ -1098,4 +1100,60 @@ check('unnamed start returns a terminal without waiting for a transcript', async
   const found = await api(`/v1/sessions/${session.id}`, 200, schemas.session);
   assert.equal(found.terminal, session.terminal);
   await api(`/v1/sessions/${session.id}/end`, 204, undefined, { method:'POST', body:{mode:'kill'} });
+});
+
+check('invalid launch preflight leaves no sessions and saved safety is applied', async () => {
+  const machines = await api('/v1/machines');
+  const machine = machines.find((m) => m.kind === 'local').id;
+  const cwd = process.env.PITCREW_FILES_ROOT;
+  const before = (await api('/v1/sessions')).map((s) => s.id).sort();
+  for (const body of [
+    { machine, cwd, engine: 'codex', permission_mode: 'plan' },
+    { machine, cwd, engine: 'opencode', permission_mode: 'accept_edits' },
+    { machine, cwd, engine: 'claude', permission_mode: 'bypass_permissions' },
+    ...['\nTitle', 'Title\r', '\tTitle', 'Title\u0085'].map((title) => ({ machine, cwd, engine: 'claude', title })),
+  ]) await api('/v1/sessions', 400, undefined, { method: 'POST', body });
+  const remote = machines.find((m) => m.kind !== 'local');
+  if (remote) await api('/v1/sessions', 503, undefined, { method: 'POST', body: { machine: remote.id, engine: 'claude', cwd } });
+  const original = await api('/v1/safety');
+  const { saved: _saved, ...settings } = original;
+  try {
+    await api('/v1/safety', 200, undefined, { method: 'PUT', body: { ...settings, permission_mode: 'plan' } });
+    await api('/v1/sessions', 400, undefined, { method: 'POST', body: { machine, cwd, engine: 'codex' } });
+  } finally {
+    await api('/v1/safety', 200, undefined, { method: 'PUT', body: settings });
+  }
+  assert.deepEqual((await api('/v1/sessions')).map((s) => s.id).sort(), before);
+});
+
+check('two person starts without prompts share a folder and have different terminals', async () => {
+  const machine = (await api('/v1/machines')).find((m) => m.kind === 'local').id;
+  const body = { machine, cwd: process.env.PITCREW_FILES_ROOT, engine: 'codex', permission_mode: 'default' };
+  const started = [];
+  try {
+    for (let i = 0; i < 2; i++) started.push(await api('/v1/sessions', 202, schemas.session, { method: 'POST', body }));
+    assert.notEqual(started[0].id, started[1].id);
+    assert.notEqual(started[0].terminal, started[1].terminal);
+  } finally {
+    for (const session of started) await api(`/v1/sessions/${session.id}/end`, 204, undefined, { method: 'POST', body: { mode: 'kill' } });
+  }
+});
+
+check('a workstream start is linked before transcript discovery on both hubs', async () => {
+  const machine = (await api('/v1/machines')).find((m) => m.kind === 'local').id;
+  const workstream = await api('/v1/workstreams', 201, schemas.workstream, { method: 'POST', body: {
+    project: context.project.id, name: 'Synthetic start link', locations: [],
+  } });
+  const session = await api('/v1/sessions', 202, schemas.session, { method: 'POST', body: {
+    machine, engine: 'claude', cwd: process.env.PITCREW_FILES_ROOT, workstream: workstream.id, permission_mode: 'default',
+  } });
+  try {
+    assert.equal(session.workstream, workstream.id);
+    assert.equal(session.link_basis, 'manual');
+    const found = await api(`/v1/sessions/${session.id}`, 200, schemas.session);
+    assert.equal(found.workstream, workstream.id);
+    assert.equal(found.link_basis, 'manual');
+  } finally {
+    await api(`/v1/sessions/${session.id}/end`, 204, undefined, { method: 'POST', body: { mode: 'kill' } });
+  }
 });

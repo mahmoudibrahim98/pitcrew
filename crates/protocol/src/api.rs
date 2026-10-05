@@ -33,6 +33,8 @@ pub struct SessionEngine {
     pub engine: crate::model::Engine,
     /// Modes supported by this engine and allowed by this runner.
     pub permission_modes: Vec<crate::model::PermissionMode>,
+    /// Characters a first prompt cannot pass through this installed CLI's wrapper.
+    pub first_prompt_forbidden: Vec<String>,
 }
 
 /// The revision a person has read in a workspace, project or workstream.

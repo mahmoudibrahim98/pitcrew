@@ -130,3 +130,7 @@ it and records it as sent without commenting again; a retry by a person the ask 
 to (`403`) and of a sent write (`409`); the task's writes and their events in order; and an
 approval ask an agent raised itself, which proposes nothing. The daemon sends writes in the
 background, so the test polls for each outcome.
+
+Start-session review coverage also checks raw-title controls before trimming, non-local starts,
+preflight refusals leaving no sessions, omitted mode using saved safety, supported prompt limits,
+and two no-prompt person starts sharing a folder with distinct terminals.

@@ -996,9 +996,9 @@ const sessionOptions: Handler = (hub, ctx) => {
   if (machine === undefined) throw notFound('No such machine.');
   if (machine.kind !== 'local' || machine.liveness !== 'live') throw unavailable('This machine has no reachable session terminal runtime.');
   return ok({ platform: 'unix', engines: [
-    { engine: 'claude', permission_modes: ['default', 'accept_edits', 'plan'] },
-    { engine: 'codex', permission_modes: ['default', 'accept_edits'] },
-    { engine: 'opencode', permission_modes: ['default'] },
+    { engine: 'claude', permission_modes: ['default', 'accept_edits', 'plan'], first_prompt_forbidden: [] },
+    { engine: 'codex', permission_modes: ['default', 'accept_edits'], first_prompt_forbidden: [] },
+    { engine: 'opencode', permission_modes: ['default'], first_prompt_forbidden: [] },
   ] });
 };
 
@@ -1019,11 +1019,16 @@ const startSession: Handler = (hub, ctx) => {
   const brief = fields.optString('brief');
   // Checked for the contract's sake; a session does not record them.
   fields.optString('model');
-  const mode = fields.optEnum('permission_mode', PERMISSION_MODES) ?? 'default';
+  const mode = fields.optEnum('permission_mode', PERMISSION_MODES) ?? hub.onboarding.safety.permission_mode;
   if ((engine === 'codex' && mode === 'plan') || (engine === 'opencode' && mode !== 'default') || mode === 'bypass_permissions') throw invalid('This permission mode is not allowed on this runner.');
-  const title = fields.optString('title')?.trim();
-  if (title !== undefined && (title.length === 0 || [...title].length > 200 || /[\u0000-\u001f\u007f]/u.test(title))) throw invalid('title must be 1–200 characters without control characters.');
+  const rawTitle = fields.optString('title');
+  const title = rawTitle?.trim();
+  if (rawTitle !== undefined && (rawTitle.trim().length === 0 || [...rawTitle.trim()].length > 200 || /[\u0000-\u001f\u007f-\u009f]/u.test(rawTitle))) throw invalid('title must be 1–200 characters without control characters.');
+  if (machine.kind !== 'local') throw unavailable('This hub cannot start a session on another machine.');
   requireLive(machine);
+  const workstreamId = fields.optString('workstream');
+  const selectedStream = workstreamId === undefined ? undefined : known(hub.findWorkstream(workstreamId), 'No such workstream.');
+  if (task !== undefined && selectedStream !== undefined && task.workstream !== selectedStream.id) throw invalid('The task is not in this workstream.');
   const folder = task === undefined ? workstreamByFolder(hub, machine.id, cwd) : undefined;
   const session = createSession(hub, {
     engine,
@@ -1031,9 +1036,9 @@ const startSession: Handler = (hub, ctx) => {
     cwd,
     title: title ?? task?.title,
     agent: agent?.id,
-    workstream: task?.workstream ?? folder?.id,
+    workstream: selectedStream?.id ?? task?.workstream ?? folder?.id,
     task: task?.id,
-    link_basis: task !== undefined ? 'manual' : folder !== undefined ? 'folder' : undefined,
+    link_basis: selectedStream !== undefined || task !== undefined ? 'manual' : folder !== undefined ? 'folder' : undefined,
     brief,
   });
   announceSession(hub, session);

@@ -839,9 +839,10 @@ export interface BriefEdit {
 
 export interface SessionOptions {
   platform: 'windows' | 'unix';
-  engines: { engine: Engine; permission_modes: PermissionMode[] }[];
+  engines: { engine: Engine; permission_modes: PermissionMode[]; first_prompt_forbidden?: string[] }[];
 }
 export interface StartSession {
+  workstream?: WorkstreamId;
   machine: MachineId;
   engine: Engine;
   cwd: string;

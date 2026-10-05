@@ -1077,6 +1077,57 @@ fn an_unnamed_start_without_a_prompt_answers_with_a_terminal_before_its_transcri
             .any(|e| e["engine"] == "claude"
                 && e["permission_modes"] == json!(["default", "accept_edits", "plan"]))
     );
+    let before = daemon.get("/v1/sessions", Some(&token)).json();
+    for (engine, mode) in [
+        ("codex", "plan"),
+        ("opencode", "accept_edits"),
+        ("claude", "bypass_permissions"),
+    ] {
+        let refused = daemon.post("/v1/sessions", Some(&token), &json!({"machine": id::LAPTOP, "engine": engine, "cwd": rig.work, "permission_mode": mode}));
+        assert_eq!(refused.status, 400, "{}", refused.body);
+    }
+    // Only the synthetic Claude CLI is installed in the rig. Options say whether Codex is absent.
+    if !options.json()["engines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["engine"] == "codex")
+    {
+        let refused = daemon.post(
+            "/v1/sessions",
+            Some(&token),
+            &json!({"machine": id::LAPTOP, "engine": "codex", "cwd": rig.work}),
+        );
+        assert_eq!(refused.status, 400, "{}", refused.body);
+        assert!(refused.body.contains("not installed"));
+    }
+    #[cfg(windows)]
+    for prompt in [
+        "line\nbreak",
+        "\"",
+        "%",
+        "!",
+        "^",
+        "&",
+        "|",
+        "<",
+        ">",
+        "(",
+        ")",
+    ] {
+        let refused = daemon.post(
+            "/v1/sessions",
+            Some(&token),
+            &json!({"machine": id::LAPTOP, "engine": "claude", "cwd": rig.work, "brief": prompt}),
+        );
+        assert_eq!(refused.status, 400, "{}", refused.body);
+        assert!(refused.body.contains("batch wrapper"));
+    }
+    assert_eq!(
+        daemon.get("/v1/sessions", Some(&token)).json(),
+        before,
+        "preflight leaves no sessions"
+    );
     let start = daemon.post("/v1/sessions", Some(&token), &json!({"machine": id::LAPTOP, "engine": "claude", "cwd": rig.work, "title": "  A chosen title  "}));
     assert_eq!(start.status, 202, "{}", start.body);
     let session = start.json();

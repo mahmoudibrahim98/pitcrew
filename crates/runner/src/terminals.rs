@@ -137,6 +137,7 @@ impl RunnerTerminals {
         let info = self.call(self.inner.options.call_timeout, move |rt| rt.info(terminal));
         let native_target = info.ok().and_then(|i| i.native_target);
         self.store().put_terminal(&TerminalRow {
+            unclaimed: false,
             terminal,
             native_target,
             session: Some(session),
@@ -180,22 +181,24 @@ impl RunnerTerminals {
             .and_then(|t| t.session))
     }
 
-    pub(crate) fn live_sessions(&self) -> std::collections::HashSet<SessionId> {
+    pub(crate) fn live_sessions(&self) -> Option<std::collections::HashSet<SessionId>> {
         let Ok(listed) = self.call(self.inner.options.call_timeout, |rt| rt.list()) else {
-            return Default::default();
+            return None;
         };
         let Ok(rows) = self.store().terminals() else {
-            return Default::default();
+            return None;
         };
         let alive: std::collections::HashSet<_> = listed
             .into_iter()
             .filter(|t| t.alive)
             .map(|t| t.id)
             .collect();
-        rows.into_iter()
-            .filter(|row| alive.contains(&row.terminal))
-            .filter_map(|row| row.session)
-            .collect()
+        Some(
+            rows.into_iter()
+                .filter(|row| alive.contains(&row.terminal))
+                .filter_map(|row| row.session)
+                .collect(),
+        )
     }
 
     /// Forgets the terminals the runtime no longer lists by their id, except CLI starts with a

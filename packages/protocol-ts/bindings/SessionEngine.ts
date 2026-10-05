@@ -13,4 +13,8 @@ engine: Engine,
 /**
  * Modes supported by this engine and allowed by this runner.
  */
-permission_modes: Array<PermissionMode>, };
+permission_modes: Array<PermissionMode>, 
+/**
+ * Characters a first prompt cannot pass through this installed CLI's wrapper.
+ */
+first_prompt_forbidden: Array<string>, };

@@ -383,3 +383,11 @@ In Codex cloud source `/workspace/.onboarding/env.sh` before building. Install t
 dependencies and Playwright Chromium during setup. The runner works on Linux, macOS and Windows,
 creates temporary homes and a synthetic Claude shim, and removes its own processes and files.
 `PITCREW_SESSION_UI_CONFIG` can point at a Playwright config using an installed browser.
+
+The start dialog preselects `/v1/safety`'s saved permission mode within the chosen engine's allowed
+modes (otherwise Default), and preserves an explicit choice. It checks session-options'
+`first_prompt_forbidden` for batch wrappers and suggests entering such a prompt in the terminal.
+Workstream starts pass the workstream id so the real hub links immediately. Error hints use API
+codes; options failures explain runner reachability. The composer disables sessions without a
+PitCrew terminal. Discovery cache patches keep Ended sessions ended and preserve firm links;
+explicit state-change events can revive them.

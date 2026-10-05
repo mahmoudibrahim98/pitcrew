@@ -1311,11 +1311,14 @@ GET /v1/machines/{id}/session-options is person-only and reports platform path s
 engines and permitted modes from the reachable local runner. Unknown machines are 404; no
 runner/runtime or another machine is 503. Detection does not run an agent CLI.
 
-Every POST /v1/sessions records a Starting session before launch, including unnamed starts with
+Every valid POST /v1/sessions records a Starting session before launch, including person starts with
 no prompt. A successful 202 includes the terminal immediately; the transcript adopts that id
 later, so the person can enter their first prompt there. An optional trimmed 1–200-character
 title is retained separately by the runner. Existing ownership, safe-folder checks, claims and
-failed-start reconciliation apply. The cross-platform PTY stand-in test gates its transcript,
+failed-start reconciliation apply. CLI/PATH, permission and batch-wrapper preflight run before
+recording, so validation failures leave no session. Person starts have no transcript deadline and
+may share a folder; reconciliation ends them only when their terminal exits. Named agent/task
+starts retain their exclusive folder claims (conflicts answer 409). The cross-platform PTY stand-in test gates its transcript,
 checks the immediate terminal and send, then verifies adoption, title preservation and restart.
 
 Terminal publication and runner batches share one lock around the hub read and write, so a
@@ -1332,3 +1335,10 @@ skipped engines. No-change previews cannot set the wizard's installed flag.
 Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
+
+Session options expose `first_prompt_forbidden` for Windows `.cmd`/`.bat` programs. The API returns
+400 for those first prompts, with advice to start without a prompt and enter it in the terminal.
+No automatic prompt typing or shell escaping is attempted. Omitted permission mode reads the
+saved `/v1/safety` default before recording. Optional `workstream` links the returned session at
+start (manual); without it, a folder match links immediately with folder basis. Task links retain
+priority. Send errors for sessions without a PitCrew terminal explain the limitation without IDs.

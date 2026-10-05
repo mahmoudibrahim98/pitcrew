@@ -39,7 +39,8 @@
 //! **Answers.** An unknown session is `404`; one on another machine, or any without a runner,
 //! `503`; one the caller may not command `403`; an ended one, or one without a terminal here
 //! (PitCrew did not start it), `409`. A command the runner refuses (a folder that does not exist,
-//! a permission mode it does not allow, a value that could be read as an option) is `400`; one
+//! a permission mode it does not allow, a value that could be read as an option) is `400`; a
+//! named start waiting in the same folder is `409`; one
 //! that fails (the runtime cannot start or reach the terminal, or did not answer in time) is
 //! `503`.
 
@@ -55,7 +56,9 @@ use pitcrew_auth::{Authenticated, ErrorResponse};
 use pitcrew_hub_work::routes::MAX_BODY;
 use pitcrew_hub_work::{RecordedStart, WorkError, WorkService};
 use pitcrew_protocol::api::{Caller, ErrorCode, TokenScope};
-use pitcrew_protocol::ids::{CommandId, MachineId, MemberId, PersonaId, SessionId, TaskId};
+use pitcrew_protocol::ids::{
+    CommandId, MachineId, MemberId, PersonaId, SessionId, TaskId, WorkstreamId,
+};
 use pitcrew_protocol::model::{Engine, PermissionMode, Session, SessionState};
 use pitcrew_protocol::runner::{CommandOutcome, EndMode, Key, RunnerCommand};
 use pitcrew_runner::{SessionAgent, SessionAgents as _};
@@ -152,6 +155,11 @@ impl Sessions {
         });
         match tokio::time::timeout(self.command_timeout, running).await {
             Ok(Ok(CommandOutcome::Ok { .. })) => Ok(()),
+            Ok(Ok(CommandOutcome::Rejected { reason }))
+                if reason == pitcrew_runner::FOLDER_BUSY =>
+            {
+                Err(conflict(reason))
+            }
             Ok(Ok(CommandOutcome::Rejected { reason })) => Err(invalid(reason)),
             Ok(Ok(CommandOutcome::Failed { error })) => Err(unavailable(error)),
             Ok(Err(e)) => {
@@ -208,9 +216,9 @@ impl Sessions {
         let terminals = runner.terminals.clone();
         match bounded(move || terminals.terminal_of(id)).await? {
             Ok(Some(_)) => Ok(runner),
-            Ok(None) => Err(conflict(format!(
-                "Session {id} has no terminal here: PitCrew did not start it."
-            ))),
+            Ok(None) => Err(conflict(
+                "PitCrew did not start this session, so it cannot send input. Start a new session in PitCrew to use its terminal.",
+            )),
             Err(e) => {
                 tracing::error!(error = %e, session = %id, "cannot look up a session's terminal");
                 Err(ErrorResponse::new(
@@ -244,6 +252,7 @@ impl Sessions {
         command: RunnerCommand,
         session: Session,
         caller: Caller,
+        unclaimed: bool,
     ) -> Result<(StatusCode, Json<Session>), ErrorResponse> {
         let id = session.id;
         // Taken first: until the runner answers, the session is not one whose CLI did not start.
@@ -261,7 +270,11 @@ impl Sessions {
             Arc::clone(&self.runner),
         );
         let running = tokio::task::spawn_blocking(move || {
-            let outcome = commands.run(CommandId::new(), &command);
+            let outcome = if unclaimed {
+                commands.run_unclaimed(CommandId::new(), &command)
+            } else {
+                commands.run(CommandId::new(), &command)
+            };
             drop(permit);
             match &outcome {
                 CommandOutcome::Ok { .. } => {
@@ -323,6 +336,11 @@ impl Sessions {
                 })
                 .await??;
                 Ok((StatusCode::ACCEPTED, Json(session)))
+            }
+            Ok(Ok(CommandOutcome::Rejected { reason }))
+                if reason == pitcrew_runner::FOLDER_BUSY =>
+            {
+                Err(conflict(reason))
             }
             Ok(Ok(CommandOutcome::Rejected { reason })) => Err(invalid(reason)),
             Ok(Ok(CommandOutcome::Failed { error })) => Err(unavailable(error)),
@@ -388,6 +406,8 @@ struct StartSession {
     agent: Option<MemberId>,
     #[serde(default)]
     task: Option<TaskId>,
+    #[serde(default)]
+    workstream: Option<WorkstreamId>,
     #[serde(default)]
     brief: Option<String>,
     #[serde(default)]
@@ -525,6 +545,33 @@ async fn start(
             start.machine
         )));
     }
+    let work = Arc::clone(&sessions.work);
+    let (agent, task) = (start.agent, start.task);
+    bounded(move || {
+        work.read(|conn| {
+            if let Some(id) = agent {
+                let agent = pitcrew_hub_work::query::member(conn, &id)?
+                    .ok_or_else(|| WorkError::invalid("No such agent."))?;
+                if agent.kind != pitcrew_protocol::model::MemberKind::Agent {
+                    return Err(WorkError::invalid(
+                        "The selected member is a person, not an agent.",
+                    ));
+                }
+                if agent.owner != Some(caller.member) {
+                    return Err(WorkError::forbidden("You may start only your own agents."));
+                }
+            }
+            if let Some(id) = task
+                && pitcrew_hub_work::query::task(conn, &pitcrew_hub_work::TaskRef::Id(id))?
+                    .is_none()
+            {
+                return Err(WorkError::invalid("No such task."));
+            }
+            Ok(())
+        })
+    })
+    .await?
+    .map_err(work_error)?;
     let given = start.cwd;
     let folder = bounded(move || checked_cwd(&given))
         .await?
@@ -547,6 +594,67 @@ async fn start(
         }
     };
     let name = window_name(start.engine, &folder.path);
+    let unclaimed = start.agent.is_none() && start.task.is_none();
+    if runner.runtime.is_none() {
+        return Err(unavailable(
+            "This machine has no terminal runtime available.",
+        ));
+    }
+    let mut command = RunnerCommand::StartSession {
+        engine: start.engine,
+        cwd: folder.path.clone(),
+        name,
+        brief: start.brief,
+        persona: start.persona,
+        model: start.model,
+        account: None,
+        permission_mode,
+        session: None,
+    };
+    let commands = runner.commands.clone();
+    let checking = command.clone();
+    bounded(move || commands.check_start(&checking, unclaimed))
+        .await?
+        .map_err(|e| match e {
+            pitcrew_runner::StartError::Invalid(reason) => invalid(reason),
+            pitcrew_runner::StartError::FolderBusy => conflict(pitcrew_runner::FOLDER_BUSY),
+            pitcrew_runner::StartError::Unavailable(reason) => unavailable(reason),
+        })?;
+    let work = Arc::clone(&sessions.work);
+    let explicit = start.workstream;
+    let machine = start.machine;
+    let cwd = folder.path.clone();
+    let task = start.task;
+    let workstream = bounded(move || {
+        if let Some(id) = explicit {
+            work.workstream(&id)?;
+            if let Some(task) = task
+                && work.task(&pitcrew_hub_work::TaskRef::Id(task))?.workstream != Some(id)
+            {
+                return Err(WorkError::invalid("The task is not in this workstream."));
+            }
+            Ok(Some(id))
+        } else if task.is_some() {
+            Ok(None)
+        } else {
+            work.workstreams(None).map(|streams| {
+                let locations = streams
+                    .into_iter()
+                    .flat_map(|w| {
+                        w.locations.into_iter().map(move |location| {
+                            pitcrew_runner::WorkstreamLocation {
+                                workstream: w.id,
+                                location,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                pitcrew_runner::workstream_at(machine, &locations, &cwd)
+            })
+        }
+    })
+    .await?
+    .map_err(work_error)?;
     let work = Arc::clone(&sessions.work);
     let record = RecordedStart {
         machine: start.machine,
@@ -555,9 +663,42 @@ async fn start(
         agent: start.agent,
         task: start.task,
     };
-    let recorded = bounded(move || work.record_start(&caller, record))
+    let mut recorded = bounded(move || work.record_start(&caller, record))
         .await?
         .map_err(work_error)?;
+    if let Some(workstream) = workstream {
+        let work = Arc::clone(&sessions.work);
+        let id = recorded.id;
+        recorded = bounded(move || {
+            if explicit.is_none() {
+                work.store()
+                    .append(&[pitcrew_protocol::events::Event::now(
+                        work.workspace(),
+                        caller.member,
+                        pitcrew_protocol::events::EventBody::SessionLinked {
+                            session: id,
+                            workstream: Some(workstream),
+                            task: None,
+                            basis: pitcrew_protocol::model::LinkBasis::Folder,
+                        },
+                    )])
+                    .map_err(|_| {
+                        WorkError::invalid("The session workstream could not be recorded.")
+                    })?;
+                return work.session(&id);
+            }
+            work.link_session(
+                &caller,
+                &id,
+                pitcrew_hub_work::SessionLink {
+                    workstream: Some(workstream),
+                    task: start.task,
+                },
+            )
+        })
+        .await?
+        .map_err(work_error)?;
+    }
     if let Some(title) = &start.title {
         let commands = runner.commands.clone();
         let id = recorded.id;
@@ -572,19 +713,11 @@ async fn start(
             return Err(unavailable("The session title could not be stored."));
         }
     }
-    let command = RunnerCommand::StartSession {
-        engine: start.engine,
-        cwd: folder.path,
-        name,
-        brief: start.brief,
-        persona: start.persona,
-        model: start.model,
-        account: None,
-        permission_mode,
-        session: Some(recorded.id),
-    };
+    if let RunnerCommand::StartSession { session, .. } = &mut command {
+        *session = Some(recorded.id);
+    }
     sessions
-        .start_recorded(&runner, command, recorded, caller)
+        .start_recorded(&runner, command, recorded, caller, unclaimed)
         .await
 }
 
@@ -878,6 +1011,7 @@ mod tests {
             cwd: format!("/{}", "c".repeat(cwd - 1)),
             agent: None,
             task: None,
+            workstream: None,
             brief: Some("b".repeat(brief)),
             persona: None,
             model: None,
@@ -1078,7 +1212,7 @@ mod tests {
     /// or on another machine, `503`; another person's agent's, or an unknown agent's, `403`;
     /// ended, or without a terminal here, `409`. Starting needs a person, a machine of the
     /// workspace, the runner's, and an absolute folder; `agent` and `task` must be known. With no
-    /// runtime, a start fails as `503`, and a session stored for an agent ends.
+    /// runtime, a start fails as `503` before any session is recorded.
     #[test]
     fn which_sessions_take_commands() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1216,15 +1350,16 @@ mod tests {
             "Invalid",
             "an unknown task"
         );
-        // Stored for the agent, then ended when the idle runner (no runtime) cannot start it.
+        // Preflight refuses the idle runner (no runtime) before recording a session.
         with_agent["agent"] = serde_json::json!(lees.id);
         let before = sessions.work.sessions(&Default::default()).unwrap().len();
         assert_eq!(code(&starting(as_lee, with_agent)), "Unavailable");
         let all = sessions.work.sessions(&Default::default()).unwrap();
-        assert_eq!(all.len(), before + 1);
-        let stored = all.last().unwrap();
-        assert_eq!(stored.agent, Some(lees.id));
-        assert_eq!(stored.state, SessionState::Ended);
+        assert_eq!(
+            all.len(),
+            before,
+            "an unavailable runtime leaves no failed-start session"
+        );
         let as_agent = Caller {
             member: lees.id,
             scope: TokenScope::Agent,
@@ -1340,22 +1475,37 @@ mod tests {
         // Dropped before the runtime, even when an assertion fails.
         let opens = Opens(Arc::clone(&held));
         let folder = std::fs::canonicalize(tmp.path()).unwrap();
-        let body = serde_json::json!({
-            "machine": parts.machine,
-            "engine": "claude",
-            "cwd": folder.to_str().unwrap(),
-            "agent": helper.id,
-        });
         let as_lee = Caller {
             member: lee.id,
             scope: TokenScope::Device,
             on_behalf_of: None,
         };
-        let answer = rt.block_on(start(
-            State(Arc::clone(&sessions)),
-            Authenticated(as_lee),
-            Body::from(body.to_string()),
-        ));
+        // Preflight is tested separately. Isolate timeout handling after recording, with a
+        // held environment and a runtime that fails when that environment is released.
+        let recorded = work
+            .record_start(
+                &as_lee,
+                RecordedStart {
+                    machine: parts.machine,
+                    engine: Engine::Claude,
+                    cwd: folder.to_str().unwrap().into(),
+                    agent: Some(helper.id),
+                    task: None,
+                },
+            )
+            .unwrap();
+        let command = RunnerCommand::StartSession {
+            engine: Engine::Claude,
+            cwd: recorded.cwd.clone(),
+            name: "helper".into(),
+            brief: None,
+            persona: None,
+            model: None,
+            account: None,
+            permission_mode: PermissionMode::Default,
+            session: Some(recorded.id),
+        };
+        let answer = rt.block_on(sessions.start_recorded(&parts, command, recorded, as_lee, false));
         assert_eq!(code(&answer), "Unavailable");
         assert!(held.waiting.load(std::sync::atomic::Ordering::SeqCst));
         let stored = work

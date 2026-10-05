@@ -351,7 +351,7 @@ New workstreams trigger another pass over existing runner sessions.
 
 `StartSession`: `{ "machine": MachineId, "engine": Engine, "cwd": String, "agent"?: MemberId,
 "task"?: TaskId, "brief"?: String, "persona"?: PersonaId, "model"?: String,
-"permission_mode"?: PermissionMode, "title"?: String }`. A title is trimmed, 1–200 Unicode
+"permission_mode"?: PermissionMode, "title"?: String, "workstream"?: WorkstreamId }`. A title is trimmed, 1–200 Unicode
 characters, with no control characters. It overrides the transcript's title without changing it.
 `persona`, `model` and `permission_mode` are launch options
 and are not echoed on `Session`. With a `task`, the session is linked with `link_basis: "manual"`.
@@ -366,18 +366,35 @@ and are not echoed on `Session`. With a `task`, the session is linked with `link
   only if its CLI did not start, as for a dispatch. It moves no task: only a dispatch does.
 - Without them, the hub also records a `starting` session before launching. Every successful
   start answers `202` with its terminal, even without a prompt or transcript yet. The transcript
-  adopts that id later. This makes the terminal available for the first prompt.
+  adopts that id later. This makes the terminal available for the first prompt. Person starts without an agent or task
+  are not subject to the 15-minute named-start deadline; a running terminal keeps them alive,
+  and multiple such starts in one folder retain the existing best-effort folder matching.
+- CLI availability, permission modes, bypass policy and argument constraints are checked before
+  recording a start (400 with a plain reason). An ambiguous named start in the same folder is
+  409 `conflict`. A runtime failure after validation can still end a recorded start.
+- An explicit `workstream` links the session by hand before launching. Without one, a workstream
+  whose location contains the resolved folder is inferred at start. Firm links survive adoption.
 
 `GET /v1/machines/{id}/session-options` (person-only) returns
 `SessionOptions`: `{ "platform": "windows" | "unix", "engines":
-[{ "engine": Engine, "permission_modes": PermissionMode[] }] }`. Only executable CLIs
+[{ "engine": Engine, "permission_modes": PermissionMode[], "first_prompt_forbidden": String[] }] }`. Only executable CLIs
 on that runner's PATH are listed; none are run to detect availability. Modes reflect launch
 support and the runner's bypass policy (Codex has no plan mode; OpenCode uses its settings).
 Unknown machines are `404`; no runner, no terminal runtime or an unreachable machine is `503`.
 Availability is advisory: a CLI removed after the check can still fail at launch.
+`first_prompt_forbidden` lists characters that cannot be passed through an installed Windows
+batch wrapper (control characters and `" % ! ^ & | < > ( )`); it is empty for native programs and
+Unix CLIs. Such a prompt is refused before recording, with 400 and advice to enter it in the
+terminal after starting. The dialog checks these limits and selects the saved safety default
+only when supported by the chosen engine.
 
-Working, Waiting and Starting from transcripts become Idle after **five minutes** without
-transcript writes, accepted hooks or a known live terminal. The runner checks this during its
+Working and Starting from transcripts become Idle after **five minutes** without
+transcript writes, accepted hooks or a known live terminal. **Waiting or an open tool call gets
+60 minutes**: a quiet permission decision or a long tool run should not look abandoned after
+five minutes, while abandoned waits still expire within an hour. An unavailable terminal list
+is unknown evidence: expiry is skipped and that failure is not cached. A deleted transcript
+emits Idle (unless terminal evidence is alive or unknown), including after restart.
+The runner checks this during its
 existing safety sweeps (normally 30 seconds; 120 seconds on polled network homes). Old transcripts
 are normalized before discovery, including after restart. Expiry clears the status line, emits
 `session_state_changed` and never edits a transcript. A later write/hook can resume activity;

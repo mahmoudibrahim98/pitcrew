@@ -78,10 +78,10 @@ mod watch;
 
 pub use agents::{MemoryAgents, SessionAgent, SessionAgents};
 pub use commands::Started;
-pub use commands::{CommandOptions, RunnerCommands};
+pub use commands::{CommandOptions, FOLDER_BUSY, RunnerCommands, StartError};
 pub use config::{EngineHome, PollMode, RunnerConfig, Timing};
 pub use hooks::RunnerHooks;
-pub use link::{Locations, MemoryLocations, WorkstreamLocation};
+pub use link::{Locations, MemoryLocations, WorkstreamLocation, workstream_at};
 pub use pages::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageError, PageOptions, RunnerTranscripts};
 pub use session_env::SessionEnv;
 pub use sink::{EventSink, SinkError};
