@@ -1,10 +1,14 @@
-// Board drafts (api-v1.md, "Board drafts"): the preview sends nothing, a start needs what the
-// preview showed, only the drafting agent proposes, and nothing is created until a person reviews
-// the proposal; rejected items create nothing.
+// Board drafts (api-v1.md, "Board drafts"): the preview sends nothing, a start sends what the
+// preview showed, confined, only the draft's own session token proposes (and then its session
+// ends), and nothing is created until a person reviews the proposal; rejected items create
+// nothing.
 
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { redactLine } from '../src/board.ts';
+import { CONFINED_BRIEF, pathTail, redactLine, relativeTo } from '../src/board.ts';
 import type { RunningServer } from '../src/server.ts';
 import type { BoardDraft, DraftPreview, Event, Task } from '../src/types.ts';
 import { AGENT, DEVICE, ID, call, sleep, withServer } from './helpers.ts';
@@ -28,6 +32,19 @@ async function tasks(server: RunningServer): Promise<Task[]> {
 
 async function events(server: RunningServer): Promise<Event[]> {
   return (await call<{ events: Event[] }>(server, 'GET', '/v1/events?limit=500', { token: DEVICE })).body.events;
+}
+
+/** A mock hub that also writes drafts' session tokens to a temporary folder, as the CLI gets them. */
+async function withTokens(test: (server: RunningServer, token: (session: string) => string) => Promise<void>, options = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'pitcrew-mock-tokens-'));
+  try {
+    await withServer(
+      (server) => test(server, (session) => readFileSync(join(dir, `${session}.token`), 'utf8')),
+      { ...options, sessionTokenDir: dir },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 const PROPOSAL = {
@@ -64,7 +81,7 @@ describe('board drafts', () => {
     }));
 
   it('creates nothing until the person accepts, and nothing for a rejected item', () =>
-    withServer(async (server) => {
+    withTokens(async (server, tokenOf) => {
       const count = (await tasks(server)).length;
       const shown = await preview(server);
       assert.equal((await start(server, { agent: ID.writer, digest: '00' })).status, 409);
@@ -75,18 +92,31 @@ describe('board drafts', () => {
       assert.equal(draft.agent, ID.writer);
       assert.equal((await start(server, { agent: ID.writer, digest: shown.digest })).status, 409, 'one at a time');
       assert.equal((await tasks(server)).length, count);
+      // Confined: a private folder of its own, never the workstream's, and one short line.
+      const session = (await call<{ cwd: string }>(server, 'GET', `/v1/sessions/${draft.session}`, { token: DEVICE })).body;
+      assert.equal(session.cwd, `~/.cache/pitcrew/scratch/${draft.session}`);
+      assert.ok(CONFINED_BRIEF.length < 100);
 
       const path = `/v1/board-drafts/${draft.id}/proposal`;
-      assert.equal((await call(server, 'POST', path, { token: DEVICE, json: PROPOSAL })).status, 403);
+      const token = tokenOf(draft.session);
+      assert.match(token, /^pcs_/);
+      // Only the draft's session token proposes: not a person, not its agent's own token.
+      for (const other of [DEVICE, AGENT]) {
+        assert.equal((await call(server, 'POST', path, { token: other, json: PROPOSAL })).status, 403);
+      }
+      // A session token does nothing else.
+      assert.equal((await call(server, 'GET', '/v1/me', { token })).status, 403);
+      assert.equal((await call(server, 'GET', '/v1/tasks', { token })).status, 403);
       const bad = await call(server, 'POST', path, {
-        token: AGENT,
+        token,
         json: { tasks: [{ title: 'T', status: 'todo', evidence: [ID.ses2] }] },
       });
       assert.equal(bad.status, 400);
-      const proposed = await call<BoardDraft>(server, 'POST', path, { token: AGENT, json: PROPOSAL });
+      const proposed = await call<BoardDraft>(server, 'POST', path, { token, json: PROPOSAL });
       assert.equal(proposed.status, 201);
       assert.equal(proposed.body.state, 'proposed');
-      assert.equal((await call(server, 'POST', path, { token: AGENT, json: PROPOSAL })).status, 409);
+      // Its token is gone once it has proposed.
+      assert.equal((await call(server, 'POST', path, { token, json: PROPOSAL })).status, 401);
       assert.equal((await tasks(server)).length, count, 'a proposal creates nothing');
 
       const review = await call<{ draft: BoardDraft; tasks: Task[] }>(server, 'POST', `/v1/board-drafts/${draft.id}/review`, {
@@ -111,6 +141,22 @@ describe('board drafts', () => {
       assert.deepEqual(types.slice(-4), ['board_proposed', 'task_created', 'task_created', 'board_draft_reviewed']);
       const listed = await call<BoardDraft[]>(server, 'GET', `/v1/board-drafts?workstream=${ID.submission}`, { token: DEVICE });
       assert.deepEqual(listed.body.map((d) => d.id), [draft.id]);
+    }, { delays: { end: 20 } }));
+
+  it('starts exactly the preview the person saw while it is kept, and never a superseded one', () =>
+    withServer(async (server) => {
+      const first = await preview(server, ID.seedRuns);
+      const created = await call(server, 'POST', '/v1/tasks', {
+        token: DEVICE,
+        json: { project: ID.paper, workstream: ID.seedRuns, title: 'Synthetic new task' },
+      });
+      assert.equal(created.status, 201);
+      const newer = await preview(server, ID.seedRuns);
+      assert.notEqual(first.digest, newer.digest);
+      assert.equal((await start(server, { agent: ID.writer, digest: first.digest }, ID.seedRuns)).status, 409);
+      const started = await start(server, { agent: ID.writer, digest: newer.digest }, ID.seedRuns);
+      assert.equal(started.status, 202);
+      assert.deepEqual(started.body.cost, newer.cost);
     }));
 
   it('plays the back office for a draft run by @office', () =>
@@ -144,8 +190,23 @@ describe('board drafts', () => {
       ['branch fix/sam@example.com', 'branch fix/[email]'],
       ['Draft the method section', 'Draft the method section'],
       ['uses sk-learn-tutorial', 'uses sk-learn-tutorial'],
+      ['{"password": "hunter22"}', '{"password": "[redacted]"}'],
+      ['password = hunter22', 'password = [redacted]'],
+      ['use **ghp_16C7e42F292c6912E7710c838347Ae178B4a** here', 'use **[redacted]** here'],
+      ['echo $sk-ant-api03-AbCdEfGhIjKlMnOp', 'echo $[redacted]'],
+      ['#glpat-AbCdEf1234567890xyz', '#[redacted]'],
+      ['ghp_16C7e42F\u0007292c6912E7710c838347Ae178B4a', '[redacted]'],
+      ['pass\u0000word', 'password'],
+      ['opened /mnt/c/Users/sam/work/notes.md', 'opened ~/work/notes.md'],
+      ['opened \\\\?\\C:\\Users\\sam\\notes.md', 'opened ~\\notes.md'],
+      ['ran /scratch/grp/sam/run.sh', 'ran …/run.sh'],
+      ['in /scratch/grp/sam', 'in …'],
+      ['see https://example.com/a/b/c', 'see https://example.com/a/b/c'],
     ] as const) {
       assert.ok(redactLine(text, 500).text === want, `case ${want}: not redacted as expected`);
     }
+    assert.equal(pathTail('/a/b/c/d/e.rs'), '…/d/e.rs');
+    assert.equal(relativeTo('/scratch/grp/sam/paper/src/a.rs', ['/scratch/grp/sam/paper']), 'src/a.rs');
+    assert.equal(relativeTo('C:\\Users\\sam\\p\\a.rs', ['c:/Users/sam/p']), 'a.rs');
   });
 });

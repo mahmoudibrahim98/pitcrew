@@ -194,6 +194,16 @@ impl WorkService {
         })?;
         let keys: HashMap<TaskId, String> =
             tasks.iter().map(|t| (t.id, t.key.to_string())).collect();
+        // The workstream's folders, which a session's files are made relative to (after the
+        // session's own folder).
+        let mut folders: Vec<String> = workstream
+            .locations
+            .iter()
+            .map(|l| l.path.clone())
+            .collect();
+        if let Some(root) = project.as_ref().and_then(|p| p.root.as_ref()) {
+            folders.push(root.path.clone());
+        }
         let mut facts = DraftFacts {
             workstream: workstream.name.clone(),
             project: project.map(|p| p.name).unwrap_or_default(),
@@ -214,17 +224,19 @@ impl WorkService {
             {
                 continue;
             }
-            let facts_of = self.session_facts(&session, &keys)?;
+            let facts_of = self.session_facts(&session, &keys, &folders)?;
             facts.sessions.push(facts_of);
         }
         Ok(facts)
     }
 
-    /// One session's facts, from the recap index: its newest blocks' counts, files and lines.
+    /// One session's facts, from the recap index: its newest blocks' counts, files and lines. Its
+    /// files are relative to its folder, else to one of the workstream's `folders`.
     fn session_facts(
         &self,
         session: &Session,
         keys: &HashMap<TaskId, String>,
+        folders: &[String],
     ) -> Result<SessionFacts> {
         let page = self.recap_blocks(
             &BlockFilter {
@@ -271,7 +283,12 @@ impl WorkService {
         }
         // Most edited first; a stable order among equals.
         files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        facts.files = files.into_iter().map(|(path, _)| path).collect();
+        let mut within: Vec<&str> = vec![session.cwd.as_str()];
+        within.extend(folders.iter().map(String::as_str));
+        facts.files = files
+            .into_iter()
+            .map(|(path, _)| pitcrew_office::board::relative_to(&path, &within))
+            .collect();
         Ok(facts)
     }
 

@@ -81,7 +81,15 @@ import {
 
 import { files } from './files.ts';
 import { parseImport, includesSession, eventVisible, includedRecaps } from './import.ts';
-import { boardPreview, draftAt, listDrafts, proposeBoard, reviewDraft, startDraft } from './board.ts';
+import {
+  boardPreview,
+  draftAt,
+  listDrafts,
+  proposeBoard,
+  reviewDraft,
+  sessionTokenGrant,
+  startDraft,
+} from './board.ts';
 import * as integrations from './integrations.ts';
 import * as writes from './writes.ts';
 export const MOCK_VERSION = '0.1.0-mock';
@@ -107,6 +115,8 @@ export interface Caller {
   memberId: MemberId;
   member: Member | undefined;
   scope: TokenScope;
+  /** For a session token, the session it is bound to. */
+  session?: string | undefined;
 }
 
 /** The caller for a token, or a 401 for one the mock does not know at all. */
@@ -116,7 +126,9 @@ export function authenticate(hub: Hub, token: string | undefined): Caller {
   }
   const grant = TOKENS.get(token);
   if (grant === undefined) {
-    throw new ApiFailure('unauthorized', 'Unknown token.');
+    const session = sessionTokenGrant(hub, token);
+    if (session === undefined) throw new ApiFailure('unauthorized', 'Unknown token.');
+    return { memberId: session.member, member: hub.findMember(session.member), scope: 'session', session: session.session };
   }
   return { memberId: grant.member, member: hub.findMember(grant.member), scope: grant.scope };
 }
@@ -155,8 +167,11 @@ type Handler = (hub: Hub, ctx: Context) => Reply;
 interface Route {
   method: string;
   pattern: string;
-  /** `agent` routes accept both scopes; `device` routes only device tokens. */
-  access: 'agent' | 'device';
+  /**
+   * `agent` routes accept device and agent tokens; `session` routes every scope (each checks a
+   * session token answers only for its own session); `device` routes only device tokens.
+   */
+  access: 'agent' | 'session' | 'device';
   handler: Handler;
 }
 
@@ -179,6 +194,9 @@ export async function handleApi(hub: Hub, request: ApiRequest): Promise<Reply> {
   const { pattern, access, handler } = match.route;
   if (access === 'device' && caller.scope !== 'device') {
     throw forbidden(`${request.method} ${pattern} needs a device token.`);
+  }
+  if (access === 'agent' && caller.scope === 'session') {
+    throw forbidden(`${request.method} ${request.path} is refused: this token may only answer for the session it was made for.`);
   }
   if (request.method === 'PUT' && pattern === '/v1/personas/:id') {
     found(hub.findPersona(match.params.get('id') ?? ''), 'No such persona.');
@@ -1716,7 +1734,7 @@ const ROUTES: Route[] = [
     ok(listDrafts(hub, queryId(ctx.query, 'workstream', 'wst'))),
   ),
   route('GET', '/v1/board-drafts/:id', 'device', (hub, ctx) => ok(draftAt(hub, ctx.param('id')))),
-  route('POST', '/v1/board-drafts/:id/proposal', 'agent', (hub, ctx) =>
+  route('POST', '/v1/board-drafts/:id/proposal', 'session', (hub, ctx) =>
     created(proposeBoard(hub, ctx.caller, ctx.param('id'), ctx.body)),
   ),
   route('POST', '/v1/board-drafts/:id/review', 'device', (hub, ctx) =>

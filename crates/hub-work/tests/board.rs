@@ -208,6 +208,14 @@ fn noisy_session(work: &WorkService) -> SessionId {
                 removed: 1,
                 receipt: None,
             }),
+            // In its own folder: the summary names it relative to that folder.
+            by(EventBody::FileEdited {
+                session: id,
+                path: "/home/sam/work/diffusion-paper/paper/figures/plot.py".into(),
+                added: 5,
+                removed: 0,
+                receipt: None,
+            }),
             by(EventBody::TurnEnded {
                 session: id,
                 receipt: Receipt::Transcript {
@@ -326,6 +334,12 @@ async fn a_preview_shows_what_would_be_sent_and_sends_nothing() {
     assert!(
         !summary.contains("PAP-4"),
         "another workstream's task is in it"
+    );
+    // Its files are named relative to its folder.
+    assert!(summary.contains("figures/plot.py"), "{summary}");
+    assert!(
+        !summary.contains("paper/figures"),
+        "a session's folder reached the summary"
     );
     // Secrets in its title, its branch, its activity and its files never reach the summary. The
     // messages are labels only: a failure must not print the synthetic token.

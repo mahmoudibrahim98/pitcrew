@@ -68,6 +68,12 @@ export interface ServerOptions {
    * `fixtures/`. It is read again at each sync, so a test can change what "upstream" says.
    */
   integrationFixtures?: string;
+  /**
+   * A private folder where each board draft's session token is also written, as
+   * `<session>.token`, as the hub gives it to the draft's CLI: for the conformance suite, which
+   * proposes as that CLI would. Unset, the tokens stay in memory only.
+   */
+  sessionTokenDir?: string;
 }
 
 export interface RunningServer {
@@ -90,6 +96,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     options.fresh === true ? undefined : loadRecaps(RECAPS),
   );
   if (options.integrationFixtures !== undefined) integrations.useFixtures(hub, options.integrationFixtures);
+  hub.sessionTokenDir = options.sessionTokenDir;
   const log = options.log ?? ((): void => {});
   const sockets = new Set<WebSocketConnection>();
   const server = createServer((req, res) => {

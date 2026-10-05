@@ -147,6 +147,46 @@ impl Cleaner {
         self.redacted += count;
         text.replace('<', "‹").replace('>', "›")
     }
+
+    /// As [`Cleaner::line`], for a path: one too long keeps its end, so its file name stays.
+    fn path(&mut self, text: &str, max: usize) -> String {
+        let Redacted { text, count } = redact::path(text, max);
+        self.redacted += count;
+        text.replace('<', "‹").replace('>', "›")
+    }
+}
+
+/// `path` relative to the first of `folders` it is inside (`/home/sam/paper/src/a.rs` in
+/// `/home/sam/paper` is `src/a.rs`), else as it is: the hub hands in a session's files this way,
+/// relative to the session's folder or the workstream's, so neither whose folder it is nor where
+/// it is goes into the summary. `/` and `\` both separate, and a Windows drive letter matches in
+/// either case; `~` and the root are never a folder to be relative to.
+#[must_use]
+pub fn relative_to(path: &str, folders: &[&str]) -> String {
+    let normal = |p: &str| {
+        let mut p = p.replace('\\', "/");
+        while p.len() > 1 && p.ends_with('/') {
+            p.pop();
+        }
+        if p.as_bytes().get(1) == Some(&b':') {
+            p[..1].make_ascii_lowercase();
+        }
+        p
+    };
+    let file = normal(path);
+    for folder in folders {
+        let folder = normal(folder);
+        if folder.is_empty() || folder == "/" || folder == "~" || folder.ends_with(':') {
+            continue;
+        }
+        if let Some(rest) = file.strip_prefix(&folder)
+            && let Some(rest) = rest.strip_prefix('/')
+            && !rest.is_empty()
+        {
+            return rest.to_owned();
+        }
+    }
+    path.to_owned()
 }
 
 fn status_word(status: TaskStatus) -> &'static str {
@@ -218,7 +258,7 @@ fn session_block(session: &SessionFacts, clean: &mut Cleaner) -> String {
         .files
         .iter()
         .take(MAX_FILES)
-        .map(|f| clean.line(f, MAX_PATH_CHARS))
+        .map(|f| clean.path(f, MAX_PATH_CHARS))
         .filter(|f| !f.is_empty())
         .collect();
     if !files.is_empty() {
