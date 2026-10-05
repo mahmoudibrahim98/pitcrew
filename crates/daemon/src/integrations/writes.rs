@@ -710,17 +710,13 @@ impl Integrations {
         result: WriteResult,
     ) {
         #[cfg(test)]
-        if self
-            .fail_finishes
-            .fetch_update(
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-                |n| n.checked_sub(1),
-            )
-            .is_ok()
         {
-            lock(&self.unfinished).insert(ask, (member, result));
-            return;
+            let mut failing = lock(&self.fail_finishes);
+            if *failing > 0 {
+                *failing -= 1;
+                lock(&self.unfinished).insert(ask, (member, result));
+                return;
+            }
         }
         let done = {
             let work = Arc::clone(work);

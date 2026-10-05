@@ -201,7 +201,7 @@ pub struct Integrations {
     unfinished: Mutex<HashMap<AskId, (MemberId, WriteResult)>>,
     /// Tests: how many of the next results to keep in memory as if the store had refused them.
     #[cfg(test)]
-    fail_finishes: std::sync::atomic::AtomicUsize,
+    fail_finishes: Mutex<usize>,
     wake: Notify,
 }
 
@@ -248,7 +248,7 @@ impl Integrations {
             requested: Mutex::new(HashSet::new()),
             unfinished: Mutex::new(HashMap::new()),
             #[cfg(test)]
-            fail_finishes: std::sync::atomic::AtomicUsize::new(0),
+            fail_finishes: Mutex::new(0),
             wake: Notify::new(),
         })
     }

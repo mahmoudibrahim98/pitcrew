@@ -1074,9 +1074,7 @@ async fn a_result_the_store_could_not_record_is_recorded_first() {
     hub.pass().await;
     let close = hub.writes().remove(0);
     hub.answer(&close.proposal.ask, 0);
-    hub.integrations
-        .fail_finishes
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    *lock(&hub.integrations.fail_finishes) = 1;
     hub.pass().await;
     assert_eq!(hub.writes_sent().len(), 1);
     assert_eq!(
@@ -1137,9 +1135,7 @@ async fn a_retried_create_finds_its_earlier_attempt_upstream() {
         .unwrap();
     hub.answer(&create.proposal.ask, 0);
     // Upstream creates #8, then the hub stops before recording it.
-    hub.integrations
-        .fail_finishes
-        .store(1, std::sync::atomic::Ordering::SeqCst);
+    *lock(&hub.integrations.fail_finishes) = 1;
     hub.pass().await;
     assert_eq!(hub.writes_sent().len(), 1);
     hub.restart();
