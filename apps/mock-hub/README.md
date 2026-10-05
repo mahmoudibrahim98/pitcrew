@@ -245,3 +245,6 @@ only in memory. Remote and WSL locations return 501. No filesystem paths are ope
 Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
 
 Onboarding hooks use synthetic in-memory configuration text, person/machine-bound previews, stale refusal and idempotent confirmation. The mock never opens agent homes. Device-only safety read/save validates the same settings as the daemon and appends `safety_changed` on change.
+
+Task patches support reversible archival through task_updated. Archived tasks remain readable for restoration and dependency resolution. GET /v1/tasks/{id-or-key}/dispatches returns both active and finished runs; ending a starting session records a failed dispatch with its reason, and ending a running session cancels it.
+

@@ -334,6 +334,7 @@ impl World {
             due: None,
             blocked_by: vec![],
             source: None,
+            archived: false,
             accept_auto,
             subtasks: vec![],
         }

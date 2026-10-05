@@ -38,7 +38,8 @@ impl Tasks {
     /// 2: key clashes are recorded instead of failing, and stale moves are ignored.
     /// 3: `task_updated` is applied.
     /// 4: a `write_finished` that created an issue gives the task its `source`.
-    pub const VERSION: u32 = 4;
+    /// 5: tasks retain reversible archival in their documents.
+    pub const VERSION: u32 = 5;
 }
 
 impl Projection for Tasks {

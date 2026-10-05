@@ -366,6 +366,7 @@ impl WorkService {
             due: new.due,
             blocked_by: Vec::new(),
             source: None,
+            archived: false,
             accept_auto: false,
             subtasks: Vec::new(),
         };

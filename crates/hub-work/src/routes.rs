@@ -57,6 +57,7 @@ where
         .route("/v1/members", get(list_members))
         .route("/v1/tasks", get(list_tasks))
         .route("/v1/tasks/{id}", get(get_task))
+        .route("/v1/tasks/{id}/dispatches", get(list_task_dispatches))
         .route("/v1/tasks/{id}/move", post(move_task))
         .route("/v1/tasks/{id}/subtasks", put(replace_subtasks))
         .route("/v1/tasks/{id}/comments", post(post_comment))
@@ -429,6 +430,24 @@ async fn list_tasks(
 async fn get_task(Work(w): Work, Who(_): Who, Segments(id): Segments<String>) -> Reply<Task> {
     let task = task_ref(&id)?;
     Ok(Json(blocking(w, move |w| w.task(&task)).await?))
+}
+
+async fn list_task_dispatches(
+    Work(w): Work,
+    Who(_): Who,
+    Segments(id): Segments<String>,
+) -> Reply<Vec<Dispatch>> {
+    let task = task_ref(&id)?;
+    Ok(Json(
+        blocking(w, move |w| {
+            let task = w.task(&task)?;
+            Ok(w.dispatches()?
+                .into_iter()
+                .filter(|run| run.task == task.id)
+                .collect())
+        })
+        .await?,
+    ))
 }
 
 async fn create_task(

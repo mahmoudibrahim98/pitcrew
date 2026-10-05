@@ -579,6 +579,7 @@ const createTask: Handler = (hub, ctx) => {
     due: fields.optDate('due'),
     blocked_by: [],
     accept_auto: false,
+    archived: false,
     subtasks: [],
   };
   hub.tasks.push(task);
@@ -716,6 +717,7 @@ function readTaskPatch(hub: Hub, task: Task, fields: Fields): TaskPatch {
   if (blockers !== undefined) {
     patch.blocked_by = readBlockers(hub, task, blockers);
   }
+  if (fields.raw('archived') !== undefined) patch.archived = fields.bool('archived');
   if (fields.raw('accept_auto') !== undefined) {
     patch.accept_auto = fields.bool('accept_auto');
   }
@@ -801,6 +803,7 @@ function changedFields(task: Task, wanted: TaskPatch): TaskPatch {
   if (wanted.blocked_by !== undefined && !sameList(wanted.blocked_by, task.blocked_by)) {
     patch.blocked_by = wanted.blocked_by;
   }
+  if (wanted.archived !== undefined && wanted.archived !== (task.archived ?? false)) patch.archived = wanted.archived;
   if (wanted.accept_auto !== undefined && wanted.accept_auto !== task.accept_auto) {
     patch.accept_auto = wanted.accept_auto;
   }
@@ -833,6 +836,7 @@ function applyPatch(task: Task, patch: TaskPatch): void {
   if (patch.blocked_by !== undefined) {
     task.blocked_by = [...patch.blocked_by];
   }
+  if (patch.archived !== undefined) task.archived = patch.archived;
   if (patch.accept_auto !== undefined) {
     task.accept_auto = patch.accept_auto;
   }
@@ -1544,6 +1548,10 @@ const ROUTES: Route[] = [
   route('PUT', '/v1/tasks/:id/subtasks', 'agent', replaceSubtasks),
   route('POST', '/v1/tasks/:id/comments', 'agent', postComment),
   route('POST', '/v1/tasks/:id/dispatch', 'device', dispatchTask),
+  route('GET', '/v1/tasks/:id/dispatches', 'agent', (hub, ctx) => {
+    const task = taskAt(hub, ctx.param('id'));
+    return ok(hub.dispatches.filter((run) => run.task === task.id));
+  }),
   // Sessions.
   route('POST', '/v1/machines/:id/hooks/diff', 'device', (hub, ctx) => ok(hooksDiff(hub, ctx.caller.memberId, ctx.param('id')))),
   route('POST', '/v1/machines/:id/hooks/install', 'device', (hub, ctx) => ok(installHooks(hub, ctx.caller.memberId, ctx.param('id'), ctx.body))),

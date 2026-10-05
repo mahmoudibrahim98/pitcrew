@@ -26,6 +26,10 @@ title?: string,
  */
 description?: string, 
 /**
+ * Archive or restore the task.
+ */
+archived?: boolean, 
+/**
  * New priority.
  */
 priority?: Priority, 

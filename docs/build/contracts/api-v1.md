@@ -244,6 +244,7 @@ replaces the workstream's linked external items (an empty list unlinks them all)
 | `PUT /v1/tasks/{id}/subtasks` | `Subtask[]` → `Task` | A `device` token replaces the whole list. An `agent` token (own task) replaces only **its own** `agent_plan` lines and keeps every other line. Emits `subtasks_replaced` with the full resulting list. **agent** |
 | `POST /v1/tasks/{id}/comments` | `{ "text": String, "mentions": MemberId[] }` → `Event` (201) | Emits `comment_posted`. **agent** |
 | `POST /v1/tasks/{id}/dispatch` | `{ "agent": MemberId, "brief"?: String, "machine"?: MachineId }` → `Dispatch` (202) | See "Dispatch" below. |
+| `GET /v1/tasks/{id-or-key}/dispatches` | → `Dispatch[]` | Runs for this task, including completed runs with `ended`, `outcome` and `summary`, oldest first. Unknown task is 404. **agent** |
 
 `NewTask`: `{ "project": ProjectId, "workstream"?: WorkstreamId, "title": String,
 "description"?: String, "status"?: TaskStatus (default "todo"), "priority"?: Priority,
@@ -254,6 +255,11 @@ replaces the workstream's linked external items (an empty list unlinks them all)
 `{ "workstream"?: WorkstreamId | null, "title"?: String, "description"?: String,
 "priority"?: Priority, "labels"?: String[], "start"?: Date | null, "due"?: Date | null,
 "blocked_by"?: TaskId[], "accept_auto"?: bool }`.
+`TaskPatch` also accepts `archived?: bool`. Tasks default to `archived: false` when reading
+older events. Setting it emits `task_updated`; setting it back to false restores the same task,
+key, dependencies and history. Archived tasks remain readable by id/key and are excluded from
+boards, calendars and task lists in the UI. This is reversible archival, not permanent deletion;
+`GET /v1/tasks` still includes them so dependencies can be resolved and undo does not lose data.
 - A field left out is unchanged. `null` clears `workstream`, `start` and `due`; on the other fields
   `null` is the same as leaving the field out. `labels` and `blocked_by` replace the whole list.
 - Status, assignee and subtasks have their own routes. Like any unknown field, they are ignored.

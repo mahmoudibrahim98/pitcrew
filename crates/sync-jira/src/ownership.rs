@@ -296,6 +296,7 @@ mod tests {
             due: None,
             blocked_by: vec![],
             source: None,
+            archived: false,
             accept_auto: false,
             subtasks: vec![],
         }

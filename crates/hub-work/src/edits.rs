@@ -189,6 +189,7 @@ pub(crate) fn changed_fields(task: &Task, wanted: TaskPatch) -> TaskPatch {
         workstream: differs(wanted.workstream, &task.workstream),
         title: differs(wanted.title, &task.title),
         description: differs(wanted.description, &task.description),
+        archived: differs(wanted.archived, &task.archived),
         priority: differs(wanted.priority, &task.priority),
         labels: differs(wanted.labels, &task.labels),
         start: differs(wanted.start, &task.start),

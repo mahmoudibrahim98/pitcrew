@@ -90,6 +90,34 @@ function check(name, fn) {
     assert.fail(`Deviation ${deviation.row} now passes: remove its expected-failure entry`);
   });
 }
+
+check('task archival is reversible, typed, authorized and event based', async () => {
+  const tasks = await api('/v1/tasks', 200, list(schemas.task));
+  const original = tasks.find((task) => task.key === 'PAP-1');
+  assert.ok(original);
+  const path = `/v1/tasks/${original.id}`;
+  const archived = await api(path, 200, schemas.task, { method: 'PATCH', body: { archived: true } });
+  assert.equal(archived.archived, true);
+  assert.deepEqual(archived.subtasks, original.subtasks);
+  const events = await api(`/v1/events?task=${original.id}`, 200, schemas.events);
+  assert.ok(events.events.some((event) => event.body.type === 'task_updated' && event.body.data.patch.archived === true));
+  await api(path, 403, undefined, { method: 'PATCH', token: agent, body: { archived: false } });
+  await api(path, 400, undefined, { method: 'PATCH', body: { archived: 'yes' } });
+  const restored = await api(path, 200, schemas.task, { method: 'PATCH', body: { archived: false } });
+  assert.equal(restored.archived, false);
+  const { archived: ignoredBefore, ...before } = original;
+  const { archived: ignoredAfter, ...after } = restored;
+  assert.deepEqual(after, before);
+});
+
+check('task dispatch reads resolve keys and ids for both token scopes', async () => {
+  const task = await api('/v1/tasks/PAP-1', 200, schemas.task);
+  const runs = await api('/v1/tasks/PAP-1/dispatches', 200, list(schemas.dispatch));
+  assert.ok(runs.every((run) => run.task === task.id));
+  assert.deepEqual(await api(`/v1/tasks/${task.id}/dispatches`, 200, list(schemas.dispatch), { token: agent }), runs);
+  await api('/v1/tasks/PAP-99999/dispatches', 404);
+  await api('/v1/tasks/PAP-1/dispatches', 401, undefined, { token: '' });
+});
 let context = {};
 check('per-person read cursors are forward-only and person-only', async () => {
   const second = process.env.PITCREW_CONFORMANCE_SECOND_PERSON;

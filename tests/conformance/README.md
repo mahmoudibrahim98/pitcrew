@@ -1,5 +1,9 @@
 # API v1 conformance
 
+The task tests include archive/restore, typed archival patches, authorization and their
+`task_updated` events, and dispatch reads by task key/id for both token scopes. The mock's
+ending-session simulation records dispatch outcomes, including a failed start's reason.
+
 From the repository root, using Node 22.18+ and (for the daemon) Rust 1.88+:
 
 ```sh

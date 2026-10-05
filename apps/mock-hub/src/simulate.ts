@@ -169,6 +169,7 @@ function finishTurn(hub: Hub, session: Session, turn: number, reply: string): vo
 }
 
 function finishEnd(hub: Hub, session: Session): void {
+  const starting = session.state === 'starting';
   if (session.state === 'ended') {
     return;
   }
@@ -177,6 +178,14 @@ function finishEnd(hub: Hub, session: Session): void {
   delete session.status_line;
   session.last_activity = Date.now();
   hub.append(authorOf(hub, session), { type: 'session_ended', data: { session: session.id } });
+  for (const dispatch of hub.dispatches.filter((run) => run.session === session.id && run.ended === undefined)) {
+    dispatch.ended = session.last_activity;
+    dispatch.outcome = starting ? 'failed' : 'canceled';
+    dispatch.summary = starting ? 'The session ended before its CLI started.' : 'The session ended without a report.';
+    hub.append(authorOf(hub, session), { type: 'dispatch_finished', data: {
+      dispatch: dispatch.id, outcome: dispatch.outcome, summary: dispatch.summary,
+    } });
+  }
 }
 
 function claimTask(hub: Hub, session: Session): void {

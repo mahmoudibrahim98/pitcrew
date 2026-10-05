@@ -377,6 +377,7 @@ fn sample_task() -> Task {
         due: Some(Date("2026-10-24".into())),
         blocked_by: vec![],
         source: None,
+        archived: false,
         accept_auto: false,
         subtasks: vec![],
     }
@@ -427,6 +428,27 @@ fn task_patch_applies_only_its_fields() {
     assert_eq!(task.description, "");
     assert_eq!(task.start, Some(Date("2026-10-02".into())));
     assert_eq!(task.due, Some(Date("2026-10-30".into())));
+}
+
+#[test]
+fn task_archive_defaults_for_old_documents_and_ignores_future_fields() {
+    let mut value = serde_json::to_value(sample_task()).expect("task JSON");
+    value.as_object_mut().expect("object").remove("archived");
+    value["future_field"] = serde_json::json!("kept compatible");
+    let mut task: Task = serde_json::from_value(value).expect("old task");
+    assert!(!task.archived);
+    TaskPatch {
+        archived: Some(true),
+        ..TaskPatch::default()
+    }
+    .apply(&mut task);
+    assert!(task.archived);
+    TaskPatch {
+        archived: Some(false),
+        ..TaskPatch::default()
+    }
+    .apply(&mut task);
+    assert!(!task.archived);
 }
 
 #[test]

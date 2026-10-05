@@ -45,6 +45,24 @@ const SEEDS = '01JB000000000000000WST0002';
 const PAP2 = '01JB000000000000000TSK0002';
 const PAP4 = ID.pap4;
 
+it('archives and restores a task with its original key, plan and history', () => withServer(async (server) => {
+  const original = await call<Task>(server, 'GET', '/v1/tasks/PAP-1', { token: DEVICE });
+  const before = await rev(server);
+  const archived = await call<Task>(server, 'PATCH', '/v1/tasks/PAP-1', { token: DEVICE, json: { archived: true } });
+  assert.equal(archived.status, 200);
+  assert.equal(archived.body.archived, true);
+  assert.deepEqual(archived.body.subtasks, original.body.subtasks);
+  assert.deepEqual((await lastEvent(server))?.body, { type: 'task_updated', data: { task: original.body.id, patch: { archived: true } } });
+  await call(server, 'PATCH', '/v1/tasks/PAP-1', { token: DEVICE, json: { archived: true } });
+  assert.equal(await rev(server), before + 1);
+  refused(await call(server, 'PATCH', '/v1/tasks/PAP-1', { token: AGENT, json: { archived: false } }), 403, 'person only');
+  refused(await call(server, 'PATCH', '/v1/tasks/PAP-1', { token: DEVICE, json: { archived: 'yes' } }), 400, 'boolean only');
+  const restored = await call<Task>(server, 'PATCH', '/v1/tasks/PAP-1', { token: DEVICE, json: { archived: false } });
+  assert.equal(restored.status, 200);
+  assert.deepEqual(restored.body, { ...original.body, archived: false });
+  assert.equal(await rev(server), before + 2);
+}));
+
 describe('POST /v1/projects', () => {
   it('creates a project with the defaults', () =>
     withServer(async (server) => {

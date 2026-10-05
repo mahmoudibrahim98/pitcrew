@@ -1,5 +1,11 @@
 # pitcrew-hub-work
 
+Task archival is an ordinary checked patch, emitting `task_updated` only on change. Projection
+version 5 rebuilds task documents with `archived` defaulting to false for old events. Lists keep
+archived tasks for dependency resolution; work views hide them. The task dispatch read route
+`GET /v1/tasks/{id-or-key}/dispatches` exposes active and finished runs (outcome, end and summary)
+to both token scopes, with the same task lookup as `GET /v1/tasks/{id-or-key}`.
+
 Session import stores reversible rules via `with_import_file` in a private atomic file. API session reads filter the retained projections; internal runner/command reads remain complete. Recaps rebuild when the choice changes, retaining the original event log.
 
 The hub's model of the work: projects, workstreams, tasks and subtasks, sessions and dispatches,
