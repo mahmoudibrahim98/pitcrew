@@ -102,6 +102,13 @@ const HIDDEN =
   /[\u00AD\u034F\u061C\u115F\u1160\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
 const GAP = /[\s"'`()[\]{}<>,;|]/u;
 
+/** `text` without the trailing characters in `chars`; a loop, so it stays linear on any input. */
+function trimEndOf(text: string, chars: string): string {
+  let end = text.length;
+  while (end > 0 && chars.includes(text[end - 1] ?? '')) end -= 1;
+  return text.slice(0, end);
+}
+
 function isSecretName(name: string): boolean {
   const lower = name.replace(/^\$+/, '').toLowerCase();
   return SECRET_EXACT.includes(lower) || SECRET_NAMES.some((s) => lower.includes(s));
@@ -229,7 +236,7 @@ function wordRules(core: string, count: Count): string {
 function asksForValue(core: string, tail: string): boolean {
   const lower = core.toLowerCase();
   if (SCHEMES.includes(lower)) return true;
-  const named = lower.replace(/[=:]+$/, '');
+  const named = trimEndOf(lower, '=:');
   const option = named.replace(/^-+/, '');
   const endsNamed = tail.startsWith(':') || core.endsWith('=') || core.endsWith(':');
   return (endsNamed || named.length !== option.length) && option !== '' && isSecretName(option);
@@ -261,7 +268,7 @@ export function redactLine(text: string, max: number): { text: string; count: nu
       out += piece;
       continue;
     }
-    const core = piece.replace(/[.:!?]+$/, '');
+    const core = trimEndOf(piece, '.:!?');
     const tail = piece.slice(core.length);
     const scheme = SCHEMES.includes(core.toLowerCase());
     if (valueNext && !scheme && [...core].length >= 3 && !core.startsWith('-')) {
