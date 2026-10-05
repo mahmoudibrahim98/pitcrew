@@ -309,3 +309,5 @@ Settings (`/w/$ws/settings`, sidebar and routing in `core.tsx`) offers Check now
 pre-release opt-in; browser mode explains that the desktop manages updates. Errors stay visible
 and retryable. See the desktop gateway contract and `tests/updates.test.tsx` for the IPC and
 consent checks. Tauri bindings remain dynamic imports outside the initial browser bundle.
+
+Create forms may mark their initial input with `data-create-focus` and React `autoFocus`: the shell focuses it when content is ready, including lazy forms, while preserving focus trapping and return to the opener.

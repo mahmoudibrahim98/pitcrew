@@ -55,14 +55,27 @@ fn start_before_due(start: Option<&Date>, due: Option<&Date>) -> Result<()> {
 }
 
 /// A location on a machine the workspace knows, with a path that is not blank.
-fn known_location(conn: &Connection, location: &Location, field: &str) -> Result<()> {
+fn known_location(
+    conn: &Connection,
+    location: &Location,
+    field: &str,
+    hub_machine: Option<pitcrew_protocol::ids::MachineId>,
+) -> Result<()> {
     if query::machine(conn, &location.machine)?.is_none() {
         return Err(WorkError::invalid(format!(
             "{field}.machine: no machine {}.",
             location.machine
         )));
     }
-    not_empty(&location.path, &format!("{field}.path"))
+    not_empty(&location.path, &format!("{field}.path"))?;
+    if hub_machine == Some(location.machine)
+        && (!std::path::Path::new(&location.path).is_absolute() || location.path.contains('\0'))
+    {
+        return Err(WorkError::invalid(format!(
+            "{field}.path must be absolute for this machine."
+        )));
+    }
+    Ok(())
 }
 
 /// The list without repeats, the first of each kept, in one pass.
@@ -269,7 +282,7 @@ impl WorkService {
                 return Err(WorkError::invalid(format!("members[{i}]: no member {id}.")));
             }
             if let Some(root) = &new.root {
-                known_location(c, root, "root")?;
+                known_location(c, root, "root", self.hub_machine())?;
             }
             match query::project_with_key(c, &new.key)? {
                 Some(holder) => Err(key_in_use(&holder)),

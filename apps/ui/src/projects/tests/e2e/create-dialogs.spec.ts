@@ -7,7 +7,7 @@ async function open(page: Page, item: string, title: string) {
   await page.getByRole('button', { name: 'New', exact: true }).click();
   await page.getByRole('menuitem', { name: item, exact: true }).click();
   const dialog = page.getByRole('dialog', { name: title, exact: true });
-  await expect(dialog.getByLabel('Name', { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel('Name', { exact: true })).toBeFocused();
   return dialog;
 }
 for (const theme of ['light', 'dark'] as const) {
@@ -20,7 +20,7 @@ for (const theme of ['light', 'dark'] as const) {
     await page.goto(`/w/${ws}/members`);
     await page.getByRole('radio', { name: theme === 'light' ? 'Light' : 'Dark', exact: true }).click();
     let dialog = await open(page, 'Agent', 'New agent');
-    await expect(dialog.getByRole('button', { name: 'Close', exact: true })).toBeFocused();
+    await expect(dialog.getByLabel('Name', { exact: true })).toBeFocused();
     await dialog.getByLabel('Name', { exact: true }).fill(`Synthetic agent ${tag}`);
     await dialog.getByLabel('Engine', { exact: true }).selectOption('codex');
     await dialog.getByLabel('Instructions (optional)', { exact: true }).fill('Use synthetic examples.');
@@ -80,6 +80,6 @@ for (const theme of ['light', 'dark'] as const) {
     await page.goto(`/w/${ws}/tasks/01JB000000000000000TSK0002`);
     const dispatch = page.getByRole('combobox', { name: 'Dispatch to', exact: true });
     await expect(dispatch.getByRole('option', { name: new RegExp(`Synthetic agent ${tag}`) })).toHaveAttribute('value', member?.id ?? 'missing');
-    await expect(dispatch.getByRole('option', { name: /@office/ })).toHaveCount(0);
+    await expect(dispatch.getByRole('option', { name: /@office|@sync/ })).toHaveCount(0);
   });
 }

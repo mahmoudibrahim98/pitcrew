@@ -1050,7 +1050,8 @@ check('cursor metadata is private in live/replay and does not consume activity p
     await replay.next();
     assert.equal((await until(replay)).filter((e) => e.body.type === 'cursor_moved').length, 0);
     for (const route of ['/v1/events', '/v1/activity']) {
-      const page = await api(`${route}?limit=3`);
+      // Other conformance files write concurrently; read the privacy barrier snapshot.
+      const page = await api(`${route}?limit=3&before=${hello.rev + 7}`);
       assert.deepEqual(page.events.map((e) => e.id), comments.map((e) => e.id));
       assert.deepEqual(page.revisions, [hello.rev + 2, hello.rev + 4, hello.rev + 6]);
       assert.equal(page.from_rev, page.revisions[0]);
@@ -1084,11 +1085,30 @@ check('directory creation and editing are device-only, validated, event-backed a
   const member = members.find((m) => m.persona === persona.id);
   const me = await api('/v1/me');
   assert.equal(member.kind, 'agent'); assert.equal(member.owner, me.id);
+  const second = process.env.PITCREW_CONFORMANCE_SECOND_PERSON;
+  assert.ok(second, 'second person fixture token');
+  const beforeEdit = (await api('/v1/workspace')).rev;
+  await api(`/v1/personas/${persona.id}`, 403, undefined, { method: 'PUT', token: second, body: { ...recipe, name: 'Stolen' } });
+  for (const change of [{ permission_mode: 'bypass_permissions' }, { model: '--dangerously-skip-permissions' }]) {
+    await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, ...change } });
+    await api(`/v1/personas/${persona.id}`, 400, undefined, { method: 'PUT', body: { ...recipe, ...change } });
+  }
+  assert.equal((await api('/v1/workspace')).rev, beforeEdit);
+  assert.equal((await api('/v1/personas')).find((p) => p.id === persona.id).name, 'Synthetic author');
+  assert.equal((await api('/v1/members')).find((m) => m.id === member.id).name, 'Synthetic author');
+
   const renamed = await api(`/v1/personas/per_${persona.id.replace(/^per_/, '')}`, 200, undefined, { method: 'PUT', body: { ...recipe, name: 'Renamed author' } });
   assert.equal(renamed.id, persona.id);
   members = await api('/v1/members');
   assert.equal(members.find((m) => m.id === member.id).name, 'Renamed author');
   const dispatchTask = await api('/v1/tasks', 201, schemas.task, { method: 'POST', body: { project: context.project.id, title: 'Dispatch new agent' } });
+  const serviceActors = members.filter((m) => m.kind === 'agent' && m.owner === me.id && m.persona === undefined);
+  assert.ok(serviceActors.length > 0, 'owned service actor fixture');
+  const beforeServiceDispatch = (await api('/v1/workspace')).rev;
+  for (const actor of serviceActors) {
+    await api(`/v1/tasks/${dispatchTask.id}/dispatch`, 400, undefined, { method: 'POST', body: { agent: actor.id } });
+  }
+  assert.equal((await api('/v1/workspace')).rev, beforeServiceDispatch);
   const dispatchReply = await raw(`/v1/tasks/${dispatchTask.id}/dispatch`, { method: 'POST', body: { agent: member.id } });
   assert.equal(dispatchReply.status, 202, dispatchReply.data?.message);
   schemas.dispatch(dispatchReply.data);

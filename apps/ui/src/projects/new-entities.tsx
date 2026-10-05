@@ -71,7 +71,7 @@ export function NewProjectDialog({ close }: { close(): void }) {
     create.mutate();
   };
   return <Form submit={submit} pending={create.isPending} error={create.error} valid={name.trim() !== '' && selected !== ''}>
-    <Field label="Name">{(id) => <input id={id} required value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />}</Field>
+    <Field label="Name">{(id) => <input data-create-focus autoFocus id={id} required value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />}</Field>
     <Field label="Key" hint="2–10 uppercase letters or digits, starting with a letter.">{(id) => <input id={id} required pattern="[A-Z][A-Z0-9]{1,9}" value={projectKey} onChange={(e) => setKey(e.target.value.toUpperCase())} className={inputClass} />}</Field>
     <Field label="Machine">{(id) => <select id={id} required value={selected} onChange={(e) => { setMachineId(e.target.value); setRootError(null); }} className={inputClass}>
       {(machines.data ?? []).map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
@@ -100,7 +100,7 @@ export function NewWorkstreamDialog({ close }: { close(): void }) {
       void router.navigate({ href: paths.workstream(ws, workstream.project, workstream.id) });
     } });
   return <Form submit={(e) => { e.preventDefault(); create.mutate(); }} pending={create.isPending} error={create.error} valid={name.trim() !== '' && selected !== ''}>
-    <Field label="Name">{(id) => <input id={id} required value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />}</Field>
+    <Field label="Name">{(id) => <input data-create-focus autoFocus id={id} required value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />}</Field>
     <Field label="Project">{(id) => <select id={id} required value={selected} onChange={(e) => setProject(e.target.value)} className={inputClass}>
       {(projects.data ?? []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
     </select>}</Field>
@@ -123,12 +123,12 @@ export function NewAgentDialog({ close }: { close(): void }) {
       close();
     } });
   return <Form submit={(e) => { e.preventDefault(); create.mutate(); }} pending={create.isPending} error={create.error} valid={name.trim() !== ''}>
-    <Field label="Name">{(id) => <input id={id} required maxLength={80} value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />}</Field>
+    <Field label="Name">{(id) => <input data-create-focus autoFocus id={id} required maxLength={80} value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />}</Field>
     <Field label="Engine">{(id) => <select id={id} value={engine} onChange={(e) => setEngine(e.target.value as Engine)} className={inputClass}>{['claude', 'codex', 'opencode'].map((engine) => <option key={engine}>{engine}</option>)}</select>}</Field>
     <Field label="Model (optional)">{(id) => <input id={id} maxLength={200} value={model} onChange={(e) => setModel(e.target.value)} className={inputClass} />}</Field>
     <Field label="Instructions (optional)">{(id) => <textarea id={id} maxLength={32000} value={instructions} onChange={(e) => setInstructions(e.target.value)} className={inputClass} />}</Field>
     <Field label="Permission mode">{(id) => <select id={id} value={permission} onChange={(e) => setPermission(e.target.value as PermissionMode)} className={inputClass}>
-      <option value="default">Ask before actions (default)</option><option value="accept_edits">Accept edits</option><option value="plan">Plan only</option><option value="bypass_permissions">Bypass permissions</option>
+      <option value="default">Ask before actions (default)</option><option value="accept_edits">Accept edits</option><option value="plan">Plan only</option><option value="bypass_permissions" disabled>Bypass permissions</option>
     </select>}</Field>
     {permission === 'bypass_permissions' && <p className="text-sm text-risk">Agents using this recipe skip CLI permission prompts.</p>}
   </Form>;
@@ -146,7 +146,7 @@ export function NewTeamDialog({ close }: { close(): void }) {
   const create = useMutation({ mutationFn: () => api.createTeam({ name, lead: leadId, members: selected }),
     onSuccess: async () => { await client.invalidateQueries({ queryKey: keys.teams }); close(); } });
   return <Form submit={(e) => { e.preventDefault(); create.mutate(); }} pending={create.isPending} error={create.error} valid={name.trim() !== '' && leadId !== ''}>
-    <Field label="Name">{(id) => <input id={id} required maxLength={80} value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />}</Field>
+    <Field label="Name">{(id) => <input data-create-focus autoFocus id={id} required maxLength={80} value={name} onChange={(e) => setName(e.target.value)} className={inputClass} />}</Field>
     <Field label="Lead">{(id) => <select id={id} required value={leadId} onChange={(e) => setLead(e.target.value)} className={inputClass}>{(members.data ?? []).map((m) => <option key={m.id} value={m.id}>{m.name} ({m.handle})</option>)}</select>}</Field>
     <fieldset className="flex flex-col gap-2"><legend className="text-xs font-medium text-ink-2">Members (lead included automatically)</legend>
       {(members.data ?? []).map((m) => <label key={m.id} className="flex items-center gap-2 text-sm"><input type="checkbox" checked={m.id === leadId || selected.includes(m.id)} disabled={m.id === leadId} onChange={(e) => setSelected(e.target.checked ? [...selected, m.id] : selected.filter((id) => id !== m.id))} />{m.name} {m.kind === 'agent' ? '(agent)' : '(person)'}</label>)}

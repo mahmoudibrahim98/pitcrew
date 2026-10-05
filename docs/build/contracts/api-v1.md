@@ -191,9 +191,9 @@ trimmed, 1–80 code points, with no control characters; model is nonblank, cont
 most 200 code points when supplied; instructions are at most 32,000 code points (multiline).
 Invalid fields answer 400 and append nothing. Ids and event authors are assigned by the hub.
 Creating an agent recipe also creates an agent member owned by the caller, with that persona,
-name and a generated `@agent-<member-id>` handle. This makes it selectable in teams without
+name and a friendly engine handle (`@claude`, `@codex`, `@opencode`, with a numeric suffix only on collision). This makes it selectable in teams without
 changing `Persona` or `Team` fields. Editing a recipe updates its linked members' names in the
-same append. Permission bypass remains an explicit selection; saving a recipe launches nothing.
+same append, only when every linked member is owned by the caller (otherwise 403; unlinked recipes are editable). Bypass permissions and models beginning with `-` are refused (400); saving a recipe launches nothing.
 
 `TeamEdit`: `{ "name": String, "lead": MemberId, "members": MemberId[] }`. Name follows the
 same rule. Members are existing people or agent members (including those linked to personas),
@@ -226,7 +226,9 @@ At most 256 members; validation completes before any event is appended.
 - `status` defaults to `in_progress`.
 - Dates are `YYYY-MM-DD`, and `start` ≤ `due` when both are set (`400`).
 - `root` names a known machine and a non-empty path (`400`). The creation dialog requires an
-  absolute path for the selected platform (drive/UNC on Windows, `/` on Unix).
+  absolute path for the selected platform (drive/UNC on Windows, `/` on Unix). The hub also
+  rejects relative or incompatible paths for its local machine. Setup records its OS and
+  architecture from the hub platform.
 - `first_workstream`, when supplied, is a nonblank workstream name. Both objects are validated
   before one atomic append of `project_created` and `workstream_created`; its location is the
   project's root. This optional extension avoids a half-created project if a second HTTP request
@@ -627,7 +629,7 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   `XDG_DATA_HOME` point). On the daemon these are the runner's homes: `--homes` when given, none
   with `--demo` alone. It reads a prefix of each transcript (one indexed row of an OpenCode
   store), never a whole transcript, and never prompt text. It does not import sessions. During
-  setup, a successful scan also ensures one dispatchable, caller-owned agent per detected engine
+  setup, every successful scan also ensures one dispatchable, caller-owned agent per detected engine
   (`counts.by_engine` with a positive count), before the `done` frame. Missing recipes and members
   are appended together as `persona_saved`/`member_added`, using default permissions. A person who
   already owns an agent with that engine's persona gets no duplicate; repeat/concurrent scans are
@@ -1195,3 +1197,15 @@ has no changes. Conflicting engines are excluded from preview files and skipped,
 with their status shown to the person. CLI homes also establish engine presence
 when a GUI process lacks CLI binaries on PATH. The desktop ships `pitcrew` beside
 `pitcrewd`, and the Hooks step disables Install when there are no file changes.
+
+### Directory write safeguards
+
+`PUT /v1/personas/{id}` answers `403` unless every member linked to the persona is owned by
+the caller; an unlinked persona is editable by any person. Refusals append no events and rename
+no members. Both persona write routes reject `bypass_permissions` with the same message as
+saving safety settings, and reject a trimmed model beginning with `-` (`400 invalid`).
+New agents use `@claude`, `@codex`, or `@opencode`, adding `-2`, `-3`, … only when a handle is
+already taken. Handles remain stable on edits. Dispatch requires an agent linked to an existing
+persona; service actors such as `@office` and `@sync` cannot be dispatched (`400 invalid`).
+Every successful machine scan provisions missing owned agents for the engines it detected;
+repeated scans reuse existing owned, persona-linked agents.

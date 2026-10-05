@@ -39,9 +39,32 @@ function fill(dialog: ReturnType<typeof within>, label: string, value: string) {
 }
 
 describe('create dialogs against the mock hub', () => {
+  it('defaults tasks to the current project and lists only its workstreams, including the fallback project', async () => {
+    const api = app(`projects/${demo.tooling}`);
+    await screen.findByRole('main');
+    useShell.getState().setCreating('task');
+    const task = within(await screen.findByRole('dialog', { name: 'New task' }));
+    const projects = await api.projects();
+    const streams = await api.workstreams();
+    await eventually(() => expect((task.getByLabelText('Project') as HTMLSelectElement).value).toBe(demo.tooling));
+    const options = () => [...(task.getByLabelText('Workstream (optional)') as HTMLSelectElement).options].map((o) => o.value).filter(Boolean);
+    await eventually(() => expect(options()).toEqual(streams.filter((w) => w.project === demo.tooling).map((w) => w.id)));
+    fireEvent.change(task.getByLabelText('Project'), { target: { value: demo.paper } });
+    await eventually(() => expect(options()).toEqual(streams.filter((w) => w.project === demo.paper).map((w) => w.id)));
+    useShell.getState().setCreating(null);
+    await eventually(() => expect(screen.queryByRole('dialog')).toBeNull());
+    // An explicit empty selection exercises the same resolved project id as a fresh dialog.
+    useShell.getState().setCreating('task');
+    const reopened = within(await screen.findByRole('dialog', { name: 'New task' }));
+    fireEvent.change(reopened.getByLabelText('Project'), { target: { value: '' } });
+    const first = projects[0]?.id;
+    await eventually(() => expect([...(reopened.getByLabelText('Workstream (optional)') as HTMLSelectElement).options].map((o) => o.value).filter(Boolean)).toEqual(streams.filter((w) => w.project === first).map((w) => w.id)));
+  });
   it('creates an agent with every persona field and immediately lists it and its team', async () => {
     const api = app();
     const agent = await open('agent', 'New agent');
+    expect(agent.getByLabelText('Name')).toBe(document.activeElement);
+    expect((agent.getByRole('option', { name: 'Bypass permissions' }) as HTMLOptionElement).disabled).toBe(true);
     fill(agent, 'Name', 'Synthetic writer'); fill(agent, 'Engine', 'codex');
     fill(agent, 'Model (optional)', 'demo-model'); fill(agent, 'Instructions (optional)', 'Write synthetic examples.');
     fill(agent, 'Permission mode', 'plan');

@@ -299,7 +299,14 @@ export class Hub {
     this.#listeners.clear();
   }
 
-  /** Provision detected engines once per person, using owned agent members with personas. */
+  agentHandle(engine: Engine): string {
+    const base = `@${engine}`;
+    let handle = base;
+    for (let suffix = 2; this.members.some((m) => m.handle === handle); suffix++) handle = `${base}-${suffix}`;
+    return handle;
+  }
+
+  /** Provision missing detected engines on every successful scan per person, using owned agent members with personas. */
   ensureEngineAgents(person: MemberId, engines: readonly Engine[]): Member[] {
     const owned = new Set(this.members.filter((m) => m.kind === 'agent' && m.owner === person)
       .flatMap((m) => { const persona = this.personas.find((p) => p.id === m.persona); return persona === undefined ? [] : [persona.engine]; }));
@@ -309,7 +316,7 @@ export class Hub {
       owned.add(engine);
       const persona: Persona = { id: ulid(), name: { claude: 'Claude', codex: 'Codex', opencode: 'OpenCode' }[engine], engine, permission_mode: 'default' };
       const id = ulid();
-      const member: Member = { id, kind: 'agent', handle: `@agent-${id.toLowerCase()}`,
+      const member: Member = { id, kind: 'agent', handle: this.agentHandle(engine),
         name: persona.name, owner: person, persona: persona.id };
       this.personas.push(persona); this.members.push(member);
       this.append(person, { type: 'persona_saved', data: { persona } });

@@ -283,3 +283,5 @@ Run `corepack pnpm --filter @pitcrew/ui exec playwright test -c
 src/projects/tests/e2e/create-dialogs.config.ts` for both themes, validation, live lists, palette,
 focus and axe. `E2E_HUB_URL` and `E2E_HUB_TOKEN` select a disposable real demo hub for the same tests;
 defaults start the mock hub. `tests/create-dialogs.test.tsx` covers the forms and platform roots.
+
+Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.

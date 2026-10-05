@@ -422,7 +422,7 @@ function DispatchForm({ task }: { task: Task }) {
   const members = useMembers();
   const dispatch = useDispatchTask();
   const me = useMe();
-  const agents = (members.data ?? []).filter((m) => m.kind === 'agent' && m.owner === me.data?.id && m.handle !== '@office');
+  const agents = (members.data ?? []).filter((m) => m.kind === 'agent' && m.owner === me.data?.id && m.persona !== undefined);
   const [agent, setAgent] = useState('');
   const [brief, setBrief] = useState('');
   const chosen = agent !== '' ? agent : (agents[0]?.id ?? '');
@@ -442,7 +442,7 @@ function DispatchForm({ task }: { task: Task }) {
             <select id={id} value={chosen} onChange={(e) => setAgent(e.target.value)} className={cx(inputClass, 'w-auto')}>
               {agents.map((a) => (
                 <option key={a.id} value={a.id}>
-                  {a.handle.startsWith('@agent-') ? `${a.name} (${a.handle})` : a.handle}
+                  {a.persona !== undefined ? `${a.name} (${a.handle})` : a.handle}
                 </option>
               ))}
             </select>

@@ -639,11 +639,29 @@ fn edits(work: &WorkService, rerun: TaskId) {
     let mut clash = thesis.clone();
     clash.id = ProjectId::new();
     clash.name = "Same key".into();
+    let rejected_project = clash.id;
     raw(
         work,
         member(SAM),
         None,
         EventBody::ProjectCreated { project: clash },
+    );
+    let mut orphan = chapter.clone();
+    orphan.id = pitcrew_protocol::ids::WorkstreamId::new();
+    orphan.project = rejected_project;
+    let orphan_id = orphan.id;
+    raw(
+        work,
+        member(SAM),
+        None,
+        EventBody::WorkstreamCreated { workstream: orphan },
+    );
+    assert!(
+        !work
+            .workstreams(None)
+            .expect("workstreams")
+            .iter()
+            .any(|w| w.id == orphan_id)
     );
     // Briefs: a pending proposal; one accepted unchanged; one for a target without a brief; one
     // the back office applies itself.

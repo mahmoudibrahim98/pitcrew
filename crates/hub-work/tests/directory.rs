@@ -15,6 +15,8 @@ async fn directory_writes_validate_authorize_and_rebuild() {
         json!({"name":" ","engine":"codex"}),
         json!({"name":"bad\u{85}","engine":"codex"}),
         json!({"name":"x","engine":"invalid"}),
+        json!({"name":"x","engine":"claude","model":" --dangerously-skip-permissions "}),
+        json!({"name":"x","engine":"claude","permission_mode":"bypass_permissions"}),
         json!({"name":"x","engine":"codex","instructions":"x".repeat(32001)}),
     ] {
         expect(
@@ -185,4 +187,129 @@ async fn optional_workstream_is_validated_and_appended_with_its_project() {
         409,
     );
     assert_eq!(work.store().latest_rev().expect("rev"), rev + 2);
+}
+
+#[tokio::test]
+async fn editing_requires_ownership_of_every_linked_member_but_unlinked_recipes_are_editable() {
+    use pitcrew_protocol::{
+        events::{Event, EventBody},
+        ids::{EventId, MemberId, PersonaId},
+        model::{Engine, Member, MemberKind, PermissionMode, Persona},
+    };
+    let dir = tempfile::tempdir().expect("temp");
+    let work = seeded(dir.path());
+    let app = app(&work);
+    let other = MemberId::new();
+    let id = PersonaId::new();
+    let recipe = Persona {
+        id,
+        name: "Synthetic shared recipe".into(),
+        engine: Engine::Claude,
+        model: None,
+        instructions: None,
+        permission_mode: PermissionMode::Default,
+    };
+    let own = Member {
+        id: MemberId::new(),
+        kind: MemberKind::Agent,
+        handle: "@shared-own".into(),
+        name: recipe.name.clone(),
+        owner: Some(person(SAM).member),
+        persona: Some(id),
+    };
+    let foreign = Member {
+        id: MemberId::new(),
+        kind: MemberKind::Agent,
+        handle: "@shared-other".into(),
+        name: recipe.name.clone(),
+        owner: Some(other),
+        persona: Some(id),
+    };
+    let append = |bodies: Vec<EventBody>| {
+        let events: Vec<_> = bodies
+            .into_iter()
+            .map(|body| Event {
+                id: EventId::new(),
+                at: 1790900000000,
+                workspace: work.workspace(),
+                author: person(SAM).member,
+                on_behalf_of: None,
+                body,
+            })
+            .collect();
+        work.store().append(&events).expect("append");
+    };
+    append(vec![EventBody::PersonaSaved {
+        persona: recipe.clone(),
+    }]);
+    expect(
+        &call(
+            &app,
+            Some(person(SAM)),
+            "PUT",
+            &format!("/v1/personas/{id}"),
+            Some(json!({"name":"Unlinked edit","engine":"claude"})),
+        )
+        .await,
+        200,
+    );
+    append(vec![
+        EventBody::MemberAdded {
+            member: own.clone(),
+        },
+        EventBody::MemberAdded {
+            member: foreign.clone(),
+        },
+    ]);
+    let rev = work.store().latest_rev().expect("rev");
+    expect(
+        &call(
+            &app,
+            Some(person(SAM)),
+            "PUT",
+            &format!("/v1/personas/{id}"),
+            Some(json!({"name":"Stolen","engine":"claude"})),
+        )
+        .await,
+        403,
+    );
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    assert_eq!(
+        work.members()
+            .expect("members")
+            .into_iter()
+            .find(|m| m.id == foreign.id)
+            .expect("foreign")
+            .name,
+        foreign.name
+    );
+    let caller = person(SAM);
+    let created = call(
+        &app,
+        Some(caller),
+        "POST",
+        "/v1/personas",
+        Some(json!({"name":"Synthetic one","engine":"opencode"})),
+    )
+    .await;
+    let second = call(
+        &app,
+        Some(caller),
+        "POST",
+        "/v1/personas",
+        Some(json!({"name":"Synthetic two","engine":"opencode"})),
+    )
+    .await;
+    for (recipe, handle) in [(created.1, "@opencode"), (second.1, "@opencode-2")] {
+        assert_eq!(
+            work.members()
+                .expect("members")
+                .iter()
+                .find(|m| m.persona.map(|p| p.0.to_string())
+                    == recipe["id"].as_str().map(str::to_owned))
+                .expect("member")
+                .handle,
+            handle
+        );
+    }
 }

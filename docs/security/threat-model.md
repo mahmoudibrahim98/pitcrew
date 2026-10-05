@@ -326,6 +326,8 @@ reads or copies a login).
 | T91 | **A fix changes the machine**: a check or a fix installs system packages, runs `sudo` or a package manager, downloads something, or a check hangs on a tool | No route runs a fix: a fix is the client's. `install_page` opens the tool's install page **from the UI's own table** (`install-pages.ts`), keyed by the row; neither the hub nor a remote machine names a URL. The only install is PitCrew's own helper (`install_helper`, the reviewed add). The hub's check runs each tool's version command only, found on absolute `PATH` entries, with no input, for at most 15 s, with everything it starts killed on a timeout or when the run is given up (its process group on Unix, a Job Object on Windows: `claude.cmd`'s `node.exe` too); the SSH check script runs `command -v`, `--version` under `timeout 10` and `df`, and writes nowhere | `crates/daemon/src/machine_setup/check.rs`, `tools.rs` (`Tools::find`, `Tools::run`); `crates/remote/src/check.rs` (`SCRIPT`); `apps/ui/src/onboarding/install-pages.ts`, `hub-api.ts` (`fixMachineRow`) | `crates/daemon/tests/machine_setup.rs` (tripwire package managers, `sudo`, `curl` … on `PATH`: none ran); `tools.rs` `a_run_is_bounded_in_time_and_output`, `a_run_given_up_stops_what_it_started`, `only_executable_files_on_absolute_entries_are_found`; `crates/remote/src/check.rs` `the_script_installs_nothing`, `the_script_runs_in_any_sh_and_reports_the_stand_ins`; `apps/ui/src/onboarding/machine-setup.test.tsx` | O, J | In place. Residual: a version command is still a program on the person's `PATH`, run as the person (as the runner's agents are) |
 | T92 | A hostile remote hub or machine makes the wizard show misleading rows or open a page of its choosing | The UI checks every row and account it is sent (known ids, statuses and fixes only, text cut to a line, control characters made spaces and hidden ones dropped: direction overrides such as U+202E, zero-width and tag characters, `pitcrew_protocol::text::is_hidden`'s table, as the hub's own check cleans its lines) and drops the rest; a fix's page comes from the UI's table; the desktop opens no browser window (the page is shown to copy) | `apps/ui/src/onboarding/machine-wire.ts`, `check-rows.tsx`; `apps/ui/src/data/remote.ts` (`parseRemoteProbe`) | `apps/ui/src/onboarding/machine-setup.test.tsx` | O | In place |
 
+| T93 | Directory writes change another person's agent recipe or launch policy, forge team membership, or leave an orphan after a project key race | Persona/team writes are device-only, bounded and validated before append. Persona edits require ownership of every linked member (unlinked recipes are editable by people); members are renamed in the same transaction. Bypass permissions and option-like models are refused. Dispatch requires an owned persona-linked agent. Team ids are existing members, with the lead included. Project plus first workstream commit atomically; projection skips workstreams with missing projects. Local roots must be absolute on the hub platform. | `crates/hub-work/src/directory.rs`, `dispatch.rs`, `edits.rs`, `setup.rs`, `projection/projects.rs`; mock parity in `apps/mock-hub/src/routes.ts` | `crates/hub-work/tests/directory.rs`, `dispatch.rs`, `setup.rs`, `rebuild.rs`; `apps/mock-hub/test/directory.test.ts`; `tests/conformance/api.test.mjs`; create-dialog unit/browser tests | 0 | In place. Residual: unlinked personas and teams are shared device-editable workspace data; no finer team ownership policy exists. |
+
 ## 6. Findings from reviews
 
 What reviews of merged or in-review branches found, and where each stands. R7 to R10, R24 and R25
@@ -682,7 +684,7 @@ The plan's security table and the ADRs' security commitments (ADR-0003, ADR-0006
 | The hub stays available: bounded queues, caches and indexes | T38, T42, T48, T67 |
 | CLI logins stay the CLIs' own; onboarding installs no system package (ADR-0010) | T90–T92 |
 
-## Directory creation (integrator/create-dialogs)
+## Directory creation (T93)
 
 Persona and team POST/PUT routes are device-only, both at the router and in the command service.
 The hub assigns ids and event authors; client-supplied author/owner/id fields never grant authority.
@@ -690,10 +692,7 @@ Names and models are trimmed, bounded and control-free; instructions and members
 bounded. Every reference is checked under the single-writer lock before appending. Creating a
 persona and its owned agent member, and creating a project with its optional first workstream,
 use one event batch so a validation or storage failure cannot leave half a creation. Team members
-are existing member identities; persona ids cannot masquerade as members. Saving a permission
-recipe starts no process: the runner's existing permission-bypass opt-in and audit rules still
-apply when an agent is launched. The UI renders names/instructions as text and requires an
-explicit bypass selection. Tests: `crates/hub-work/tests/directory.rs`, directory and atomic-project
+are existing member identities; persona ids cannot masquerade as members. Persona saves reject bypass permissions and option-like models; the runner also enforces its permission policy. The UI renders names/instructions as text and disables bypass selection. Tests: `crates/hub-work/tests/directory.rs`, directory and atomic-project
 cases in `tests/conformance/api.test.mjs`, and the projects create-dialog unit/browser tests.
 
 A successful setup scan provisions missing detected engines as person-owned agent members and

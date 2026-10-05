@@ -36,9 +36,27 @@ impl WorkService {
             self.read(|c| query::persona(c, &id))?
                 .ok_or_else(|| WorkError::not_found("No such persona."))?;
         }
+        if let Some(id) = id
+            && self
+                .members()?
+                .iter()
+                .any(|m| m.persona == Some(id) && m.owner != Some(caller.member))
+        {
+            return Err(WorkError::forbidden(
+                "A person may edit only personas whose members they own.",
+            ));
+        }
         self.read(|c| known_member(c, &caller.member, "caller"))?;
+        if edit.permission_mode == PermissionMode::BypassPermissions {
+            return Err(WorkError::invalid(
+                "Bypass permissions cannot be saved as the workspace default while the runner disallows it.",
+            ));
+        }
         let name = text(edit.name, "name", 80)?;
         let model = edit.model.map(|v| text(v, "model", 200)).transpose()?;
+        if model.as_ref().is_some_and(|m| m.starts_with('-')) {
+            return Err(WorkError::invalid("model must not start with '-'."));
+        }
         if edit
             .instructions
             .as_ref()
@@ -67,7 +85,7 @@ impl WorkService {
             let member = Member {
                 id: member_id,
                 kind: MemberKind::Agent,
-                handle: format!("@agent-{}", member_id.0.to_string().to_lowercase()),
+                handle: agent_handle(persona.engine, &self.members()?),
                 name: persona.name.clone(),
                 owner: Some(caller.member),
                 persona: Some(persona.id),
@@ -158,6 +176,7 @@ impl WorkService {
             Ok(owned)
         })?;
         let mut events = Vec::new();
+        let mut members = self.members()?;
         let mut created = Vec::new();
         for engine in engines {
             if !owned.insert(*engine) {
@@ -175,7 +194,7 @@ impl WorkService {
             let member = Member {
                 id,
                 kind: MemberKind::Agent,
-                handle: format!("@agent-{}", id.0.to_string().to_lowercase()),
+                handle: agent_handle(*engine, &members),
                 name: persona.name.clone(),
                 owner: Some(caller.member),
                 persona: Some(persona.id),
@@ -187,6 +206,7 @@ impl WorkService {
                     member: member.clone(),
                 },
             ));
+            members.push(member.clone());
             created.push(member);
         }
         if !events.is_empty() {
@@ -194,4 +214,20 @@ impl WorkService {
         }
         Ok(created)
     }
+}
+
+fn agent_handle(engine: Engine, members: &[Member]) -> String {
+    let base = match engine {
+        Engine::Claude => "@claude",
+        Engine::Codex => "@codex",
+        Engine::OpenCode => "@opencode",
+        _ => "@agent",
+    };
+    let mut handle = base.to_owned();
+    let mut suffix = 2;
+    while members.iter().any(|m| m.handle == handle) {
+        handle = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    handle
 }

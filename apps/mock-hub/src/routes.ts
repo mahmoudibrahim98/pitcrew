@@ -406,7 +406,7 @@ const setupHub: Handler = (hub, ctx) => {
   // The person is the device token's own member id, which nothing knew until now.
   const me = ctx.caller.memberId;
   const member: Member = { id: me, kind: 'human', handle, name };
-  const machine: Machine = { id: ulid(), name: machineName, kind: 'local', liveness: 'live' };
+  const machine: Machine = { id: ulid(), name: machineName, kind: 'local', liveness: 'live', info: { hostname: machineName, os: process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : process.platform, arch: process.arch === 'x64' ? 'x86_64' : process.arch === 'arm64' ? 'aarch64' : process.arch, has_tmux: false, home_on_network_fs: false } };
   hub.members.push(member);
   hub.machines.push(machine);
   hub.workspace.name = workspaceName;
@@ -428,6 +428,7 @@ function directoryText(value: string, field: string, max: number): string {
 const savePersona = (editing = false): Handler => (hub, ctx) => {
   const previous = !editing ? undefined
     : found(hub.findPersona(ctx.param('id')), 'No such persona.');
+  if (previous !== undefined && hub.members.some((m) => m.persona === previous.id && m.owner !== ctx.caller.memberId)) throw forbidden('A person may edit only personas whose members they own.');
   memberRef(hub, ctx.caller.memberId, 'caller');
   const f = new Fields(ctx.body);
   const name = directoryText(f.string('name'), 'name', 80);
@@ -438,9 +439,11 @@ const savePersona = (editing = false): Handler => (hub, ctx) => {
   if (instructions !== undefined && [...instructions].length > 32_000) throw invalid('instructions must be at most 32000 characters.');
   const persona: Persona = { id: previous?.id ?? ulid(), name, model, instructions,
     engine: f.enumOf('engine', ENGINES), permission_mode: f.optEnum('permission_mode', PERMISSION_MODES) ?? 'default' };
+  if (persona.permission_mode === 'bypass_permissions') throw invalid('Bypass permissions cannot be saved as the workspace default while the runner disallows it.');
+  if (model?.startsWith('-')) throw invalid("model must not start with '-'.");
   const members: Member[] = previous === undefined ? (() => {
     const id = ulid();
-    return [{ id, name, handle: `@agent-${id.toLowerCase()}`, kind: 'agent', owner: ctx.caller.memberId, persona: persona.id }];
+    return [{ id, name, handle: hub.agentHandle(persona.engine), kind: 'agent', owner: ctx.caller.memberId, persona: persona.id }];
   })() : hub.members.filter((m) => m.persona === persona.id).map((m) => ({ ...m, name }));
   if (previous === undefined) hub.personas.push(persona);
   else hub.personas[hub.personas.indexOf(previous)] = persona;
@@ -561,6 +564,7 @@ const createWorkstream: Handler = (hub, ctx) => {
 function knownLocation(hub: Hub, value: unknown, where: string): Location {
   const location = readLocation(value, where);
   const machine = known(hub.findMachine(location.machine), `${where}.machine: no machine ${location.machine}.`);
+  if (machine.id === hub.machines.find((m) => m.kind === 'local')?.id && (location.path.includes('\0') || !(process.platform === 'win32' ? /^[A-Za-z]:[\\/]/.test(location.path) || /^\\\\[^\\/]+\\[^\\/]+(?:\\|$)/.test(location.path) : location.path.startsWith('/')))) throw invalid(`${where}.path must be absolute for this machine.`);
   return { ...location, machine: machine.id };
 }
 
@@ -974,6 +978,8 @@ const dispatchTask: Handler = (hub, ctx) => {
   const task = taskAt(hub, ctx.param('id'));
   const fields = new Fields(ctx.body);
   const agent = agentRef(hub, fields.string('agent'), 'agent');
+  if (agent.owner !== ctx.caller.memberId) throw forbidden(`${agent.handle} is not your agent: a person may run only their own agents.`);
+  if (agent.persona === undefined || hub.findPersona(agent.persona) === undefined) throw invalid('agent must have a persona to dispatch.');
   const brief = fields.optString('brief') ?? (task.description !== '' ? task.description : task.title);
   const place = placeFor(hub, task, fields.optString('machine'));
   if (task.status === 'done' || task.status === 'canceled') {

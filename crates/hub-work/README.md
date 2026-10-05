@@ -749,3 +749,5 @@ skipped engines. No-change previews cannot set the wizard's installed flag.
 Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
+
+Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.
