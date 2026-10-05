@@ -81,6 +81,8 @@ export interface CreateEntry {
   /** `task`, `agent`, `project` and `team` replace the shell's placeholders. */
   id: string;
   label: string;
+  /** Only show in the menu and palette when a project route is in context. */
+  projectContext?: boolean;
   /** The dialog's title; default "New <label>". */
   title?: string;
   /** The dialog body. Wrap a heavy form in `React.lazy`; the shell adds the Suspense boundary. */

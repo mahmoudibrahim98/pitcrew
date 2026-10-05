@@ -227,3 +227,8 @@ wrong as soon as the text holds a character outside ASCII.
 hub). It is presentation data, not authorization. File reads and writes still use the
 workstream location index, relative paths, revisions and the existing transport.
 `useSession(undefined)` is idle, allowing the workbench’s file tabs to omit a session lookup.
+
+`api.createPersona`/`editPersona` and `createTeam`/`editTeam` use the device-only directory write
+routes. Their `persona_saved`, `member_added` and `team_saved` events already invalidate the shared
+lists; creation forms also refresh their own lists on success. Machines expose their optional
+reported `info.os` to validate creation roots against that machine rather than the browser OS.
