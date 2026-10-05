@@ -39,4 +39,9 @@ finished_at?: number,
 /**
  * What came of it.
  */
-result?: WriteResult, };
+result?: WriteResult, 
+/**
+ * The person whose retry (`write_retry_requested`) waits to be sent; cleared by the attempt
+ * that uses it.
+ */
+retry_requested_by?: MemberId, };

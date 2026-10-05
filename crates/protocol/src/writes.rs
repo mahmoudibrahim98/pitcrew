@@ -60,7 +60,9 @@ pub enum CloseReason {
 }
 
 /// The fields of a write: what it sends (`after`), or upstream's values of the same fields
-/// before it (`before`). Only the fields being changed are present.
+/// before it (`before`). Only the fields being changed are present. An `update` changes labels
+/// with `add_labels` and `remove_labels`, never the whole list, so labels upstream has that the
+/// hub does not hold are kept.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct WriteFields {
@@ -72,10 +74,19 @@ pub struct WriteFields {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub body: Option<String>,
-    /// The whole label list.
+    /// The whole label list: a new issue's (`create_issue`), or, in `before`, upstream's labels
+    /// as last read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub labels: Option<Vec<String>>,
+    /// Labels an `update` adds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub add_labels: Option<Vec<String>>,
+    /// Labels an `update` removes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub remove_labels: Option<Vec<String>>,
     /// GitHub: the milestone, as a link key (`owner/repo#milestone:2`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -113,6 +124,8 @@ impl WriteFields {
             (self.title.is_some(), "title"),
             (self.body.is_some(), "body"),
             (self.labels.is_some(), "labels"),
+            (self.add_labels.is_some(), "add_labels"),
+            (self.remove_labels.is_some(), "remove_labels"),
             (self.milestone.is_some(), "milestone"),
             (self.epic.is_some(), "epic"),
             (self.state.is_some(), "state"),
@@ -254,6 +267,11 @@ pub struct UpstreamWrite {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub result: Option<WriteResult>,
+    /// The person whose retry (`write_retry_requested`) waits to be sent; cleared by the attempt
+    /// that uses it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub retry_requested_by: Option<MemberId>,
 }
 
 /// `POST /v1/writes`: a person asks for a write.
@@ -306,6 +324,16 @@ mod tests {
             ..WriteFields::default()
         };
         assert_eq!(fields.names(), vec!["title", "state"]);
+        let labels = WriteFields {
+            add_labels: Some(vec!["security".into()]),
+            remove_labels: Some(vec!["bug".into()]),
+            ..WriteFields::default()
+        };
+        assert_eq!(labels.names(), vec!["add_labels", "remove_labels"]);
+        assert_eq!(
+            serde_json::to_value(&labels).unwrap(),
+            serde_json::json!({"add_labels": ["security"], "remove_labels": ["bug"]})
+        );
         assert!(WriteFields::default().is_empty());
         assert_eq!(
             serde_json::to_value(&fields).unwrap(),

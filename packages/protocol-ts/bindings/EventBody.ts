@@ -361,7 +361,19 @@ task?: TaskId,
 /**
  * Which attempt, from 1.
  */
-attempt: number, } } | { "type": "write_finished", "data": { 
+attempt: number, } } | { "type": "write_retry_requested", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * The person who asked.
+ */
+by: MemberId, } } | { "type": "write_finished", "data": { 
 /**
  * The write's approval ask.
  */

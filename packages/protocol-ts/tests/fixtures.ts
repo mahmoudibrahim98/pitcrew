@@ -215,6 +215,14 @@ export const write: import('../index.ts').UpstreamWrite = {
   },
   "state": "sent"
 };
+export const writeRetryRequested: import('../index.ts').EventBody = {
+  "data": {
+    "ask": "01J00000000000000000000000",
+    "by": "01J00000000000000000000000",
+    "task": "01J00000000000000000000000"
+  },
+  "type": "write_retry_requested"
+};
 export const writeFinished: import('../index.ts').EventBody = {
   "data": {
     "ask": "01J00000000000000000000000",

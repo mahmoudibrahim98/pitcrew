@@ -4,7 +4,9 @@ import type { IssueState } from "./IssueState.ts";
 
 /**
  * The fields of a write: what it sends (`after`), or upstream's values of the same fields
- * before it (`before`). Only the fields being changed are present.
+ * before it (`before`). Only the fields being changed are present. An `update` changes labels
+ * with `add_labels` and `remove_labels`, never the whole list, so labels upstream has that the
+ * hub does not hold are kept.
  */
 export type WriteFields = { 
 /**
@@ -16,9 +18,18 @@ title?: string,
  */
 body?: string, 
 /**
- * The whole label list.
+ * The whole label list: a new issue's (`create_issue`), or, in `before`, upstream's labels
+ * as last read.
  */
 labels?: Array<string>, 
+/**
+ * Labels an `update` adds.
+ */
+add_labels?: Array<string>, 
+/**
+ * Labels an `update` removes.
+ */
+remove_labels?: Array<string>, 
 /**
  * GitHub: the milestone, as a link key (`owner/repo#milestone:2`).
  */

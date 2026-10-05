@@ -384,6 +384,18 @@ pub enum EventBody {
         /// Which attempt, from 1.
         attempt: u32,
     },
+    /// A person asked to send a failed write again. The next attempt (`write_started`) uses it;
+    /// a failed write is never started again without one.
+    WriteRetryRequested {
+        /// The write's approval ask.
+        ask: AskId,
+        /// Its task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        task: Option<TaskId>,
+        /// The person who asked.
+        by: MemberId,
+    },
     /// An attempt ended, or a write was settled without being sent.
     WriteFinished {
         /// The write's approval ask.

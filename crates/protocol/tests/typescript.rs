@@ -427,6 +427,17 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
                 created: None,
                 url: Some("https://github.com/example-org/demo-repo/issues/1".into()),
             }),
+            retry_requested_by: None,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "writeRetryRequested",
+        events::EventBody::WriteRetryRequested {
+            ask,
+            task: Some(id),
+            by: "01J00000000000000000000000".parse()?,
         },
     )?;
     fixture(
