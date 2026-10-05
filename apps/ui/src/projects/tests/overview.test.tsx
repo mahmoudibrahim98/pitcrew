@@ -5,7 +5,7 @@ import { fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Home } from '../home.tsx';
 import { ProjectOverview, WorkstreamOverview } from '../overview.tsx';
-import { demo, eventually, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
+import { AGENT_TOKEN, demo, eventually, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
 describe('ProjectOverview and WorkstreamOverview', () => {
   let hub: Hub;
@@ -112,13 +112,22 @@ describe('Home', () => {
     renderWithHub(<Home />, hub);
     const since = await screen.findByRole('region', { name: 'Since you last looked' });
     const changes = await within(since).findByRole('list', { name: 'Changes' });
-    expect(within(changes).getAllByRole('listitem')).toHaveLength(15);
-    expect(within(since).getByText('15 new changes')).toBeTruthy();
+    // Fifteen events: @sam's own four (three dispatches, a brief) are left out, and each
+    // session's events are a line of their own, named by its agent.
+    expect(within(changes).getAllByRole('listitem')).toHaveLength(11);
+    expect(within(since).getByText('11 new changes')).toBeTruthy();
+    expect(within(changes).queryByText('@sam')).toBeNull();
+    // Newest first, by when it happened.
+    const items = within(changes).getAllByRole('listitem');
+    const times = items.map((li) => Date.parse(li.querySelector('time')?.getAttribute('datetime') ?? ''));
+    expect(times).toEqual([...times].sort((a, b) => b - a));
     fireEvent.click(await within(since).findByRole('button', { name: 'Mark all as read' }));
     await within(since).findByText('Nothing new since you last looked.');
     expect(await otherClient(hub).request('GET', '/v1/me/cursors')).toEqual([{ scope: 'workspace', rev: 15 }]);
 
-    await otherClient(hub).moveTask('PAP-2', 'in_progress');
+    // My own change is not news; the agent's is.
+    await otherClient(hub).moveTask('PAP-5', 'in_progress');
+    await otherClient(hub, AGENT_TOKEN).moveTask('PAP-2', 'in_progress');
     const fresh = await within(since).findByRole('list', { name: 'Changes' });
     await eventually(() => expect(within(fresh).getAllByRole('listitem')).toHaveLength(1));
     expect(within(fresh).getByText('moved PAP-2 from Todo to In progress')).toBeTruthy();

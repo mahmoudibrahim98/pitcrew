@@ -4,7 +4,7 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, useAsks, useSession, type TranscriptItemOf } from '../data/index.ts';
+import { ApiError, subagentsByParent, useAsks, useSession, useSessions, type Session, type TranscriptItemOf } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import { ChatRowView, PlanChecklist, type RowContext } from './chat-rows.tsx';
 import { usePending, useTranscript } from './data.ts';
@@ -22,7 +22,10 @@ const ESTIMATE: Record<ChatRowType, number> = {
   plan: 120,
   question: 150,
   turn: 32,
+  subagent: 36,
 };
+
+const NO_SUBAGENTS: Session[] = [];
 
 /** How close to the top (px) a scroll loads the page before. */
 const LOAD_OLDER_WITHIN = 400;
@@ -36,6 +39,10 @@ export interface ChatViewProps {
   className?: string;
   /** The region's name ("Chat"); the workbench makes it unique per pane. */
   label?: string | undefined;
+  /** Where a sub-agent's transcript is, for the links where each sub-agent ran. */
+  sessionHref?: ((session: string) => string) | undefined;
+  /** Opens a sub-agent's transcript on a plain click. */
+  onOpenSession?: ((session: string) => void) | undefined;
 }
 
 export function ChatView(props: ChatViewProps) {
@@ -43,14 +50,19 @@ export function ChatView(props: ChatViewProps) {
   return <ChatViewBody key={props.sessionId} {...props} />;
 }
 
-function ChatViewBody({ sessionId, pageSize, className, label }: ChatViewProps) {
+function ChatViewBody({ sessionId, pageSize, className, label, sessionHref, onOpenSession }: ChatViewProps) {
   'use no memo'; // TanStack Virtual's instance changes under the React Compiler's memoisation.
   const transcript = useTranscript(sessionId, { pageSize });
   const { view } = transcript;
   const session = useSession(sessionId);
+  const sessions = useSessions();
   const asks = useAsks();
   const pending = usePending(sessionId, view);
-  const rows = useMemo(() => buildRows(view, pending), [view, pending]);
+  const subagents = useMemo(
+    () => (sessions.data === undefined ? NO_SUBAGENTS : (subagentsByParent(sessions.data).get(sessionId) ?? NO_SUBAGENTS)),
+    [sessions.data, sessionId],
+  );
+  const rows = useMemo(() => buildRows(view, pending, subagents), [view, pending, subagents]);
   const plan = useMemo(() => latestPlan(view.items), [view.items]);
 
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
@@ -71,6 +83,8 @@ function ChatViewBody({ sessionId, pageSize, className, label }: ChatViewProps) 
     asksKnown: asks.data !== undefined || asks.isError,
     expanded,
     toggle,
+    sessionHref,
+    onOpenSession,
   };
 
   const scrollRef = useRef<HTMLDivElement>(null);

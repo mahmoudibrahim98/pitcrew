@@ -28,6 +28,9 @@ export interface SessionHeaderProps {
   compact?: boolean;
   /** The "Linked work" landmark's name; the workbench makes it unique per pane. */
   linksLabel?: string | undefined;
+  /** Where a session is, for a sub-agent's link to its parent; a plain click calls `onOpenSession`. */
+  sessionHref?: ((session: string) => string) | undefined;
+  onOpenSession?: ((session: string) => void) | undefined;
   className?: string;
 }
 
@@ -132,6 +135,14 @@ export function SessionHeader(props: SessionHeaderProps) {
         </dl>
       )}
 
+      {!props.compact && s.parent !== undefined && (
+        <ParentLink
+          parent={s.parent}
+          href={props.sessionHref?.(s.parent)}
+          onOpen={props.onOpenSession === undefined ? undefined : () => props.onOpenSession?.(s.parent ?? '')}
+        />
+      )}
+
       {!props.compact && (s.task !== undefined || s.workstream !== undefined) && (
         <nav aria-label={props.linksLabel ?? 'Linked work'} className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
           {linkedTask !== undefined && (
@@ -173,6 +184,19 @@ export function SessionHeader(props: SessionHeaderProps) {
         </div>
       )}
     </header>
+  );
+}
+
+/** A sub-agent's parent: it ran as part of that session's work. */
+function ParentLink({ parent, href, onOpen }: { parent: string; href: string | undefined; onOpen: (() => void) | undefined }) {
+  const session = useSession(parent);
+  // A parent the hub does not know (not imported, or gone): no line, the session stands alone.
+  if (session.data === undefined) return null;
+  return (
+    <p className="flex min-w-0 items-center gap-1 text-xs">
+      <span className="shrink-0 text-ink-2">Sub-agent of</span>
+      <LinkedWork label="" text={sessionTitle(session.data)} href={href} onOpen={onOpen} />
+    </p>
   );
 }
 

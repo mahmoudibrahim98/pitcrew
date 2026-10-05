@@ -3,7 +3,7 @@
 // commands, and placeholder "+ New" dialogs.
 
 import { createRoute, lazyRouteComponent, type AnyRoute } from '@tanstack/react-router';
-import { useMe, useSessions, useTasks } from '../data/index.ts';
+import { topLevel, useMe, useSessions, useTasks } from '../data/index.ts';
 import {
   Badge,
   Button,
@@ -43,8 +43,10 @@ function MyTasksCount() {
 }
 
 function ConsoleCount() {
-  const sessions = useSessions().data;
-  if (sessions === undefined) return null;
+  const all = useSessions().data;
+  if (all === undefined) return null;
+  // Agents only: a sub-agent is part of its parent's work.
+  const sessions = topLevel(all);
   const working = sessions.filter((s) => s.state === 'working').length;
   const waiting = sessions.filter((s) => s.state === 'waiting').length;
   return (

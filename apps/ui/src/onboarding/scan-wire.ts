@@ -13,8 +13,12 @@ export interface WireScanProgress {
 }
 
 export interface WireWorkstreamSuggestion {
-  /** A sub-folder's own path (also where it is), or `<project path>#<branch>`. */
+  /**
+   * The project's own path (`main`), a worktree's or a sub-folder's own path (also where it is),
+   * or `<project path>#<branch>`.
+   */
   id: string;
+  kind: 'main' | 'worktree' | 'folder' | 'branch';
   name: string;
   branch?: string;
   session_count: number;
@@ -123,6 +127,7 @@ export function toScanResult(report: WireScanReport): ScanResult {
       path: s.path,
       workstreams: s.workstreams.map((w) => ({
         id: w.id,
+        kind: w.kind,
         name: w.name,
         ...(w.branch === undefined ? {} : { branch: w.branch }),
         sessionCount: w.session_count,

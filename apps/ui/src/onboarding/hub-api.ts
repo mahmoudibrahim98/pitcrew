@@ -450,7 +450,14 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
           createdProjects.set(suggestion.id, project);
         }
         result.projects.push(project);
-        for (const pick of choice.workstreams) {
+        // The project's default workstream (at its root) always comes with it, so every session
+        // under the project is linked (api-v1.md, "Machine scan"), even if the selection left it out.
+        const main = suggestion.workstreams.find((w) => w.kind === 'main');
+        const picks =
+          main === undefined || choice.workstreams.some((w) => w.suggestionId === main.id)
+            ? choice.workstreams
+            : [{ suggestionId: main.id, name: main.name }, ...choice.workstreams];
+        for (const pick of picks) {
           const found = findWorkstream(scan.report, pick.suggestionId);
           if (found === undefined) throw new Error(`“${pick.name}” is not in the last scan; scan again.`);
           const memo = `${project.id}\n${pick.suggestionId}`;
@@ -473,13 +480,13 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
       if (transport === undefined) return unavailable('importSessions');
       const res = await transport.request('POST', '/v1/import/dry-run', JSON.stringify(filter));
       if (res.status !== 200) throw new Error(refusal(res));
-      return JSON.parse(res.body) as { count: number };
+      return JSON.parse(res.body) as { count: number; subagents?: number };
     },
     async commitImport(filter) {
       if (transport === undefined) return unavailable('commitImport');
       const res = await transport.request('PUT', '/v1/import', JSON.stringify(filter));
       if (res.status !== 200) throw new Error(refusal(res));
-      return JSON.parse(res.body) as { imported: number };
+      return JSON.parse(res.body) as { imported: number; subagents?: number };
     },
     async hooksDiff() {
       if (hooksData === undefined || transport === undefined) return unavailable('hooksDiff');

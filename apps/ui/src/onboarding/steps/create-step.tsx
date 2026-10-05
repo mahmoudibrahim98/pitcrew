@@ -23,7 +23,7 @@ function toSelection(projects: CreateProjectDraft[], workstreams: CreateWorkstre
       name: p.name,
       template: p.template,
       workstreams: workstreams
-        .filter((w) => w.checked && w.projectId === p.suggestionId)
+        .filter((w) => (w.checked || w.main === true) && w.projectId === p.suggestionId)
         .map((w) => ({ suggestionId: w.suggestionId, name: w.name })),
     }));
 }
@@ -118,10 +118,12 @@ export function CreateStep() {
                 <ul className="mt-2 flex flex-col gap-1.5 pl-6">
                   {workstreams.map((ws) => (
                     <li key={ws.suggestionId} className="flex items-center gap-2">
+                      {/* The default workstream comes with its project: sessions at its root link to it. */}
                       <input
                         type="checkbox"
-                        aria-label={`Include ${ws.name}`}
-                        checked={ws.checked}
+                        aria-label={ws.main === true ? `${ws.name}: the project's main workstream, always created` : `Include ${ws.name}`}
+                        checked={ws.main === true || ws.checked}
+                        disabled={ws.main === true}
                         onChange={(e) => updateWorkstream(ws.suggestionId, { checked: e.target.checked })}
                         className="size-3.5"
                       />
@@ -134,19 +136,23 @@ export function CreateStep() {
                         className="h-6 flex-1 rounded-sm border border-line-2 bg-card px-2 text-xs text-ink outline-none focus-visible:border-accent disabled:opacity-50"
                       />
                       <span className="text-xs text-ink-2">{ws.sessionCount} sessions</span>
-                      <select
-                        aria-label={`Move ${ws.name} to project`}
-                        value={ws.projectId}
-                        disabled={!ws.checked}
-                        onChange={(e) => updateWorkstream(ws.suggestionId, { projectId: e.target.value })}
-                        className="h-6 rounded-sm border border-line-2 bg-card px-1 text-xs text-ink disabled:opacity-50"
-                      >
-                        {moveOptions.map((p) => (
-                          <option key={p.suggestionId} value={p.suggestionId}>
-                            {p.name}
-                          </option>
-                        ))}
-                      </select>
+                      {ws.main === true ? (
+                        <span className="text-xs text-ink-2">Main</span>
+                      ) : (
+                        <select
+                          aria-label={`Move ${ws.name} to project`}
+                          value={ws.projectId}
+                          disabled={!ws.checked}
+                          onChange={(e) => updateWorkstream(ws.suggestionId, { projectId: e.target.value })}
+                          className="h-6 rounded-sm border border-line-2 bg-card px-1 text-xs text-ink disabled:opacity-50"
+                        >
+                          {moveOptions.map((p) => (
+                            <option key={p.suggestionId} value={p.suggestionId}>
+                              {p.name}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                     </li>
                   ))}
                 </ul>

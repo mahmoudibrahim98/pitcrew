@@ -5,9 +5,10 @@
 import { ToggleGroup } from 'radix-ui';
 import { useState } from 'react';
 import { Button } from '../design/index.ts';
-import { ApiError, type Event, type Member, type MemberId } from '../data/index.ts';
+import { ApiError, ENGINE_NAME, sessionsById, useSessions, type Actor, type Event, type Member, type MemberId } from '../data/index.ts';
+import { attributedFeed } from './attribution.ts';
 import { useActivity, useMemberMap, useNames, type EventFilters } from './data.ts';
-import { describeEvent, formatWhen, type Names } from './format.ts';
+import { formatWhen, type Names } from './format.ts';
 import { Avatar } from './people.tsx';
 import { RecapSummary, WorkBlocks } from './recaps.tsx';
 import { ErrorNote, Panel } from './ui.tsx';
@@ -20,7 +21,33 @@ export function AuthorAvatar({ event, members }: { event: Event; members: Readon
   return <Avatar member={author} owner={owner} decorative />;
 }
 
-/** Events, newest first, each as "who did what, when". */
+/**
+ * Who did it: a member's avatar, or for a session nobody started from PitCrew (its own doing), its
+ * engine's initial.
+ */
+export function ActorAvatar({ actor, members }: { actor: Actor; members: ReadonlyMap<MemberId, Member> }) {
+  if (actor.kind === 'session') {
+    return (
+      <span
+        aria-hidden
+        data-kind="session"
+        className="inline-flex size-5 shrink-0 items-center justify-center rounded-sm bg-sunken text-xs font-semibold text-ink-2 select-none"
+      >
+        {ENGINE_NAME[actor.engine].slice(0, 1)}
+      </span>
+    );
+  }
+  const member = members.get(actor.member);
+  if (member === undefined) return <span aria-hidden className="size-5 shrink-0" />;
+  const owner = member.owner === undefined ? undefined : members.get(member.owner);
+  return <Avatar member={member} owner={owner} decorative />;
+}
+
+/**
+ * Events, newest first by when they happened (`events` is in log order, newest first), each as
+ * "who did what, when": a session's events name its agent, or the session itself, and a
+ * sub-agent's are its parent's (`attribution.ts`).
+ */
 export function EventList({
   events,
   members,
@@ -32,16 +59,20 @@ export function EventList({
   names: Names;
   label: string;
 }) {
+  const sessions = useSessions();
+  const lines = attributedFeed(
+    events.map((event, i) => ({ event, rev: events.length - i })),
+    sessionsById(sessions.data ?? []),
+    names,
+  );
   return (
     <ol aria-label={label} className="flex flex-col gap-1.5">
-      {events.map((event) => {
-        const author = members.get(event.author);
+      {lines.map(({ event, actor, who, what }) => {
         return (
           <li key={event.id} className="flex items-start gap-2 text-sm">
-            <AuthorAvatar event={event} members={members} />
+            <ActorAvatar actor={actor} members={members} />
             <p className="min-w-0 flex-1">
-              <span className="font-medium">{author?.handle ?? names.member(event.author)}</span>{' '}
-              <span className="text-ink-2">{describeEvent(event, names)}</span>
+              <span className="font-medium">{who}</span> <span className="text-ink-2">{what}</span>
             </p>
             <time dateTime={new Date(event.at).toISOString()} className="shrink-0 text-xs text-ink-2">
               {formatWhen(event.at)}

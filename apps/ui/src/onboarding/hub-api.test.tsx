@@ -419,14 +419,17 @@ describe('creating from the scan', () => {
       { key: 'PAP2', name: 'Paper', root: { machine: LAPTOP, path: PAPER } },
       { key: 'TOO', name: 'tools', root: { machine: LAPTOP, path: TOOLS } },
     ]);
+    // Each project's main workstream comes first, at its root, though the selection left it out.
     // A folder is its own place; a branch is the project's root on that branch. A cleared name is
     // the suggestion's.
     expect(hub.workstreams).toEqual([
+      { project: 'prj-1', name: 'main', locations: [{ machine: LAPTOP, path: PAPER }] },
       { project: 'prj-1', name: 'Drafts', locations: [{ machine: LAPTOP, path: DRAFTS }] },
       { project: 'prj-1', name: 'revision-2', locations: [{ machine: LAPTOP, path: PAPER, branch: 'revision-2' }] },
+      { project: 'prj-2', name: 'Main', locations: [{ machine: LAPTOP, path: TOOLS }] },
     ]);
     expect(result.projects.map((p) => p.key)).toEqual(['PAP2', 'TOO']);
-    expect(result.workstreams.map((w) => w.project)).toEqual(['prj-1', 'prj-1']);
+    expect(result.workstreams.map((w) => w.project)).toEqual(['prj-1', 'prj-1', 'prj-1', 'prj-2']);
   });
 
   it('keeps a workstream’s place when it is moved to another project', async () => {
@@ -437,6 +440,7 @@ describe('creating from the scan', () => {
       { suggestionId: TOOLS, name: 'Tools', template: 'blank', workstreams: [{ suggestionId: DRAFTS, name: 'Drafts' }] },
     ]);
     expect(hub.workstreams).toEqual([
+      { project: 'prj-1', name: 'Main', locations: [{ machine: LAPTOP, path: TOOLS }] },
       { project: 'prj-1', name: 'Drafts', locations: [{ machine: LAPTOP, path: DRAFTS }] },
     ]);
   });
@@ -457,9 +461,9 @@ describe('creating from the scan', () => {
     expect(hub.projects).toHaveLength(1);
     const result = await api.createFromScan(both);
     expect(hub.projects.map((p) => p.key)).toEqual(['PAP', 'TOO']);
-    expect(hub.workstreams.map((w) => w.name)).toEqual(['Drafts', 'revision-2']);
+    expect(hub.workstreams.map((w) => w.name)).toEqual(['main', 'Drafts', 'revision-2', 'Main']);
     expect(result.projects.map((p) => p.id)).toEqual(['prj-1', 'prj-2']);
-    expect(result.workstreams.map((w) => w.id)).toEqual(['wst-1', 'wst-2']);
+    expect(result.workstreams.map((w) => w.id)).toEqual(['wst-1', 'wst-2', 'wst-3', 'wst-4']);
   });
 
   it('refuses a suggestion the last scan did not have', async () => {
@@ -525,7 +529,8 @@ describe('the real first run, with the scan', () => {
       ['PAP', 'paper'],
       ['TOO', 'tools'],
     ]);
-    expect(hub.workstreams.map((w) => w.name)).toEqual(['drafts']);
+    // The main workstreams too: they cannot be unticked.
+    expect(hub.workstreams.map((w) => w.name)).toEqual(['main', 'drafts', 'Main']);
     // Machine setup only reads; what goes to the hub otherwise is the scan, the import, the hooks'
     // preview (then skipped) and the safety settings, in that order.
     expect(hub.sent.filter((line) => !line.startsWith('GET ') || line === 'GET /v1/safety')).toEqual([

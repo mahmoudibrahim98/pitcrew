@@ -6,7 +6,7 @@ import { act, cleanup, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { Home } from '../home.tsx';
 import { ReadScope } from '../read-scope.tsx';
-import { demo, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
+import { AGENT_TOKEN, demo, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
 let hub: Hub;
 beforeEach(async () => { hub = await startHub(); });
@@ -33,10 +33,12 @@ async function settled(check: () => void | Promise<void>) {
 it('a cursor moved on another device refreshes Home without reloading', async () => {
   renderWithHub(<Home />, hub);
   const region = await screen.findByRole('region', { name: 'Since you last looked' });
-  await within(region).findByText('15 new changes');
+  // The demo's fifteen events, less @sam's own four, the session ones one line per session.
+  await within(region).findByText('11 new changes');
   await otherClient(hub).request('PUT', '/v1/me/cursors/workspace', { body: { rev: 15 } });
   await within(region).findByText('Nothing new since you last looked.');
-  await otherClient(hub).moveTask('PAP-2', 'in_progress');
+  // An agent's move is new; @sam's own would not be.
+  await otherClient(hub, AGENT_TOKEN).moveTask('PAP-2', 'in_progress');
   await within(region).findByText('1 new change');
 });
 
