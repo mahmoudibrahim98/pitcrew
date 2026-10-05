@@ -481,6 +481,7 @@ function GroupView({ group, api, numbers, count, empty }: NodeProps & { group: G
           />
         ) : (
           <FileTab
+            paneNumber={number}
             key={tab.id}
             ws={api.ws}
             tabId={tab.id}

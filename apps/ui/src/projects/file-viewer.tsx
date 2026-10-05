@@ -176,6 +176,7 @@ export interface FileViewerProps {
   path: string;
   line?: number | undefined;
   copyPath?: string | undefined;
+  breadcrumbsLabel?: string | undefined;
   onFolder?: ((path: string) => void) | undefined;
   onDirty?: ((dirty: boolean) => void) | undefined;
   onBusy?: ((busy: boolean) => void) | undefined;
@@ -187,7 +188,7 @@ export interface FileViewerProps {
   onDraftChange?: ((draft: FileDraft | undefined) => void) | undefined;
 }
 
-export function FileViewer({ client, path, line, copyPath, onFolder, onDirty, onBusy, draft: keptDraft, onDraftChange }: FileViewerProps) {
+export function FileViewer({ client, path, line, copyPath, breadcrumbsLabel, onFolder, onDirty, onBusy, draft: keptDraft, onDraftChange }: FileViewerProps) {
   const [file, setFile] = useState<FileContent>();
   const [ownDraft, setOwnDraft] = useState<FileDraft>();
   const [error, setError] = useState<unknown>();
@@ -257,7 +258,7 @@ export function FileViewer({ client, path, line, copyPath, onFolder, onDirty, on
       <h2 id={heading} className="font-medium break-all">
         {path}
       </h2>
-      <FileBreadcrumbs path={path} {...(copyPath === undefined ? {} : { copyPath })} onFolder={onFolder} />
+      <FileBreadcrumbs label={breadcrumbsLabel} path={path} {...(copyPath === undefined ? {} : { copyPath })} onFolder={onFolder} />
       {error !== undefined && (
         <div role="alert">
           <p>{conflict ? 'Changed since you opened it' : fileProblem(error)}</p>
