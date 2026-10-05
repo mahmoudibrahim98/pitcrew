@@ -242,6 +242,6 @@ src/hello.txt, a large.bin above the read cap, and an outside link that cannot b
 They enforce revisions, exclusive creation, path rules and body/file/list caps; writes persist
 only in memory. Remote and WSL locations return 501. No filesystem paths are opened.
 
-Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
+Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Its counts leave sub-agents (sessions with a `parent`) out and report them apart (`subagents`), and a sub-agent is included exactly when its parent is (`import.ts`, `deciding`). The synthetic scan report suggests each project's default (`main`) workstream first, with each suggestion's `kind`. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
 
 Onboarding hooks use synthetic in-memory configuration text, person/machine-bound previews, stale refusal and idempotent confirmation. The mock never opens agent homes. Device-only safety read/save validates the same settings as the daemon and appends `safety_changed` on change.

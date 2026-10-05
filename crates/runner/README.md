@@ -52,27 +52,37 @@ reports it:
   discovered. One refused then is dropped; the allowed ones are folded into the session's first
   state, oldest first.
 - **Sub-agents run as their parent.** When `SessionAgents` answers `NoAgent` for a session whose
-  transcript names a parent (a Claude sub-agent in `<session>/subagents/`), the runner asks for
-  the parent's agent and judges by that. The hub has not stored a sub-agent yet when its held
-  hooks are decided (its `session_discovered` is on its way to the store), nor until the sink's
-  write lands, so only its parent's agent is known then. It fails closed:
+  transcript names a parent, the runner asks for the parent's agent and judges by that. The hub
+  has not stored a sub-agent yet when its held hooks are decided (its `session_discovered` is on
+  its way to the store), nor until the sink's write lands, so only its parent's agent is known
+  then. It fails closed:
   - the sub-agent's own answer, when it is an agent or `Unknown`, stands: the parent never
     overrides it;
   - the parent's answer is taken as it is: its `Unknown` (or a lookup that panics) refuses
     everyone, a person included;
-  - the parent's transcript `<session>.jsonl` counts only if it is a regular file (a link is not
-    followed) inside the sub-agent's own home; otherwise the sub-agent has no parent, and is
-    judged by its own answer alone. So a sub-agent can never be its own parent, nor two each
-    other's;
   - if the parent cannot be looked up (an index or I/O error), the sub-agent is `Unknown` and
     every hook is refused; the lookup is tried again at the next hook.
 
   The parent found at discovery, the one its `session_discovered` names, is kept with the
   sub-agent's row, so a restart judges by the same one. (A sub-agent indexed before this was kept
   gets it at its first hook.)
-- **Codex and OpenCode sub-agents have no parent yet**: their transcripts do not name one the
-  runner reads. They are judged by their own answer alone, which today is `NoAgent`: any person's
-  hook can change them, and no agent's.
+- **Where a sub-agent's parent is.** The adapter reads what the transcript names
+  (`SessionMeta::parent`, the parent's CLI id), and the runner finds that session among what it
+  watches **in the sub-agent's own home**:
+  - **Claude**: `<session>.jsonl` beside a `<session>/subagents/` folder; for an older top-level
+    sidechain transcript (`isSidechain` records), `<sessionId>.jsonl` in its own folder;
+  - **OpenCode**: the session its `parent_id` names, in the same store;
+  - **Codex**: the rollout whose id its `source.subagent.thread_spawn.parent_thread_id` names,
+    among the rollouts tracked in the same home, else in the sub-agent's own day folder. A review
+    or compaction sub-agent (`source.subagent` a string) names no parent.
+
+  A parent transcript must be a regular file (a link is not followed) inside the home, never the
+  sub-agent itself; an id the transcript names becomes part of a file name only if it is a plain
+  id (letters, digits, `-`, `_`, `.`, not starting with `.`, at most 128 bytes), so it cannot
+  name another folder. A parent found on disk but not indexed yet gets its row (and session id)
+  at once, which its discovery then keeps. A sub-agent whose parent is not found has none, is
+  judged by its own answer alone, and is a session of its own in the hub. A Codex sub-agent read
+  before its parent was discovered, whose rollout is not in its own day folder, has none either.
 - **Which session a hook names.** A hook names the CLI's own id; a sub-agent's is whatever its
   transcript says (`agentId`). Sessions and sub-agents are looked up apart, sessions first: a
   sub-agent named like a session never takes that session's hooks, whichever is found first.
@@ -193,6 +203,18 @@ before the dispatch's CLI starts.
   still answers `Exited` if its CLI disappeared while the daemon was down. Hand-linked terminals
   and unclaimed starts retain the usual refresh behavior; no missing terminal is followed by its
   old target. Imported transcripts never acquire this exit evidence.
+
+## What a session says about itself
+
+`session_discovered` states a session as its transcript has it so far: its folder, branch, title,
+start, the parent a sub-agent names (above), the **model** the transcript last recorded, and the
+**account**: the home it was found in, as configured, with `~` for the user's home (`USERPROFILE`
+first on Windows, else `HOME`; links are resolved on both sides when the configured spelling is
+not inside it). When a later read changes the title, branch or model (a custom title written
+after the first prompt, the model of the first reply), the runner sends `session_updated` with
+the values that changed, never one that went away. Its id hashes the session, the reading's
+generation and a count kept with the row (`Facts::updates`), and its time is the session's last
+activity, so a replay after a crash repeats it.
 
 ## File discovery and cursors
 

@@ -1298,6 +1298,36 @@ make a manual link. Imported links, like manual/dispatch/claimed links, are firm
 overwritten by folder/branch inference. `tests/linking.rs` covers synthetic transcript discovery,
 branch preference, later creation, and manual-link protection.
 
+## Sub-agents, worktrees and who did what
+
+What the hub shows matches what happened (brief `0-trusted-data`; api-v1.md, "Sessions" and
+"Machine scan"):
+
+- **Sub-agents are children.** Every adapter names a sub-agent's parent (Claude's `subagents/`
+  folder and older `isSidechain` files, Codex `source.subagent.thread_spawn`, OpenCode
+  `parent_id`), and the runner states it as the session's `parent` when it finds that session in
+  the same home (its README, "Where a sub-agent's parent is"). `HubAgents` judges a sub-agent's
+  hooks by its parent's agent (above). The import's counts leave sub-agents out and report them
+  apart (`subagents`); a sub-agent is included exactly when its parent is (hub-work's
+  `import.rs`, up a chain of at most 16). Clients nest sub-agents under their parents.
+- **Worktrees belong to their repository.** The scan resolves a `.git` file (`gitdir:`, then the
+  git folder's `commondir`) to the main worktree, so a repository and its worktrees
+  (`.claude/worktrees/*` included) are one suggested project, with a default (`main`) workstream
+  at its root and one per linked worktree, named after the branch its `HEAD` names.
+- **Every session is linked.** Creating from the scan always makes each project's `main`
+  workstream, so folder linking (the deepest location wins) puts a worktree's session in its
+  worktree's workstream and every other one in the default, and nothing is unsorted.
+- **Sessions say what their transcript records:** the model (updated by `session_updated`) and
+  the account home they were found in. `work.sessions` (version 5) keeps both (migration 0212).
+- **Who did it.** The runner's events are stamped with the workspace's person, but clients name
+  the session's agent or the session itself (engine and name); a person started a session only
+  when it has a terminal of PitCrew's and no agent. Clients order activity by `at`.
+
+`tests/trusted_data.rs` runs all of it end to end on synthetic homes shaped like the audit's: a
+repository with two worktrees (one under `.claude/worktrees`), Claude sub-agents in both
+formats, a Codex sub-agent and a Codex exec run: three projects, ten sessions with four nested
+sub-agents, nothing unsorted, and no sub-agent stated as an agent.
+
 ## Workstream files
 
 The device-only Files API resolves location roots from the work model and calls the runner on
