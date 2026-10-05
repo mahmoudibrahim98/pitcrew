@@ -12,7 +12,7 @@ runs on every agent turn.
 | `PITCREW_SOCKET` | Unix: the daemon's socket (`…/pitcrewd.sock`) or its directory. |
 | `PITCREW_PIPE` | Windows: the daemon's pipe, `\\.\pipe\<name>` with a name of letters, digits, `.`, `_` and `-` (not ending in `.`), so it cannot leave the pipe namespace. Default `\\.\pipe\pitcrewd-<your SID>`. |
 | `PITCREW_URL` | Loopback TCP, **development only**: `http://127.0.0.1:<port>`, `http://[::1]:<port>` or `http://localhost:<port>`. Any other host is refused. |
-| `PITCREW_TOKEN` | The agent token. |
+| `PITCREW_TOKEN` | The agent token (or a reader token, which only reads: the Orchestrator's). |
 | `PITCREW_TOKEN_FILE` | Or a file holding it. On Unix it must be ours, mode 0600 or stricter, and not a symlink. |
 
 The token is sent only after the server passes an identity check (`pitcrew_api::client`):
@@ -27,7 +27,8 @@ The token is sent only after the server passes an identity check (`pitcrew_api::
 
 Verbs check `GET /v1/host/info` (without the token) first and refuse a daemon whose protocol
 range does not include ours. Then they ask `GET /v1/me` whose token it is: **only agent tokens
-are accepted**; a person's (device) token is refused with exit 2.
+are accepted** (a reader token is an agent's too); a person's (device) token is refused with
+exit 2.
 
 ## Verbs
 
@@ -50,6 +51,14 @@ pitcrew ask <@member> <title…> [--option <text>]… [--body <text>] [--task <t
 pitcrew reply <ask> [<text…>] [--option <n>]   # options are numbered from 1, as `check` shows
 pitcrew check                                  # asks for you, mentions, your asks and their answers
 pitcrew board submit <draft>  < proposal.json  # a board draft's proposal (see below)
+
+# The read verbs: only GETs, so a reader token runs them (see below).
+pitcrew session list [--since today|YYYY-MM-DD] [--state working,waiting] [--workstream <wst>] [--task <task>]
+pitcrew session show <ses>                     # the session and its recent blocks of work
+pitcrew recap blocks [--session|--task|--workstream|--project <id>] [--limit 50]
+pitcrew recap days (--workstream <wst> | --project <prj>) [--limit 7]
+pitcrew activity [--session|--task|--workstream|--project <id>] [--limit 50]
+pitcrew search <words…>                        # projects, workstreams, tasks, sessions and blocks holding every word
 ```
 
 A text of `-` is read from stdin.
@@ -60,6 +69,13 @@ the prompt names the draft, `drf_…`). It reads the proposal's JSON on stdin,
 one over 32 KiB or that is not a JSON object before anything is sent (exit 2), and posts it with
 the agent's token. Only the draft's own agent may (exit 3 otherwise), once (exit 4 after); the
 daemon checks the rest (exit 2). Nothing is created until a person reviews the proposal.
+
+**The read verbs** are what the Orchestrator's agent looks at to answer a question about the
+work (api-v1.md, "Orchestrator", "The CLI's read verbs"). They only `GET`, so the reader token
+its CLI gets runs every one, and any write verb is refused with it (exit 3). Text output names
+things by the ids an answer cites, so the hub can turn them into links: `ses_…`, `wst_…`,
+`prj_…`, task keys, and `recap:wst_…@YYYY-MM-DD`. `--since` is a day in UTC. `--json` prints the
+daemon's JSON (for `session show` and `search`, an object of the daemon's lists).
 
 | Exit | Meaning |
 |---|---|

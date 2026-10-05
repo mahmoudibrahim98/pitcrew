@@ -25,6 +25,7 @@ It listens on `http://127.0.0.1:47317` (never on other interfaces) and prints on
 |---|---|---|
 | `dev-device-token` | `@sam` (`01JB000000000000000MEM0001`), the person | `device`: every route |
 | `dev-agent-token` | `@writer` (`01JB000000000000000MEM0002`), an agent owned by @sam | `agent`: routes marked **agent**; reads everything, writes only to its own tasks and sessions |
+| `dev-reader-token` | `@office` (`01JB000000000000000MEM0006`), @sam's back office | `reader`, as the Orchestrator's CLI holds: `GET` and `HEAD` of the routes marked **agent** or **read**; anything else `403` |
 
 ### Fresh mode: starting before setup
 
@@ -87,7 +88,8 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   the back office, though the mock has none), and otherwise appends `member_added` and
   `machine_added` for the device token's own member, so it and `GET /v1/me` mean that person from
   then on.
-- **Auth and scopes.** Agent tokens reach only routes marked **agent**. They read the whole
+- **Auth and scopes.** A reader token (`dev-reader-token`) is refused anything but a `GET` or
+  `HEAD` of a route marked **agent** or **read**. Agent tokens reach only routes marked **agent**. They read the whole
   workspace, but write only to their own tasks (assignee, or holder of an active dispatch) and
   sessions; any other write, a move included, is `403 forbidden`. An agent's subtask list replaces
   only its own plan lines. `author` and `on_behalf_of` always come from the token.
@@ -96,6 +98,14 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **Move rules** are `TaskStatus::can_move` ported exactly; a refused move is `409 conflict`.
 - **Dispatch** assigns an unassigned task to the agent (`task_assigned`), then emits
   `dispatch_started` and `session_discovered`. Done or canceled tasks answer 409.
+- **The Orchestrator** (`src/orchestrator.ts`, api-v1.md "Orchestrator"): a question starts a
+  simulated session titled `Orchestrator` as the person's back office, with the hub's own prompt
+  (`crates/office/prompts/orchestrator/v1.md`) in its transcript. After the reply delay it answers
+  from the workspace (the most recently active sessions, their tasks, a recap) with suggestion
+  lines; references and suggestions are found and resolved as the hub does. Follow-ups type into
+  the live session (one line, `Q: ` before what would be a CLI command); a new conversation ends
+  the old session; one answer at a time; cancel and clear as the contract says. Claude Code and
+  Codex read as installed, OpenCode not. It never times out or cuts an answer.
 - **Board drafts** (`src/board.ts`, api-v1.md "Board drafts"): the preview builds the summary as
   the hub does (the hub's own template from `crates/office/prompts/`, the same bounds, and the
   redaction rules ported), from the workstream's sessions and the recaps fixture; a start needs the
@@ -189,6 +199,7 @@ a single entry point.
 | `src/transcripts.ts` | Canned transcripts and paging. |
 | `src/recaps.ts` | The recap routes, paged from the recaps fixture. |
 | `src/scan.ts` | The machine scan: its synthetic report and streamed frames. |
+| `src/orchestrator.ts` | The Orchestrator's conversations, its synthetic answers, and what they cite and suggest. |
 | `src/ws.ts` | A minimal WebSocket server (RFC 6455). |
 | `src/types.ts` | Wire types mirroring `crates/protocol`. |
 | `src/rules.ts` | `can_move` and date checks ported from `model.rs`. |

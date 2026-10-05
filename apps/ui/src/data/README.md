@@ -12,6 +12,14 @@ keeps its cursor cache separate, and failed mutations retain the previous cursor
 The board drafts' events (`board_draft_started`, `board_proposed`, `board_draft_reviewed`)
 invalidate `['board-drafts']`, the projects feature's draft queries (`projects/board-drafts.ts`).
 
+`orchestrator.ts` is the Orchestrator panel's conversation (API v1, "Orchestrator"): its wire
+types, `useOrchestrator()` (`['orchestrator']`), `useAsk()`, `useCancelAnswer()` and
+`useClearConversations()`. Conversations are the person's own and are **not events**, so the
+stream never touches them: the query polls every second (`ANSWER_POLL_MS`) while an answer is
+under way (`answering`), and each write puts the hub's answer in the cache itself (the one
+exception to "mutations do not touch the cache" below). An answer is untrusted text: render it as
+text (`shell/answer.tsx`).
+
 | File | What |
 |---|---|
 | `transport.ts` | The seam every request and socket goes through: `Transport` (`request(method, path, body) → { status, contentType, body }`, `openSocket(path) → TransportSocket`). `browserTransport()`: `fetch` and `WebSocket` with the bearer token (development). `TransportSocket.bufferedAmount` is bytes sent but not yet taken: the real `WebSocket`'s own, here. `isDesktop()`: `window.__TAURI_INTERNALS__` exists. |
@@ -34,6 +42,7 @@ invalidate `['board-drafts']`, the projects feature's draft queries (`projects/b
 | `live.ts` | Wires it together: patches, then coalesced invalidation (250 ms window). Fetches in flight are not cancelled; each query whose fetch was in flight when an event touched it is refetched once, by its exact key, after that fetch settles. `resetQueries()` on a reset; failed queries refetch when the stream comes back. After 3 connection failures, and every 5 more, it reports `problem: 'unauthorized' \| 'unreachable' \| 'needs_pairing'`: from the gateway's reason when the socket gave one, otherwise by probing `GET /v1/me` (none when the probe succeeds and only the stream fails). `recapCacheLookup()`/`recapKeysForScope()` resolve recap scope through the cache into query keys: `Invalidator.addExact()` invalidates a key by itself only, never as a prefix, for the unfiltered-blocks case (TanStack matches `{}` against any object, so the usual prefix invalidation would reach every filtered blocks query too). |
 | `provider.tsx` | `<DataProvider>` (a browser's one hub), `<DataScope>`, `useApi()`, `useConnection()` (`status`, `synced`, `problem`), `useLiveQuery()`, `useLiveInfiniteQuery()`, `useOpenSocket()`, `useGatewayWorkspace()`, `createQueryClient()`. |
 | `hooks.ts` | Shared hooks: workspace, machines, members, projects, workstreams, tasks, sessions, asks, and `useMoveTask`. |
+| `orchestrator.ts` | The Orchestrator's conversations: types, the polled query and its three writes (above). |
 
 ## Transports: the browser and the desktop app
 

@@ -37,7 +37,9 @@ planted by another user never receives a token:
 - On success the token is removed from the headers and `Caller` is inserted as an extension. See
   [`pitcrew-auth`](../auth/README.md) for how routes read it.
 - Failures are `ApiError` bodies: `401 unauthorized` (none, unknown, revoked, or not `Bearer`),
-  `403 forbidden` (agent on a device route), `404 not_found` (unknown route or method).
+  `403 forbidden` (an agent on a device route; a reader's request that is not a plain `GET` or
+  `HEAD`, or is a WebSocket upgrade, refused before routing), `404 not_found` (unknown route or
+  method).
 
 ## Live updates: `GET /v1/stream?since=`
 
@@ -195,9 +197,10 @@ let recap_source: Arc<dyn pitcrew_api::RecapSource> = Arc::new(RecapIndexSource(
 let parts = RouterParts::new()
     .agent(pitcrew_api::hooks::routes(hooks))
     .agent(hub_work::agent_routes())    // routes marked **agent** in api-v1.md
+    .read(hub_work::read_routes())      // device routes a reader may GET (marked **read**)
     .device(pitcrew_api::stream::routes(source.clone(), StreamConfig::default()))
-    .device(pitcrew_api::Activity::new(source).with_refs(refs).routes())
-    .device(pitcrew_api::Recaps::new(recap_source).routes())
+    .read(pitcrew_api::Activity::new(source).with_refs(refs).routes())
+    .read(pitcrew_api::Recaps::new(recap_source).routes())
     .device(pitcrew_api::terminal::routes(terminals.clone(), TerminalConfig::default()))
     .device(hub_work::device_routes()); // everything else
 pitcrew_api::serve(&Listen::private_default(run_dir)?, info, tokens, parts, shutdown).await?;

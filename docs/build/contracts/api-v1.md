@@ -879,8 +879,9 @@ route (`POST /v1/tasks/{id}/move`, after they confirm) or by opening the page.
 reached (nothing changes). Otherwise its CLI gets Esc and the turn is `canceled`.
 
 **Clear**: the caller's conversations are forgotten, and their Orchestrator session ends
-(`EndSession`, graceful). The remembered engine stays. The sessions stay in the log, and their
-transcripts in their CLI's own folder, as any session's do.
+(`EndSession`, `kill`: an Orchestrator session holds nothing to save). The remembered engine
+stays. The sessions stay in the log, and their transcripts in their CLI's own folder, as any
+session's do.
 
 **The CLI's read verbs** (all `GET`s; the reader token can do nothing else), each with `--json`:
 `pitcrew search <words…>` (projects, workstreams, tasks, sessions and recent recap lines whose

@@ -67,6 +67,9 @@ in the log when used (see "Terminals"):
 | `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `agents/<agent id>.token` | An agent token for each agent whose CLI the runner started (a dispatch's, or `POST /v1/sessions` with `agent`), bound to that agent and its owner, `pca_…`. The CLI is given its path (`PITCREW_TOKEN_FILE`), never the token. Minted once, reused while it verifies as exactly that. The folder is 0700, each file 0600. |
+| `agents/<agent id>.reader.token` | The same for an Orchestrator session's CLI, but a **reader** token (`pcr_…`), which may only read (see "The Orchestrator"). |
+| `orchestrator.json` | The Orchestrator's conversations, per person (hub-work's `with_orchestrator_file`): not in the event log, so a person can clear theirs. Written atomically. Private. |
+| `scratch/orchestrator-<member id>/` | The folder a person's Orchestrator sessions run in, with the settings a Claude Code session that only reads needs (`.claude/settings.json`). Private (0700). |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
 On Unix the directory is created 0700, and an existing one must already be ours and private; on
@@ -661,6 +664,30 @@ as itself. A refusal or a failure ends the session (and so the draft); the recon
 after a draft's session as after any the hub stored ahead of the runner. `serve` mounts hub-work's
 `board_agent_routes` (the proposal) and `board_device_routes` (preview, start, list, review).
 
+## The Orchestrator
+
+The Orchestrator panel's questions (api-v1.md, "Orchestrator"; hub-work's README, "The
+Orchestrator") run as sessions of an agent CLI on this machine, through the same `RunnerLink`
+(`src/orchestrator.rs`, `src/dispatch.rs`):
+
+- **Where:** `Dispatcher::scratch` makes `scratch/orchestrator-<member id>` in the state
+  directory (0700), and for Claude Code writes `.claude/settings.json` there: `pitcrew`'s read
+  verbs run without asking; editing files, writing them and the web are denied. Codex and OpenCode
+  run in their own default permission mode, which asks before writing.
+- **As whom:** `AgentEnv` gives the CLI `agents/<agent id>.reader.token`, a reader token for the
+  person's agent (on behalf of the person), for the sessions hub-work's `reads_only` names; never
+  an agent or device token. A reader may only `GET` (`pitcrew-api` refuses anything else, and
+  every WebSocket, with `403`), so the CLI's write verbs fail and its read verbs work.
+- **Installed:** `Dispatcher::installed` says whether the CLI is on this daemon's `PATH`
+  (`PATHEXT` on Windows), which `GET /v1/orchestrator` shows per engine.
+- **Following answers:** a loop (`orchestrator::follow`, every second, on the blocking pool)
+  calls `WorkService::follow_orchestrator`, which reads each answering session's transcript
+  through `Dispatcher::transcript` (the runner's) and sends Esc through `Dispatcher::command` when
+  an answer is cut, times out or is canceled.
+
+`serve` mounts hub-work's `read_routes`, `pitcrew-api`'s `Activity` and `Recaps` as **read**
+routes (device and reader tokens), and `orchestrator_routes` as device routes.
+
 ## Routes
 
 | Route | From |
@@ -676,6 +703,7 @@ after a draft's session as after any the hub stored ahead of the runner. `serve`
 | `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SessionTerminals` (see "Terminals") |
 | `POST /v1/sessions`, `POST /v1/sessions/{id}/send`, `/keys`, `/interrupt`, `/end` | `src/sessions.rs`, device routes, through the runner's `RunnerCommands` (see "Terminals") |
 | `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route, from the runner's `RunnerTranscripts` (see "The runner") |
+| `GET /v1/orchestrator`, `POST /v1/orchestrator/questions`, `POST /v1/orchestrator/conversations/{id}/cancel`, `DELETE /v1/orchestrator/conversations` | `pitcrew-hub-work` (`orchestrator_routes`), device routes, with `RunnerLink` as its dispatcher (see "The Orchestrator") |
 
 On development TCP only, the daemon answers CORS as the mock hub does: preflights from
 `http://localhost:<port>`, `http://127.0.0.1:<port>` and the Tauri app's origins get `204` and
@@ -990,6 +1018,16 @@ process the daemon starts carries the test's mark, and none is left at the end.
   appended as if the hub stopped before starting it: at the next start the second fails ("did not
   start") and its session ends, while the first is kept and reported under its id once its
   transcript appears; ended without a report, its dispatch is `canceled`.
+
+`tests/orchestrator.rs` (Unix), the Orchestrator end to end, with the same rig: a stand-in
+`claude` reads the work through the real `pitcrew` read verbs with the token file the daemon gave
+it (a reader token's, in the person's scratch folder, none in its environment), tries two writes
+(both refused, exit 3), and answers "What did my agents do today?" in a transcript as Claude Code
+writes one. The answer arrives with working links (each reference names a session and a task the
+hub serves) and a suggestion that moved nothing; the reader token is `403` on every write route
+of the contract, every WebSocket and the device-only reads, and `200` on the reads marked
+**read**; a follow-up is typed into the live session and answered there; clearing forgets the
+conversation and ends its session.
 
 `tests/board.rs` (Unix), a board draft end to end, with the same rig as `tests/dispatch.rs` and
 the `pitcrew` CLI built next to `pitcrewd` (skipped with a message when it or pitcrew-ptyd is not

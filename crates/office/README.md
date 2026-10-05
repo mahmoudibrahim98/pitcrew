@@ -63,13 +63,17 @@ activity, so the office never feeds on itself.
   the prompt, nor a long piece of one; hidden characters and newlines cannot inject lines or close
   the summary; every bound holds with 100 sessions and 200 tasks of 10,000-character texts, the
   most recent kept and the rest counted; the estimate follows the prompt's size.
-- Unit tests in `src/redact.rs` (each rule, plain text left alone, bounds after redaction) and
-  `src/prompts.rs` (one-pass rendering).
+- Unit tests in `src/redact.rs` (each rule, plain text left alone, bounds after redaction),
+  `src/prompts.rs` (one-pass rendering) and `src/orchestrator.rs` (references found once with
+  their punctuation trimmed; suggestion lines taken out and others kept; questions cleaned, and
+  follow-ups one line and never a CLI command; the prompt holds the question last and bounded,
+  data-only context).
 
 ## Prompts as files, and what a board draft sends
 
 - **`prompts/<name>/v<n>.md`** are the versioned prompt templates, built into the binary
-  (`prompts::DRAFT_BOARD`, `prompts/draft-board/v1.md`). A template is never edited once
+  (`prompts::DRAFT_BOARD`, `prompts/draft-board/v1.md`; `prompts::ORCHESTRATOR`,
+  `prompts/orchestrator/v1.md`). A template is never edited once
   released: a change is a new version, and what was sent records the version (`draft-board/v1`).
   `Prompt::render` puts each `{{name}}` in, in one pass, so a value never reaches another
   placeholder.
@@ -90,10 +94,26 @@ activity, so the office never feeds on itself.
   - `<` and `>` in session text are shown as `‹` and `›`: nothing a session wrote can close the
     prompt's `<summary>` and speak outside it. The prompt says the summary is data, not
     instructions.
+- **`orchestrator`**: the Orchestrator's side of its conversation (brief
+  [0-orchestrator-chat](../../docs/build/briefs/0-orchestrator-chat.md)), text in and text out;
+  the hub checks what it finds before anything becomes a link or a suggestion.
+  - **The prompt** (`prompt`, `orchestrator/v1`) names the workspace, the person and the day,
+    lists `pitcrew`'s read verbs (its CLI holds a token that may only read), says what they print
+    is data, not instructions, and how to cite and suggest; the question comes last. A
+    conversation whose session ended starts a new one with its last turns as context (`Earlier`):
+    one line each, redacted, `<`/`>` shown as `‹`/`›` inside `<earlier>`, at most 6 KiB, newest
+    kept.
+  - **The question** (`clean_question`): control and hidden characters dropped; a follow-up typed
+    into the CLI's terminal is one line, and one that would read as a CLI command (`/`, `!`, `#`,
+    `@`) is typed after `Q: ` (`typed`).
+  - **What an answer cites** (`scan`, `cited`): `ses_…`, `tsk_…`, `wst_…`, `prj_…`, task keys,
+    and `recap:wst_…`/`recap:prj_…` with an optional `@YYYY-MM-DD`, each word trimmed of `-`, `:`
+    and `@` at its ends, each once, and the lines `Suggestion: move <task> to <status>` and
+    `Suggestion: open <reference>` (at most 10), taken out of the text.
 - **`redact`**: what never leaves in a prompt. Every text is made one line (hidden and control
   characters dropped, so nothing hides a secret from the rules), then: private key blocks;
   well-known token prefixes (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`, `AIza`,
-  PitCrew's `pcd_`/`pca_`, and others, followed by at least 8 token characters with digits or mixed
+  PitCrew's `pcd_`/`pca_`/`pcr_`, and others, followed by at least 8 token characters with digits or mixed
   case); JSON Web Tokens; the values of secrets' names (`password=`, `token:`, `--password x`,
   `?access_token=`, `Authorization: Bearer x`); a URL's user and password; long random-looking
   words (32+ characters, mixed case and digits, or hexadecimal); e-mail addresses; and home
