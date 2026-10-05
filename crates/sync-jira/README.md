@@ -2,7 +2,12 @@
 
 Read Jira issues and epics, for Jira Cloud and Jira Data Center, safely and incrementally; field
 ownership; the write-approval queue and outward writes are later briefs. This crate is read-only
-and never writes to Jira.
+and never writes to Jira. `pitcrewd` runs it on a timer and applies its intents to the hub
+(`crates/daemon/src/integrations/`); `probe::probe` is the read-only "test this connection".
+`SyncState::created_from_snapshot(source, epic)` gives an issue that is not done as a first read
+would report it (`IssueCreated`), from the snapshot the last read kept: an `IssueReparented` change
+carries none of its fields, so this is how `pitcrewd` makes a task of an issue moved under an epic
+it follows.
 
 See the [crate's own docs](src/lib.rs) ("Shape" and "Reuse, not a fork") for the architecture and
 for exactly what is reused from [`pitcrew-sync-github`](../sync-github/README.md) versus added
@@ -13,10 +18,11 @@ wire types are specific to this crate.
 
 ## Known gaps
 
-- `ownership::plan` produces no hub `Intent` for an epic change yet (`EpicCreated`/`EpicRenamed`/
-  `EpicClosed`): epics map to workstreams, not tasks, and `plan`'s signature here only takes a
-  task. `pitcrew-sync-github`'s `plan` has the identical gap for milestones, for the same reason.
-  Applying either to a workstream is a later brief.
+- Closed: epics → workstreams. `ownership::plan_workstream` turns an epic's change into intents for
+  each workstream that links the epic (`EPIC_FIELD_OWNERSHIP`: the hub owns the name; an epic moved
+  to done proposes `shipped`, unless a task of the workstream is in progress, which is a conflict
+  ask). `pitcrewd` applies them (`crates/daemon/src/integrations/`, G-sync-wiring). There is no
+  reopened-epic change, so a reopened epic does not move a shipped workstream back.
 - When one project sits in a dense enough burst of updates that a single sync call's page budget
   (`Limits::max_pages`) runs out while every item fetched so far is still within
   `CURSOR_SAFETY_MARGIN_HOURS` of the old cursor (`SearchResult::stuck_window_exhausted`, see

@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile, symlink } from 'node:fs/promises';
+import { cp, mkdtemp, mkdir, readdir, readFile, rm, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -111,8 +111,13 @@ try {
     console.log('# skipped: conformance link creation refused by the OS');
   }
   env.PITCREW_FILES_ROOT = filesRoot;
+  // Both targets read GitHub and Jira from this copy of the mock hub's recorded fixtures, again at
+  // each sync: integrations.test.mjs adds a file that sorts first to change what upstream says.
+  const fixtures = join(temporary, 'fixtures');
+  await cp(join(root, 'apps', 'mock-hub', 'fixtures'), fixtures, { recursive: true });
+  env.PITCREW_CONFORMANCE_FIXTURES = fixtures;
   if (target === 'mock') {
-    mock = await startServer({ port: 0 });
+    mock = await startServer({ port: 0, integrationFixtures: fixtures });
     env.PITCREW_CONFORMANCE_URL = mock.url;
     env.PITCREW_CONFORMANCE_PERSON = 'dev-device-token';
     env.PITCREW_CONFORMANCE_AGENT = 'dev-agent-token';
@@ -147,6 +152,13 @@ try {
     const standIn = `#!/bin/sh\nif [ \"$1\" = --version ]; then echo 2.1.139; exit 0; fi\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
     for (const cli of ['claude', 'codex', 'opencode'])
       await writeFile(join(bin, cli), standIn, { mode: 0o700 });
+    // GitHub integrations read `gh auth token`: a stand-in that prints a synthetic credential,
+    // never the machine's own gh.
+    await writeFile(
+      join(bin, 'gh'),
+      "#!/bin/sh\n[ \"$1 $2\" = 'auth token' ] || exit 2\necho synthetic-conformance-gh-credential\n",
+      { mode: 0o700 },
+    );
     env.PATH = [bin, process.env.PATH].filter(Boolean).join(delimiter);
     const ptydEndpoint = join(temporary, 'ptyd');
     await mkdir(ptydEndpoint, { mode: 0o700 });
@@ -174,6 +186,9 @@ try {
         // A scan holds its machine this long, so scan.test.mjs can show a second one refused.
         '--scan-hold-ms',
         '1500',
+        // Integrations read the copy of the mock hub's recorded fixtures, never the network.
+        '--integration-fixtures',
+        fixtures,
       ],
       {
         cwd: root,
@@ -204,24 +219,25 @@ try {
     ).trim();
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
-  suite = spawn(process.execPath, ['--test', 'tests/conformance/onboarding.test.mjs'], { cwd: root, env, stdio: 'inherit' });
-  const [onboardingCode] = await once(suite, 'exit');
-  process.exitCode = onboardingCode ?? 1;
-  suite = spawn(
-    process.execPath,
-    ['--test', 'tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
-    {
+  // One phase per file (or group) that changes the hub for every view, in this order:
+  // onboarding.test.mjs first, then the main suite, then import.test.mjs, which commits session
+  // inclusion (and restores it), and integrations.test.mjs last, which syncs, appending events that
+  // the main suite's exact-revision checks must not see. Every phase runs; the first failure
+  // decides the exit code.
+  for (const files of [
+    ['tests/conformance/onboarding.test.mjs'],
+    ['tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
+    ['tests/conformance/import.test.mjs'],
+    ['tests/conformance/integrations.test.mjs'],
+  ]) {
+    suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,
       env,
       stdio: 'inherit',
-    },
-  );
-  const [code] = await once(suite, 'exit');
-  process.exitCode = process.exitCode || (code ?? 1);
-  {
-    suite = spawn(process.execPath, ['--test', 'tests/conformance/import.test.mjs'], { cwd: root, env, stdio: 'inherit' });
-    const [importCode] = await once(suite, 'exit');
-    process.exitCode = process.exitCode || (importCode ?? 1);
+    });
+    const [code] = await once(suite, 'exit');
+    suite = undefined;
+    process.exitCode = process.exitCode || (code ?? 1);
   }
 } finally {
   await cleanup();

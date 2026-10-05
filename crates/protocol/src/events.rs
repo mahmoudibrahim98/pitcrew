@@ -13,9 +13,9 @@ use crate::ids::{
     AskId, DispatchId, EventId, MachineId, MemberId, SessionId, TaskId, WorkspaceId, WorkstreamId,
 };
 use crate::model::{
-    Answer, Ask, Dispatch, DispatchOutcome, Health, LinkBasis, Liveness, Machine, Member, Mover,
-    Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskPatch, TaskStatus, Team,
-    TimestampMs, Workstream, WorkstreamStatus,
+    Answer, Ask, Dispatch, DispatchOutcome, ExternalRef, Health, LinkBasis, Liveness, Machine,
+    Member, Mover, Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskPatch,
+    TaskStatus, Team, TimestampMs, Workstream, WorkstreamStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -215,6 +215,14 @@ pub enum EventBody {
         status: WorkstreamStatus,
         /// New health.
         health: Health,
+    },
+    /// A workstream's linked external items changed (api-v1.md, "Linking a workstream
+    /// upstream"): a GitHub repository or milestone, a Jira project or epic.
+    WorkstreamLinked {
+        /// The workstream.
+        workstream: WorkstreamId,
+        /// The full new list.
+        external: Vec<ExternalRef>,
     },
     /// A task was created.
     TaskCreated {

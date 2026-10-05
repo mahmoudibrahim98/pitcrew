@@ -7,7 +7,10 @@ node tests/conformance/run.mjs mock
 node tests/conformance/run.mjs daemon
 ```
 
-Both commands run the same `api.test.mjs` and `scan.test.mjs`. No npm dependency is needed. The
+Both commands run `onboarding.test.mjs` on its own, then the same `api.test.mjs`, `scan.test.mjs`
+and `files.test.mjs`, then `import.test.mjs` on its own, then `integrations.test.mjs` on its own
+(its syncs append events, which the main suite's exact-revision checks must not see). Every phase
+runs, and the first failure decides the exit code. No npm dependency is needed. The
 daemon runner builds `pitcrewd` and `pitcrew-ptyd` with the locked workspace dependencies, starts a
 seeded demo on an OS-assigned free loopback port, and reads its two private token files without
 printing them. Each runner creates an empty temporary home and cleans up its child process and
@@ -76,3 +79,23 @@ Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 Hook-install conformance writes agent configurations. It is disabled unless
 `PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed
 synthetic targets. Do not set it when pointing the suite at an existing hub.
+
+`integrations.test.mjs` covers "Integrations" and "Linking a workstream upstream": every route
+refused without a token (`401`) and to an agent (`403`), unknown ids `404`, malformed connections
+and links `400`, a second connection to the same repository and a secret for a `gh_cli` connection
+`409`; a stored secret that is never in any answer; a project and workstream of its own linked to
+milestone 1 of `example-org/demo-repo` (`workstream_linked` in the log); a sync that turns the open
+issue #1 into a `todo` task of that workstream (and not #3, closed before it was first seen); the
+connection's status, link title and test (with its warning about write rights); that the link's
+and the sync's events reach activity and a `/v1/stream` replay only as the shared visibility rule
+allows (an agent gets `403` from both; with every session excluded by `/v1/import`, they stay
+visible while an excluded session's events are hidden from the same answers, and the choice is
+restored to `all` afterwards); then upstream changes, which both targets must apply alike: an open
+issue (#4) moved into the linked milestone becomes a task there while a closed one (#2) does not,
+an issue and the milestone closing upstream move the task to `done` and ship the workstream, and a
+task a person reopens stays reopened on the next sync; and removal. Both targets read a copy of
+the recorded fixtures in `apps/mock-hub/fixtures` that `run.mjs` makes
+(`PITCREW_CONFORMANCE_FIXTURES`), again at each sync: the test changes upstream by adding a
+fixture file that sorts first. The daemon runner passes `--integration-fixtures` and puts a
+stand-in `gh` (printing a synthetic credential) first on the daemon's `PATH`; the mock gets
+`startServer({ integrationFixtures })`. Nothing reaches GitHub or Jira.

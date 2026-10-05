@@ -407,7 +407,7 @@ whatever it sent.
 | `raise_ask` | anyone; an agent only about its own task and session | 400 unknown task or session; 403; 400 empty title, unknown addressee |
 | `answer_ask` | the addressee, or a person for their agents; decisions, approvals and reviews only by people | 404; 403; 400 no option and no non-blank text, option out of range; 409 already answered |
 | `put_brief` | person | 404 unknown target. With the pending proposal's text and next, `brief_accepted` carries its receipts (and the brief is the back office's) |
-| `patch_workstream` | person | 404; 400 empty patch |
+| `patch_workstream` | person | 404; 400 empty patch, or links that break `links::check_links` (over 16, repeated, a key with control or hidden characters, a URL that is not `https://` or has a user name). `external` appends `workstream_linked` with the full new list (after `workstream_changed` when status or health changed too) |
 | `dispatch_task` | person | see "Dispatch" |
 | `dispatch_working` | the runner link (through `follow_sessions`) | moves the dispatched task to in progress as the agent, when the rules allow; 409 for an ended dispatch, or a racing writer that moved the task first |
 | `follow_sessions` | the runner link | see "Dispatch": a dispatched session's first `working` moves its task, its end finishes its dispatch |
@@ -417,6 +417,8 @@ whatever it sent.
 | `seed` | the daemon | imports a `DemoWorkspace` into an empty work model |
 | `ensure_office_member(owner)` | the daemon | finds or adds the back office's member (see "The back office"); 400 `owner` is not a person; 409 `@office` held by a person, another person's agent or no one's agent |
 | `run_office`, `OfficeCommands` | the back office | see "The back office" |
+| `ensure_sync_member(owner)` | the daemon, when a person connects a tracker (each connection keeps its own) | finds or adds the tracker sync's member: an agent of `owner` named `@sync` (`@tracker-sync` when `@sync` is someone else's); 400 `owner` is not a person; 409 both handles taken |
+| `SyncCommands` | a tracker sync (`sync_commands(member)`) | see "Tracker sync" |
 
 "Own task" means the agent is the assignee or holds an active (not ended) dispatch on it.
 
@@ -429,6 +431,29 @@ Lists in a body (up to 1 MiB) cost time linear in their length: the checks that 
 before the command lock, labels in one pass that stops at the 33rd distinct one, repeats dropped
 with a hash set; the checks against the tables take one query per list (`json_each`), and a
 `blocked_by` cycle is one recursive query over the tasks waiting on the edited one.
+
+## Tracker sync (`SyncCommands`)
+
+A GitHub or Jira sync (`pitcrewd`'s `integrations`, api-v1.md "Integrations") changes the work
+model only through `SyncCommands`, as its own member (`@sync`, an agent of the person who connected
+the tracker), each command re-checked under the command lock like any caller's:
+
+- `create_task(workstream, source, title, description, labels)`: status `todo`, the upstream item
+  as `source`, text made to fit (`fit_title`, `fit_labels`: hidden characters dropped, 1–500
+  characters, labels trimmed and cut to 64 characters, at most 32). A source already mirrored
+  returns that task and appends nothing.
+- `update_task(task, title?, description?, labels?, workstream?)`: upstream-owned fields and the
+  workstream (of the task's project); `task_updated` with what differs, or nothing.
+- `move_task(task, to)`: `can_move(.., Mover::Sync)` from the status the task is in now: in-progress
+  work is never touched (`Refused`), and a move to where the task already is appends nothing.
+- `set_workstream_status(workstream, shipped)`: refused while one of its tasks is in progress.
+- `note(task, text)` (a merged pull request) and `raise_conflict(task?, title, body)` (a `decision`
+  ask to the owner): never posted or raised twice while the same one stands.
+- `task_by_source`, `workstreams`, `work_in_progress`: what routing and planning read.
+
+`links::scope_of(link)` says what a workstream link names (a repository or milestone, a Jira
+project or epic); the sync routes issues by it. Nothing here knows GitHub or Jira: the daemon reads
+them and plans with `pitcrew-sync-github` and `pitcrew-sync-jira`.
 
 ## The back office
 

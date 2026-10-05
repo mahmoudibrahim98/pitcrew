@@ -194,6 +194,31 @@ fn no_token_reaches_the_webview_or_the_logs() {
         json!({ "req": { "workspace": DOWN, "method": "GET", "path": "/v1/tasks" } }),
     );
     call("gateway_request", json!({ "req": 42 }));
+    let credential = |workspace: &str, integration: &str, secret: Value| json!({ "workspace": workspace, "integration": integration, "secret": secret });
+    call(
+        "gateway_integration_credential",
+        credential(WORKSPACE_ID, "01J9ZQ3", json!("synthetic-no-token-secret")),
+    );
+    call(
+        "gateway_integration_credential",
+        credential(WORKSPACE_ID, "gh", json!("synthetic-no-token-secret")),
+    );
+    call(
+        "gateway_integration_credential",
+        credential(WORKSPACE_ID, "../x", json!("synthetic-no-token-secret")),
+    );
+    call(
+        "gateway_integration_credential",
+        credential("nope", "01J9ZQ3", json!("synthetic-no-token-secret")),
+    );
+    call(
+        "gateway_integration_credential",
+        credential(DOWN, "01J9ZQ3", json!("synthetic-no-token-secret")),
+    );
+    call(
+        "gateway_integration_credential",
+        credential(WORKSPACE_ID, "01J9ZQ3", json!(42)),
+    );
     let open = |path: &str, channel: u32| json!({ "workspace": WORKSPACE_ID, "path": path, "events": format!("__CHANNEL__:{channel}") });
     call("gateway_socket_open", open("/v1/stream?script=order", 1));
     call("gateway_socket_open", open("/v1/stream?script=drop", 2));

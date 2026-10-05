@@ -131,6 +131,21 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **Transcripts** for all six demo sessions, paged tail-first with `before` and `limit`. SES0001
   is the Claude fixture transcript (its offsets are the file's real record offsets), and the
   receipts in the demo workspace point at real items.
+- **Integrations** (`/v1/integrations…`, `src/integrations.ts`): GitHub and Jira connections over
+  the recorded exchanges in `fixtures/` (`github.fixture` for `example-org/demo-repo`,
+  `jira.fixture` for project `DEMO` on `https://jira.example.com`; the sync crates' format, which
+  `pitcrewd serve --integration-fixtures` reads too), or the folder `startServer`'s
+  `integrationFixtures` names, read again at each sync. The checks are the daemon's. Adding one
+  finds or adds the caller's own sync member (`@sync`, or `@tracker-sync` when `@sync` is another
+  person's) and syncs at once, and so do `POST …/sync` and storing a credential. Each sync diffs
+  what it reads against the last read, as the daemon's crates do, so only upstream changes act:
+  open issues in a linked scope become tasks (`PATCH /v1/workstreams/{id}` with `external` links a
+  workstream and emits `workstream_linked`), and so does an open issue moved into a linked
+  milestone or epic; upstream-owned fields are overwritten when upstream changes them; an upstream
+  close or reopen moves the task by the sync's `can_move`, with conflicts as asks; a milestone or
+  epic seen closing ships its workstreams; and a merged pull request is noted on its task.
+  Credentials stay in memory and are never returned. `gh_cli` connections always have a
+  credential here.
 - **Terminals.** `GET /v1/sessions/{id}/terminal` replays a short ANSI screen, echoes keystrokes,
   accepts `{"type":"resize"}` and ignores unknown control types (malformed JSON closes with 1007),
   sends `{"type":"truncated"}` before the replay for sessions that ran over a day, and sends
@@ -141,7 +156,7 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - It runs no agents and reads no real transcripts; replies, terminal screens and the scan's report
   are canned.
 - Nothing is saved: restart the server to get the demo workspace back.
-- No back office or tracker sync: briefs are only proposed by the fixture, dispatches never finish
+- No back office, and no tracker sync on a timer (only when asked): briefs are only proposed by the fixture, dispatches never finish
   on their own, workstream health never changes by itself, and mentions do not create asks.
 - A resize changes nothing, and `model`, `persona` and `permission_mode` on a new session are only
   checked, not used (the contract says they are not echoed on `Session`).
@@ -181,6 +196,8 @@ a single entry point.
 | `src/transcripts.ts` | Canned transcripts and paging. |
 | `src/recaps.ts` | The recap routes, paged from the recaps fixture. |
 | `src/scan.ts` | The machine scan: its synthetic report and streamed frames. |
+| `src/integrations.ts` | GitHub and Jira integrations over `fixtures/*.fixture`, and the links' checks. |
+| `fixtures/` | Recorded, synthetic GitHub and Jira answers, shared with the daemon's tests and the conformance runner. |
 | `src/ws.ts` | A minimal WebSocket server (RFC 6455). |
 | `src/types.ts` | Wire types mirroring `crates/protocol`. |
 | `src/rules.ts` | `can_move` and date checks ported from `model.rs`. |

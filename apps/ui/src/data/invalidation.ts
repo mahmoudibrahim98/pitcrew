@@ -53,6 +53,8 @@ export const invalidationMap: InvalidationMap = {
   project_created: (d) => [keys.projects.lists, keys.projects.detail(d.project.id)],
   workstream_created: (d) => [keys.workstreams.lists, keys.workstreams.detail(d.workstream.id)],
   workstream_changed: (d) => [keys.workstreams.lists, keys.workstreams.detail(d.workstream)],
+  // Links upstream: the workstream, and the integrations that list them.
+  workstream_linked: (d) => [keys.workstreams.lists, keys.workstreams.detail(d.workstream), ['integrations']],
   task_created: () => [],
   task_moved: (d, cache) => taskAndWorkstream(d.task, cache),
   task_assigned: (d) => task(d.task),

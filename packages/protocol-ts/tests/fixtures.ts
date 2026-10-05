@@ -133,5 +133,53 @@ export const command: import('../index.ts').RunnerCommand = {
   "session": "01J00000000000000000000000",
   "type": "end_session"
 };
+export const integration: import('../index.ts').Integration = {
+  "added_at": 42,
+  "added_by": "01J00000000000000000000000",
+  "credential": {
+    "source": "gh_cli",
+    "stored": false
+  },
+  "id": "01J00000000000000000000000",
+  "interval_minutes": 15,
+  "links": [
+    {
+      "scope": {
+        "key": "example-org/demo-repo#milestone:1",
+        "system": "github",
+        "url": "https://github.com/example-org/demo-repo/milestone/1"
+      },
+      "title": "v1 launch",
+      "workstream": "01J00000000000000000000000"
+    }
+  ],
+  "name": "Demo repositories",
+  "settings": {
+    "kind": "github",
+    "repos": [
+      "example-org/demo-repo"
+    ]
+  },
+  "status": {
+    "last_attempt_at": 40,
+    "last_run": {
+      "applied": 0,
+      "changes": 0,
+      "conflicts": 0,
+      "malformed": 0,
+      "skipped": 0
+    },
+    "last_success_at": 41,
+    "problems": [],
+    "running": false
+  }
+};
+export const linked: import('../index.ts').EventBody = {
+  "data": {
+    "external": [],
+    "workstream": "01J00000000000000000000000"
+  },
+  "type": "workstream_linked"
+};
 export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };
 export const filteredImport: import('../index.ts').ImportFilter = { mode: 'filtered', since: '2026-01-01' };

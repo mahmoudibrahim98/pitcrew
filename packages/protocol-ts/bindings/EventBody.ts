@@ -6,6 +6,7 @@ import type { BriefTarget } from "./BriefTarget.ts";
 import type { Dispatch } from "./Dispatch.ts";
 import type { DispatchId } from "./DispatchId.ts";
 import type { DispatchOutcome } from "./DispatchOutcome.ts";
+import type { ExternalRef } from "./ExternalRef.ts";
 import type { Health } from "./Health.ts";
 import type { LinkBasis } from "./LinkBasis.ts";
 import type { Liveness } from "./Liveness.ts";
@@ -194,7 +195,15 @@ status: WorkstreamStatus,
 /**
  * New health.
  */
-health: Health, } } | { "type": "task_created", "data": { 
+health: Health, } } | { "type": "workstream_linked", "data": { 
+/**
+ * The workstream.
+ */
+workstream: WorkstreamId, 
+/**
+ * The full new list.
+ */
+external: Array<ExternalRef>, } } | { "type": "task_created", "data": { 
 /**
  * The task.
  */

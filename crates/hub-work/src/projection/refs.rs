@@ -179,7 +179,8 @@ fn direct(tx: &Transaction<'_>, body: &EventBody) -> Result<About, BoxError> {
             remember(tx, WORKSTREAM, &id, &p)?;
             about.workstream = Some(id);
         }
-        EventBody::WorkstreamChanged { workstream, .. } => {
+        EventBody::WorkstreamChanged { workstream, .. }
+        | EventBody::WorkstreamLinked { workstream, .. } => {
             about.workstream = Some(workstream.text());
         }
         EventBody::TaskCreated { task } => {

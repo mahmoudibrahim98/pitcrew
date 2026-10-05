@@ -1,0 +1,34 @@
+GET https://api.github.com/repos/example-org/demo-repo HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+X-OAuth-Scopes: repo, read:org
+
+{"full_name":"example-org/demo-repo","private":false,"permissions":{"admin":false,"maintain":false,"push":true,"triage":true,"pull":true}}
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/milestones?state=all&sort=due_on&direction=asc&per_page=100 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+ETag: "demo-milestones-1"
+
+[{"number":1,"title":"v1 launch","state":"open","html_url":"https://github.com/example-org/demo-repo/milestone/1"},{"number":2,"title":"v0 cleanup","state":"closed","html_url":"https://github.com/example-org/demo-repo/milestone/2"}]
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/issues?state=all&sort=updated&direction=asc&per_page=100 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+ETag: "demo-issues-1"
+
+[{"number":1,"title":"Fix flaky login test","body":"Login fails one run in ten on CI.","state":"open","labels":[{"name":"bug"},{"name":"tests"}],"assignees":[{"login":"octo-demo"}],"milestone":{"number":1,"title":"v1 launch","state":"open","html_url":"https://github.com/example-org/demo-repo/milestone/1"},"updated_at":"2026-01-02T09:00:00Z","created_at":"2026-01-01T09:00:00Z","html_url":"https://github.com/example-org/demo-repo/issues/1"},{"number":2,"title":"Docs typo","body":"A typo in the README.","state":"closed","state_reason":"completed","labels":[],"assignees":[],"updated_at":"2026-01-02T09:05:00Z","created_at":"2025-12-30T09:00:00Z","html_url":"https://github.com/example-org/demo-repo/issues/2"},{"number":3,"title":"Drop the old API","body":"Asked to keep supporting the old API.","state":"closed","state_reason":"not_planned","labels":[],"assignees":[],"milestone":{"number":1,"title":"v1 launch","state":"open","html_url":"https://github.com/example-org/demo-repo/milestone/1"},"updated_at":"2026-01-02T09:10:00Z","created_at":"2025-12-29T09:00:00Z","html_url":"https://github.com/example-org/demo-repo/issues/3"},{"number":4,"title":"Write the release notes","body":"","state":"open","labels":[{"name":"docs"}],"assignees":[],"updated_at":"2026-01-02T09:20:00Z","created_at":"2026-01-02T08:00:00Z","html_url":"https://github.com/example-org/demo-repo/issues/4"},{"number":7,"title":"Fix login flake","body":"Closes #1","state":"closed","labels":[],"assignees":[],"pull_request":{"url":"https://api.github.com/repos/example-org/demo-repo/pulls/7"},"updated_at":"2026-01-02T09:30:00Z","created_at":"2026-01-02T08:30:00Z","html_url":"https://github.com/example-org/demo-repo/pull/7"}]
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/pulls?state=all&sort=updated&direction=desc&per_page=100 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+ETag: "demo-pulls-1"
+
+[{"number":7,"title":"Fix login flake","body":"Closes #1","state":"closed","merged_at":"2026-01-02T09:30:00Z","updated_at":"2026-01-02T09:30:00Z","html_url":"https://github.com/example-org/demo-repo/pull/7"}]

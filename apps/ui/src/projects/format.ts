@@ -225,6 +225,10 @@ export function describeEvent(event: Event, names: Names): string {
       return `created the workstream ${body.data.workstream.name}`;
     case 'workstream_changed':
       return `marked ${names.workstream(body.data.workstream)} ${WORKSTREAM_STATUS[body.data.status].label.toLowerCase()}, ${HEALTH[body.data.health].label.toLowerCase()}`;
+    case 'workstream_linked':
+      return body.data.external.length === 0
+        ? `unlinked ${names.workstream(body.data.workstream)} from upstream`
+        : `linked ${names.workstream(body.data.workstream)} to ${body.data.external.map((l) => l.key).join(', ')}`;
     case 'task_created':
       return `created ${body.data.task.key} “${body.data.task.title}”`;
     case 'task_moved':

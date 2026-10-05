@@ -1,6 +1,8 @@
 //! Deterministic, explicit export; normal protocol tests never write bindings.
 #![cfg(feature = "ts")]
-use pitcrew_protocol::{api, events, ids, import, model, recap, runner, scan, transcript};
+use pitcrew_protocol::{
+    api, events, ids, import, integrations, model, recap, runner, scan, transcript,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{error::Error, fmt::Debug, fs, path::Path};
 use ts_rs::{Config, TS};
@@ -77,6 +79,7 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     ids::AskId::export_all(&config)?;
     ids::CommandId::export_all(&config)?;
     ids::DispatchId::export_all(&config)?;
+    ids::IntegrationId::export_all(&config)?;
     ids::EventId::export_all(&config)?;
     ids::MachineId::export_all(&config)?;
     ids::MemberId::export_all(&config)?;
@@ -91,6 +94,19 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     ids::TerminalId::export_all(&config)?;
     ids::WorkspaceId::export_all(&config)?;
     ids::WorkstreamId::export_all(&config)?;
+    integrations::CredentialInfo::export_all(&config)?;
+    integrations::CredentialSource::export_all(&config)?;
+    integrations::Integration::export_all(&config)?;
+    integrations::IntegrationCheck::export_all(&config)?;
+    integrations::IntegrationLink::export_all(&config)?;
+    integrations::IntegrationSettings::export_all(&config)?;
+    integrations::JiraDeployment::export_all(&config)?;
+    integrations::NewCredential::export_all(&config)?;
+    integrations::NewIntegration::export_all(&config)?;
+    integrations::ScopeCheck::export_all(&config)?;
+    integrations::SyncCounts::export_all(&config)?;
+    integrations::SyncProblem::export_all(&config)?;
+    integrations::SyncStatus::export_all(&config)?;
     model::Answer::export_all(&config)?;
     model::Ask::export_all(&config)?;
     model::AskKind::export_all(&config)?;
@@ -313,6 +329,53 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
         runner::RunnerCommand::EndSession {
             session: "01J00000000000000000000000".parse()?,
             mode: runner::EndMode::Graceful,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "integration",
+        integrations::Integration {
+            id: "01J00000000000000000000000".parse()?,
+            name: "Demo repositories".into(),
+            settings: integrations::IntegrationSettings::Github {
+                repos: vec!["example-org/demo-repo".into()],
+                api_base: None,
+            },
+            credential: integrations::CredentialInfo {
+                source: integrations::CredentialSource::GhCli,
+                stored: false,
+            },
+            interval_minutes: 15,
+            added_by: "01J00000000000000000000000".parse()?,
+            added_at: 42,
+            status: integrations::SyncStatus {
+                running: false,
+                last_attempt_at: Some(40),
+                last_success_at: Some(41),
+                next_at: None,
+                rate_limited_until: None,
+                problems: vec![],
+                last_run: Some(integrations::SyncCounts::default()),
+            },
+            links: vec![integrations::IntegrationLink {
+                workstream: "01J00000000000000000000000".parse()?,
+                scope: model::ExternalRef {
+                    system: model::ExternalSystem::Github,
+                    key: "example-org/demo-repo#milestone:1".into(),
+                    url: Some("https://github.com/example-org/demo-repo/milestone/1".into()),
+                },
+                title: Some("v1 launch".into()),
+            }],
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "linked",
+        events::EventBody::WorkstreamLinked {
+            workstream: "01J00000000000000000000000".parse()?,
+            external: vec![],
         },
     )?;
     // Request dimensions may be omitted even though Rust serializes their defaults.

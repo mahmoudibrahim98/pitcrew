@@ -38,6 +38,29 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `calendar.tsx`, `calendar-dates.ts` | Calendar route: due tasks by month, filters for me/project/workstream, locale week starts, arrow-key day navigation, Enter to show a day's tasks, and a phone agenda. Calendar arithmetic uses UTC solely to keep date-only values stable. |
 | `timeline.tsx`, `scheduled-task.tsx`, `schedule.css` | Project Timeline: workstream rows on a shared week/month axis, exact due-date labels, a today line, undated tasks apart, and status symbols and borders. Scrolling stays in the timeline; task buttons open the drawer and regain focus when it closes. |
 | `people.tsx`, `ui.tsx` | Avatars; small shared pieces (candidates for `src/design`). |
+| `integrations/` | GitHub and Jira (api-v1.md, "Integrations"; read-only upstream): `api.ts` (the wire types, `integrationClient`, `useIntegrations`, `useIntegrationActions`, `useStoreCredential`, and the links' `githubWebRoot`, `scopesOf` and `narrowerScope`), `integrations-page.tsx` (Settings › Integrations at `settings/integrations`: connect, credential, test, sync now, status and problems, linked workstreams, remove) and `workstream-links.tsx` (the workstream page's links upstream and their last sync, and the dialog that links or unlinks them). See "Integrations" below. |
+
+## Integrations
+
+- **The page** lists each connection with its sync's state (`syncState`: syncing, waiting on a rate
+  limit, needs a credential, problems, in sync), the last and next sync, the last run's counts, the
+  problems (`role="alert"`), and the workstreams it syncs. "Test" shows each check and the
+  warnings about a credential that can do more than read. Connecting GitHub offers `gh auth token`
+  on the hub's machine or a token entered next; Jira always takes a stored secret.
+- **Secrets.** The token field is an uncontrolled password input: on Save its value goes to
+  `integrationClient(api).storeCredential` once, through `useStoreCredential` (which keeps only
+  whether it is under way and its error, not a TanStack mutation, whose `variables` the mutation
+  cache would keep), and the field is cleared, so no React state, query or mutation cache holds it
+  (tested). In the desktop app the transport's
+  `storeCredential` is the gateway's own command (`gateway_integration_credential`), never
+  `gateway_request`; in a browser (development) it is `PUT …/credential`.
+- **Links.** A workstream's header shows its links (with the upstream title once synced) and its
+  integration's last sync; "Edit links" picks a connected repository or Jira project, optionally
+  narrowed to a milestone number or an epic key of that project (anything else is refused before
+  it is sent), and `PATCH`es the full list. Links point at the integration's own web host: an
+  Enterprise server's origin, not `github.com` (`githubWebRoot`). `workstream_linked`
+  refreshes the workstream and the integrations. The list polls every 30 s (2 s while one syncs):
+  a sync's status has no event of its own.
 
 ## The task page
 

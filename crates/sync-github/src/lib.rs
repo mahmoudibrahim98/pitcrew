@@ -20,7 +20,10 @@
 //! - [`change::UpstreamChange`]: what changed upstream, each carrying an `ExternalRef` and the
 //!   upstream time.
 //! - [`ownership::plan`]: turns one `UpstreamChange` into abstract hub [`ownership::Intent`]s,
-//!   respecting the field-ownership table in [`ownership::ISSUE_FIELD_OWNERSHIP`].
+//!   respecting the field-ownership table in [`ownership::ISSUE_FIELD_OWNERSHIP`];
+//!   [`ownership::plan_workstream`] does the same for a milestone and a workstream that links it
+//!   ([`ownership::MILESTONE_FIELD_OWNERSHIP`]).
+//! - [`probe::probe`]: one read of each repository, for "test this connection".
 
 #![forbid(unsafe_code)]
 
@@ -32,6 +35,7 @@ pub mod link_header;
 pub mod links;
 mod origin;
 pub mod ownership;
+pub mod probe;
 pub mod state;
 pub mod sync;
 pub mod time;
@@ -40,7 +44,10 @@ mod wire;
 
 pub use change::UpstreamChange;
 pub use client::{ClientError, GithubClient, Outcome};
-pub use ownership::{FieldOwner, FieldOwnership, ISSUE_FIELD_OWNERSHIP, Intent, plan};
+pub use ownership::{
+    FieldOwner, FieldOwnership, ISSUE_FIELD_OWNERSHIP, Intent, LinkedWorkstream,
+    MILESTONE_FIELD_OWNERSHIP, plan, plan_workstream,
+};
 pub use state::{CloseReason, RepoState, SyncState};
 // Not public API: exposed only so stream Q's fuzz harness can call `trusted_next_url` directly,
 // rather than only reaching it indirectly through `sync::sync` — see its own doc.
