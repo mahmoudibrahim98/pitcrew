@@ -21,4 +21,3 @@ pub struct SaveProfile {
     /// Avatar appearance.
     pub avatar: Avatar,
 }
-

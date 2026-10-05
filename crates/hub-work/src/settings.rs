@@ -120,6 +120,4 @@ impl WorkService {
         }
         Ok(member)
     }
-
-
 }
