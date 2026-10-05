@@ -39,7 +39,7 @@ describe('DraftBoardPanel', () => {
     expect(await person.request<BoardDraft[]>('GET', '/v1/board-drafts')).toEqual([]);
 
     // Drafted by @writer, whose proposal the test sends as the agent.
-    fireEvent.change(within(panel).getByLabelText('Agent'), { target: { value: demo.writer } });
+    fireEvent.change(await within(panel).findByLabelText('Agent'), { target: { value: demo.writer } });
     fireEvent.click(within(panel).getByRole('button', { name: 'Send and draft' }));
     await within(panel).findByText(/@writer is drafting the board in Claude Code/);
     const [draft] = await person.request<BoardDraft[]>('GET', '/v1/board-drafts');
@@ -76,7 +76,7 @@ describe('DraftBoardPanel', () => {
     const panel = await screen.findByRole('region', { name: 'Draft the board from history' });
     // The back office (the default agent) drafts; the mock plays it.
     await within(panel).findByText(/^2 sessions/);
-    fireEvent.click(within(panel).getByRole('button', { name: 'Send and draft' }));
+    fireEvent.click(await within(panel).findByRole('button', { name: 'Send and draft' }));
     await within(panel).findByRole('list', { name: 'Proposed tasks' }, { timeout: 15_000 });
     fireEvent.click(within(panel).getByRole('button', { name: 'Reject all' }));
     await within(panel).findByText('Rejected: no task was created.');

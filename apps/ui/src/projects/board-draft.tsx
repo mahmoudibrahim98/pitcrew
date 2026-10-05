@@ -33,14 +33,19 @@ import { ErrorNote, Field, Panel, inputClass } from './ui.tsx';
 const ENGINE_LABEL: Record<Engine, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode' };
 const ENGINES: Engine[] = ['claude', 'codex', 'opencode'];
 
-/** The caller's own agents, the back office first: those a draft may run as. */
+/**
+ * The caller's own agents, the back office first: those a draft may run as. `loading` until both
+ * the caller and the members are known, so no one is told they have none before then.
+ */
 export function useMyAgents() {
   const me = useMe();
   const members = useMembers();
-  return useMemo(() => {
+  const agents = useMemo(() => {
     const mine = (members.data ?? []).filter((m) => m.kind === 'agent' && m.owner === me.data?.id);
     return [...mine.filter((m) => m.handle === '@office'), ...mine.filter((m) => m.handle !== '@office')];
   }, [members.data, me.data?.id]);
+  const error = me.error ?? members.error;
+  return { agents, error, loading: error === null && (me.data === undefined || members.data === undefined) };
 }
 
 /** The preview, and the start of a draft of `workstream`: cost first. */
@@ -55,7 +60,7 @@ export function DraftStart({
   compact?: boolean;
 }) {
   const preview = useDraftPreview(workstream);
-  const agents = useMyAgents();
+  const { agents, error: agentsError, loading: agentsLoading } = useMyAgents();
   const start = useStartDraft(workstream);
   const [agent, setAgent] = useState<MemberId | ''>('');
   const [engine, setEngine] = useState<Engine | ''>('');
@@ -105,7 +110,13 @@ export function DraftStart({
           </pre>
         )}
       </div>
-      {agents.length === 0 ? (
+      {agentsError !== null ? (
+        <ErrorNote error={agentsError} what="load your agents" />
+      ) : agentsLoading ? (
+        <p role="status" className="text-sm text-ink-2">
+          Loading your agents…
+        </p>
+      ) : agents.length === 0 ? (
         <p className="text-sm text-ink-2">None of your agents can draft: add an agent to this workspace first.</p>
       ) : (
         <form

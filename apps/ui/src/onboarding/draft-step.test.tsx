@@ -87,7 +87,7 @@ describe('the draft step', () => {
     expect(within(list).getByRole('button', { name: 'Show what will be sent' })).toBeTruthy();
     expect(await person.request<BoardDraft[]>('GET', '/v1/board-drafts')).toEqual([]);
     expect(screen.getByRole('button', { name: 'Continue without drafting' })).toBeTruthy();
-    fireEvent.click(within(list).getByRole('button', { name: 'Send and draft' }));
+    fireEvent.click(await within(list).findByRole('button', { name: 'Send and draft' }));
     await within(list).findByText(/^Drafting\. Review the proposal/);
     const drafts = await person.request<BoardDraft[]>('GET', '/v1/board-drafts');
     expect(drafts.map((d) => d.workstream)).toEqual([demo.submission]);
