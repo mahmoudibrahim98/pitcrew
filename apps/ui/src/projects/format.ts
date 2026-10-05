@@ -267,6 +267,8 @@ export function describeEvent(event: Event, names: Names): string {
     }
     case 'write_started':
       return `sent a write${body.data.task === undefined ? '' : ` for ${names.task(body.data.task)}`} upstream${body.data.attempt > 1 ? ` (attempt ${body.data.attempt})` : ''}`;
+    case 'write_retry_requested':
+      return `asked to send a failed write${body.data.task === undefined ? '' : ` for ${names.task(body.data.task)}`} again`;
     case 'write_finished': {
       const r = body.data.result;
       const about = body.data.task === undefined ? '' : ` for ${names.task(body.data.task)}`;

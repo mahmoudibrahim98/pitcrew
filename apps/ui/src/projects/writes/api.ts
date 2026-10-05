@@ -2,10 +2,12 @@
 // client over the routes, and the hooks the Inbox's approval cards and the task drawer use.
 //
 // Nothing here sends anything upstream. Approving is answering the write's approval ask with
-// "Send" (`POST /v1/asks/{id}/answer`, option 0); the hub then sends exactly `proposal.after`.
+// "Send" (`POST /v1/asks/{id}/answer`, option 0); the hub then sends exactly `proposal.after`, or
+// less when upstream already holds some of it, or nothing when upstream changed since.
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
+  ApiError,
   keys,
   useApi,
   useLiveQuery,
@@ -47,7 +49,7 @@ export function useTaskWrites(task: TaskId) {
 
 /**
  * The write an approval ask proposes, if it proposes one: an approval ask the hub raised has one;
- * any other has none (`404`), and then the card shows the ask as it is.
+ * any other has none (`404`, see `hasNoWrite`), and then the card shows the ask as it is.
  */
 export function useWriteOf(ask: Ask) {
   const api = useApi();
@@ -57,6 +59,11 @@ export function useWriteOf(ask: Ask) {
     enabled: ask.kind === 'approval',
     retry: false,
   });
+}
+
+/** Whether `error` says the ask proposes no write (`404`), as opposed to failing to read it. */
+export function hasNoWrite(error: Error | null): boolean {
+  return error instanceof ApiError && error.status === 404;
 }
 
 /** Asking for a write, and retrying a failed one. Each refreshes every write list. */
@@ -86,8 +93,13 @@ const FIELD_ORDER = ['title', 'body', 'labels', 'milestone', 'epic', 'state', 'c
 
 function shown(fields: WriteFields, field: (typeof FIELD_ORDER)[number]): string | undefined {
   switch (field) {
-    case 'labels':
+    case 'labels': {
+      // An update sends labels as a change: those it adds and those it removes, nothing else.
+      if (fields.add_labels !== undefined || fields.remove_labels !== undefined) {
+        return [...(fields.add_labels ?? []).map((l) => `+ ${l}`), ...(fields.remove_labels ?? []).map((l) => `− ${l}`)].join(', ');
+      }
       return fields.labels === undefined ? undefined : fields.labels.length === 0 ? '(none)' : fields.labels.join(', ');
+    }
     case 'state': {
       if (fields.state === undefined) return undefined;
       const reason =

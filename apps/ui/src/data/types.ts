@@ -381,7 +381,12 @@ export type WriteState = 'pending' | 'approved' | 'denied' | 'sending' | 'sent' 
 export interface WriteFields {
   title?: string;
   body?: string;
+  /** A new issue's whole label list; in `before`, upstream's labels as last read. */
   labels?: string[];
+  /** Labels an `update` adds; the issue's others are kept. */
+  add_labels?: string[];
+  /** Labels an `update` removes. */
+  remove_labels?: string[];
   /** GitHub: a milestone link key, `owner/repo#milestone:2`. */
   milestone?: string;
   /** Jira: an epic's key, `DEMO-5`. */
@@ -423,6 +428,8 @@ export interface UpstreamWrite {
   answered_by?: MemberId;
   finished_at?: TimestampMs;
   result?: WriteResult;
+  /** The person whose retry waits to be sent. */
+  retry_requested_by?: MemberId;
 }
 
 // ─── Recaps (`crates/protocol/src/recap.rs`) ───────────────────────────────────────────────────
@@ -647,6 +654,7 @@ export type EventBody =
     }
   | { type: 'write_proposed'; data: { write: WriteProposal } }
   | { type: 'write_started'; data: { ask: AskId; task?: TaskId; attempt: number } }
+  | { type: 'write_retry_requested'; data: { ask: AskId; task?: TaskId; by: MemberId } }
   | { type: 'write_finished'; data: { ask: AskId; task?: TaskId; result: WriteResult } };
 
 export type EventType = EventBody['type'];
@@ -687,6 +695,7 @@ export const EVENT_TYPES = [
   'decision_recorded',
   'write_proposed',
   'write_started',
+  'write_retry_requested',
   'write_finished',
 ] as const satisfies readonly EventType[];
 

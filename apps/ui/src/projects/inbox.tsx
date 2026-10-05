@@ -12,7 +12,7 @@ import { ASK_KIND, ASK_KINDS } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { Receipts } from './receipts.tsx';
 import { ErrorNote, MaybeLink } from './ui.tsx';
-import { useWriteOf } from './writes/api.ts';
+import { hasNoWrite, useWriteOf } from './writes/api.ts';
 import { ApprovalCard } from './writes/approval-card.tsx';
 
 export function groupAsks(asks: readonly Ask[]): { kind: AskKind; asks: Ask[] }[] {
@@ -71,12 +71,22 @@ function AskCardFallback() {
 
 /**
  * An approval the hub raised for a write upstream shows exactly what will be sent; any other ask,
- * an approval an agent raised itself included, is the console's question card.
+ * an approval an agent raised itself included (it has no write: `404`), is the console's question
+ * card. When the write cannot be read for any other reason, the card shows why and offers no
+ * answer: the ask's own text is only a short preview of what would be sent.
  */
 function AskBody({ ask }: { ask: Ask }) {
   const write = useWriteOf(ask);
   if (write.data !== undefined) return <ApprovalCard ask={ask} write={write.data} />;
   if (ask.kind === 'approval' && write.error === null) return <AskCardFallback />;
+  if (ask.kind === 'approval' && write.error !== null && !hasNoWrite(write.error)) {
+    return (
+      <article aria-label={ask.title} className="flex flex-col gap-1 rounded-lg border border-line bg-card p-3">
+        <h3 className="text-sm font-semibold">{ask.title}</h3>
+        <ErrorNote error={write.error} what="read what this approval would send, so it cannot be answered here yet" />
+      </article>
+    );
+  }
   return (
     <Suspense fallback={<AskCardFallback />}>
       <QuestionCard ask={ask} />

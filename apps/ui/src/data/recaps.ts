@@ -257,6 +257,7 @@ export const recapScopeMap: RecapScopeMap = {
   // Outward writes are about their task.
   write_proposed: (d, cache) => (d.write.task === undefined ? NONE_SCOPE : scopeOfTask(d.write.task, cache)),
   write_started: (d, cache) => (d.task === undefined ? NONE_SCOPE : scopeOfTask(d.task, cache)),
+  write_retry_requested: (d, cache) => (d.task === undefined ? NONE_SCOPE : scopeOfTask(d.task, cache)),
   write_finished: (d, cache) => (d.task === undefined ? NONE_SCOPE : scopeOfTask(d.task, cache)),
 };
 

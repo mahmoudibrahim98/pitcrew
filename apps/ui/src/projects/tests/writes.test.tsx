@@ -12,7 +12,7 @@ import { integrationClient } from '../integrations/api.ts';
 import { Inbox } from '../inbox.tsx';
 import { TaskDrawer } from '../task-drawer.tsx';
 import { fieldRows, writeClient } from '../writes/api.ts';
-import { demo, eventually, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
+import { AGENT_TOKEN, demo, eventually, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
 let hub: Hub;
 beforeEach(async () => {
@@ -119,6 +119,59 @@ describe('Outward writes', () => {
     // What it sends, on demand.
     fireEvent.click(within(item).getByRole('button', { name: 'What it sends' }));
     expect(item.querySelector('tr[data-field="comment"]')?.textContent).toContain('Synthetic comment.');
+  });
+
+  it('an approval whose write cannot be read offers no answer; one with no write is a question', async () => {
+    const api = otherClient(hub);
+    const task = await connected(api);
+    await move(api, task, 'done');
+    const [write] = await writeClient(api).ofTask(task.id);
+    if (write === undefined) throw new Error('no write');
+    // An approval an agent raised itself has no write (404): the question card answers it.
+    const crafted = await otherClient(hub, AGENT_TOKEN).request<{ id: string }>('POST', '/v1/asks', {
+      body: { kind: 'approval', to: demo.sam, title: 'Synthetic crafted approval', options: ['Send', "Don't send"] },
+    });
+    // Reading the hub's own write fails (500): its card says so, and has no buttons at all.
+    const failing: typeof fetch = async (input, init) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes(`/v1/writes/${write.proposal.ask}`)) {
+        return new Response(JSON.stringify({ code: 'internal', message: 'Synthetic failure' }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return fetch(input, init);
+    };
+    renderWithHub(<Inbox />, hub, { fetch: failing });
+    const card = await screen.findByRole('article', { name: /GitHub: close example-org\/demo-repo#1/ });
+    await within(card).findByRole('alert');
+    expect(within(card).getByRole('alert').textContent).toContain('Synthetic failure');
+    expect(within(card).queryAllByRole('button')).toEqual([]);
+    const question = await screen.findByText('Synthetic crafted approval');
+    const block = question.closest('[data-ask]');
+    if (block === null) throw new Error('no ask');
+    expect(within(block as HTMLElement).getAllByRole('button').length).toBeGreaterThan(0);
+    expect(crafted.id).toBeTruthy();
+  });
+
+  it('labels show as the change sent, never the whole list', () => {
+    const write: UpstreamWrite = {
+      proposal: {
+        ask: '01J00000000000000000000000',
+        integration: '01J00000000000000000000000',
+        system: 'github',
+        scope: 'example-org/demo-repo',
+        target: { system: 'github', key: 'example-org/demo-repo#1' },
+        operation: 'update',
+        before: { labels: ['bug', 'tests', 'security'] },
+        after: { add_labels: ['docs'], remove_labels: ['tests'] },
+        requested_by: demo.sam,
+      },
+      state: 'pending',
+      attempts: 0,
+      proposed_at: 0,
+    };
+    expect(fieldRows(write)).toEqual([{ field: 'labels', before: 'bug, tests, security', after: '+ docs, − tests' }]);
   });
 
   it('diff rows name every field sent, with upstream’s value before', () => {

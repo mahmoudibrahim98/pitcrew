@@ -68,8 +68,11 @@ none of this folder lands in the initial bundle until a projects route is visite
 - **In the Inbox**, an `approval` ask the hub raised for a write (`GET /v1/writes/{ask}` answers)
   is an `ApprovalCard`: what it does and to which issue, who or what implied it, a row per field
   sent (upstream's value now, struck through, and exactly what is sent), and the ask's own options
-  (Send, Don't send), answered in place through `POST /v1/asks/{id}/answer`. Any other ask, an
-  approval an agent raised itself included (`404`), stays the console's `QuestionCard`.
+  (Send, Don't send), answered in place through `POST /v1/asks/{id}/answer`. Labels show as the
+  change sent (`+ docs, − tests`), never a whole list. Any other ask, an approval an agent raised
+  itself included (`404`), stays the console's `QuestionCard`. When the write cannot be read for
+  any other reason, the card shows the ask's title and the error, and no buttons: the ask's own
+  text is only a short preview of what would be sent.
 - **In the task drawer**, "Upstream" lists the task's writes newest first (waiting for approval,
   sent with a link, failed with upstream's message, or not sent and why), each with "What it
   sends" and, when failed, Retry. A person can ask to create an issue from a task that mirrors
@@ -77,7 +80,8 @@ none of this folder lands in the initial bundle until a projects route is visite
   The section shows when the task mirrors an issue, has writes, or (for a person) when an
   integration is connected.
 - Write events invalidate the write queries (`keys.writes`), the asks on a proposal, and the task
-  on a result (a created issue becomes its `source`).
+  on a result (a created issue becomes its `source`); `write_retry_requested` refreshes the write
+  lists and reads as "asked to send a failed write … again" in activity.
 
 ## The task page
 
