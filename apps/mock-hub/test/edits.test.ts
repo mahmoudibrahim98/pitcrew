@@ -88,7 +88,7 @@ describe('POST /v1/projects', () => {
           status: 'planning',
           start: '2026-10-01',
           due: '2026-10-01',
-          root: { machine: LAPTOP, path: '/work/ablations', branch: 'main' },
+          root: { machine: LAPTOP, path: process.platform === 'win32' ? 'C:/work/ablations' : '/work/ablations', branch: 'main' },
         },
       });
       assert.equal(res.status, 201);
@@ -96,7 +96,7 @@ describe('POST /v1/projects', () => {
       assert.deepEqual(res.body.members, [ID.writer, ID.runner, ID.sam]);
       assert.equal(res.body.status, 'planning');
       assert.deepEqual([res.body.start, res.body.due], ['2026-10-01', '2026-10-01']);
-      assert.deepEqual(res.body.root, { machine: LAPTOP, path: '/work/ablations', branch: 'main' });
+      assert.deepEqual(res.body.root, { machine: LAPTOP, path: process.platform === 'win32' ? 'C:/work/ablations' : '/work/ablations', branch: 'main' });
     }));
 
   it('answers 409 when the key is already used', () =>
