@@ -33,6 +33,7 @@ mod init;
 mod locations;
 mod office;
 mod onboarding;
+mod orchestrator;
 mod recaps;
 mod refs;
 mod runner;

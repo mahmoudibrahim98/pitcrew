@@ -53,10 +53,12 @@ use pitcrew_hub_work::{DispatchError, DispatchRequest, Dispatcher, SessionReques
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::{CommandId, MachineId, MemberId, SessionId};
+use pitcrew_protocol::model::Engine;
 use pitcrew_protocol::runner::{CommandOutcome, RunnerCommand};
+use pitcrew_protocol::transcript::TranscriptPage;
 use pitcrew_runner::{
-    EventSink, RunnerCommands, SessionAgent, SessionAgents as _, SessionEnv, SinkError, Started,
-    StoreSink,
+    EventSink, PageError, RunnerCommands, SessionAgent, SessionAgents as _, SessionEnv, SinkError,
+    Started, StoreSink,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -80,13 +82,25 @@ const ENDPOINTS: [&str; 3] = ["PITCREW_SOCKET", "PITCREW_PIPE", "PITCREW_URL"];
 #[derive(Debug)]
 pub struct RunnerLink {
     attached: Arc<Attached>,
+    /// Where scratch folders are made (`scratch/` in the state directory), if anywhere.
+    scratch: Option<PathBuf>,
 }
 
 impl RunnerLink {
     /// Starts dispatched sessions with the runner `attached` has, once it has one.
     #[must_use]
     pub fn new(attached: Arc<Attached>) -> Self {
-        Self { attached }
+        Self {
+            attached,
+            scratch: None,
+        }
+    }
+
+    /// Makes scratch folders (`Dispatcher::scratch`, the Orchestrator's) under `dir`.
+    #[must_use]
+    pub fn with_scratch(mut self, dir: PathBuf) -> Self {
+        self.scratch = Some(dir);
+        self
     }
 
     /// The runner, if one is attached and runs on `machine`.
@@ -145,13 +159,69 @@ impl Dispatcher for RunnerLink {
         }
         match runner.commands.run(CommandId::new(), &command) {
             CommandOutcome::Ok { .. } => {
-                tracing::info!(session = %request.session, agent = %request.agent, "started a board draft's CLI");
+                tracing::info!(session = %request.session, agent = %request.agent, "started a session the hub stored for an agent");
                 self.attached.started();
                 Ok(())
             }
             CommandOutcome::Rejected { reason } => Err(DispatchError::Rejected(reason)),
             CommandOutcome::Failed { error } => Err(DispatchError::Unavailable(error)),
         }
+    }
+
+    /// `scratch/<name>` in the state directory, on this hub's machine only
+    /// ([`crate::orchestrator::scratch_folder`]).
+    fn scratch(&self, machine: &MachineId, name: &str) -> Result<String, DispatchError> {
+        self.runner(machine)?;
+        let root = self.scratch.as_ref().ok_or_else(|| {
+            DispatchError::Unavailable("this hub keeps no scratch folders".into())
+        })?;
+        let folder =
+            crate::orchestrator::scratch_folder(root, name).map_err(DispatchError::Unavailable)?;
+        folder.into_os_string().into_string().map_err(|_| {
+            DispatchError::Unavailable("the state directory's path is not UTF-8".into())
+        })
+    }
+
+    fn command(&self, machine: &MachineId, command: &RunnerCommand) -> Result<(), DispatchError> {
+        let runner = self.runner(machine)?;
+        match runner.commands.run(CommandId::new(), command) {
+            CommandOutcome::Ok { .. } => Ok(()),
+            CommandOutcome::Rejected { reason } => Err(DispatchError::Rejected(reason)),
+            CommandOutcome::Failed { error } => Err(DispatchError::Unavailable(error)),
+        }
+    }
+
+    /// As `GET /v1/sessions/{id}/transcript` reads it (`crate::transcripts`): a session the
+    /// runner has not indexed yet has an empty page.
+    fn transcript(
+        &self,
+        machine: &MachineId,
+        session: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<TranscriptPage, DispatchError> {
+        let runner = self.runner(machine)?;
+        match runner
+            .transcripts
+            .transcript_page(*session, before, Some(limit))
+        {
+            Ok(page) => Ok(page),
+            Err(PageError::UnknownSession(_)) => Ok(TranscriptPage {
+                items: Vec::new(),
+                from: 0,
+                to: 0,
+                at_start: true,
+            }),
+            Err(PageError::Unavailable { reason, .. }) => {
+                Err(DispatchError::Unavailable(reason.to_owned()))
+            }
+        }
+    }
+
+    fn installed(&self, machine: &MachineId, engine: Engine) -> Option<bool> {
+        self.runner(machine)
+            .ok()
+            .map(|_| crate::orchestrator::installed(engine))
     }
 }
 
@@ -226,15 +296,25 @@ impl AgentEnv {
         let _ = self.endpoint.set((variable, value));
     }
 
-    /// The file holding a token for `agent`, acting for `owner`: the one there while it verifies
-    /// as exactly that, else a new token minted into it. Only its id is logged.
-    fn token_file(&self, agent: MemberId, owner: MemberId) -> anyhow::Result<PathBuf> {
+    /// The file holding a token of `scope` (an agent's, or a reader's) for `agent`, acting for
+    /// `owner`: the one there while it verifies as exactly that, else a new token minted into it.
+    /// Only its id is logged.
+    fn token_file(
+        &self,
+        agent: MemberId,
+        owner: MemberId,
+        scope: TokenScope,
+    ) -> anyhow::Result<PathBuf> {
         let want = Caller {
             member: agent,
-            scope: TokenScope::Agent,
+            scope,
             on_behalf_of: Some(owner),
         };
-        let path = self.dir.join(format!("{}.token", agent.0));
+        let name = match scope {
+            TokenScope::Reader => format!("{}.reader.token", agent.0),
+            _ => format!("{}.token", agent.0),
+        };
+        let path = self.dir.join(name);
         let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         if let Ok(Some(raw)) = read_token(&path)
             && self.tokens.verify(&raw) == Some(want)
@@ -244,7 +324,7 @@ impl AgentEnv {
         private_dir(&self.dir)?;
         let (info, token) = self.tokens.mint(want)?;
         write_token(&path, &token)?;
-        tracing::info!(token = %info.id, %agent, path = %path.display(), "minted an agent token for the sessions it runs");
+        tracing::info!(token = %info.id, %agent, ?scope, path = %path.display(), "minted a token for the sessions an agent runs");
         Ok(path)
     }
 }
@@ -255,7 +335,7 @@ impl SessionEnv for AgentEnv {
             .work
             .upgrade()
             .ok_or_else(|| "the hub is stopping".to_owned())?;
-        let (agent, owner) = match HubAgents::new(work).agent_of(session) {
+        let (agent, owner) = match HubAgents::new(Arc::clone(&work)).agent_of(session) {
             SessionAgent::NoAgent => return Ok(Vec::new()),
             SessionAgent::Unknown => {
                 return Err(format!(
@@ -274,7 +354,13 @@ impl SessionEnv for AgentEnv {
                 owner: Some(owner),
             } => (agent, owner),
         };
-        let file = self.token_file(agent, owner).map_err(|e| {
+        // The Orchestrator's sessions only read: their CLI's token can do nothing else.
+        let scope = if work.reads_only(&session) {
+            TokenScope::Reader
+        } else {
+            TokenScope::Agent
+        };
+        let file = self.token_file(agent, owner, scope).map_err(|e| {
             tracing::error!(%agent, error = %format!("{e:#}"), "cannot write an agent's token file");
             "the agent's token file cannot be written".to_owned()
         })?;
@@ -300,7 +386,7 @@ impl SessionEnv for AgentEnv {
 }
 
 /// Makes `dir` if it is not there, private to this user (0700 on Unix).
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};

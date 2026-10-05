@@ -418,10 +418,10 @@ impl Sessions {
 
 /// Whether `caller` may command a session that runs as `agent`: the runner's rule for hooks. A
 /// person may command a session with no agent, or with an agent they own; an agent, only its own
-/// sessions; nobody one whose agent is not known.
+/// sessions; a reader, none; nobody one whose agent is not known.
 fn may_command(caller: Caller, agent: SessionAgent) -> bool {
     match (caller.scope, agent) {
-        (_, SessionAgent::Unknown) => false,
+        (_, SessionAgent::Unknown) | (TokenScope::Reader, _) => false,
         (TokenScope::Device, SessionAgent::NoAgent) => true,
         (TokenScope::Device, SessionAgent::Agent { owner, .. }) => owner == Some(caller.member),
         (TokenScope::Agent, SessionAgent::NoAgent) => false,
