@@ -11,6 +11,7 @@ import { hooksDiff, installHooks, parseSafety } from './onboarding.ts';
 import { blocksPage, daysPage } from './recaps.ts';
 import { canMove } from './rules.ts';
 import { startScan, type StreamedBody } from './scan.ts';
+import { agentAccounts, checkMachine, signInStatus, startSignIn, stopSignIn } from './machine-setup.ts';
 import {
   announceSession,
   createSession,
@@ -86,6 +87,8 @@ import {
   clear as clearConversations,
   orchestratorOf,
 } from './orchestrator.ts';
+import * as integrations from './integrations.ts';
+import * as writes from './writes.ts';
 export const MOCK_VERSION = '0.1.0-mock';
 /** `PROTOCOL_VERSION` and `PROTOCOL_MIN` in crates/protocol/src/version.rs. */
 export const PROTOCOL_VERSION = 1;
@@ -202,7 +205,13 @@ export async function handleApi(hub: Hub, request: ApiRequest): Promise<Reply> {
     }
     return value;
   };
-  return handler(hub, { caller, query: request.query, body, param });
+  const reply = handler(hub, { caller, query: request.query, body, param });
+  // As the daemon's loop wakes on every append: propose what a change implies upstream, and act
+  // on answered approvals and retries (writes.ts).
+  if (request.method !== 'GET') {
+    writes.pass(hub);
+  }
+  return reply;
 }
 
 function matchRoute(
@@ -524,8 +533,11 @@ const patchWorkstream: Handler = (hub, ctx) => {
   const fields = new Fields(ctx.body);
   const status = fields.optEnum('status', WORKSTREAM_STATUSES);
   const health = fields.optEnum('health', HEALTHS);
-  if (status === undefined && health === undefined) {
-    throw invalid('Give a status, a health, or both.');
+  const raw = fields.raw('external');
+  // Links upstream (api-v1.md, "Linking a workstream upstream"): the full new list.
+  const external = raw === undefined ? undefined : integrations.checkLinks(raw);
+  if (status === undefined && health === undefined && external === undefined) {
+    throw invalid('Give a status, a health, links (external), or several.');
   }
   const next = { status: status ?? workstream.status, health: health ?? workstream.health };
   if (next.status !== workstream.status || next.health !== workstream.health) {
@@ -534,6 +546,13 @@ const patchWorkstream: Handler = (hub, ctx) => {
     hub.append(ctx.caller.memberId, {
       type: 'workstream_changed',
       data: { workstream: workstream.id, ...next },
+    });
+  }
+  if (external !== undefined && JSON.stringify(external) !== JSON.stringify(workstream.external)) {
+    workstream.external = external;
+    hub.append(ctx.caller.memberId, {
+      type: 'workstream_linked',
+      data: { workstream: workstream.id, external },
     });
   }
   return ok(workstream);
@@ -1382,6 +1401,7 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'workstream_created':
       return { workstream: body.data.workstream.id };
     case 'workstream_changed':
+    case 'workstream_linked':
       return { workstream: body.data.workstream };
     case 'task_created':
       return { task: body.data.task.id };
@@ -1421,6 +1441,12 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'board_proposed':
     case 'board_draft_reviewed':
       return {};
+    case 'write_proposed':
+      return { task: body.data.write.task };
+    case 'write_started':
+    case 'write_retry_requested':
+    case 'write_finished':
+      return { task: body.data.task };
   }
 }
 
@@ -1497,6 +1523,23 @@ const ROUTES: Route[] = [
     status: 200,
     stream: startScan(hub, ctx.param('id')),
   })),
+  // Machine setup (machine-setup.ts).
+  route('GET', '/v1/machines/:id/check', 'device', (hub, ctx) =>
+    ok(checkMachine(hub, ctx.caller.memberId, ctx.param('id'), ctx.query)),
+  ),
+  route('GET', '/v1/machines/:id/agents', 'device', (hub, ctx) =>
+    ok(agentAccounts(hub, ctx.caller.memberId, ctx.param('id'))),
+  ),
+  route('GET', '/v1/machines/:id/agents/:engine/sign-in', 'device', (hub, ctx) =>
+    ok(signInStatus(hub, ctx.caller.memberId, ctx.param('id'), ctx.param('engine'))),
+  ),
+  route('POST', '/v1/machines/:id/agents/:engine/sign-in', 'device', (hub, ctx) =>
+    startSignIn(hub, ctx.caller.memberId, ctx.param('id'), ctx.param('engine'), ctx.body),
+  ),
+  route('DELETE', '/v1/machines/:id/agents/:engine/sign-in', 'device', (hub, ctx) => {
+    stopSignIn(hub, ctx.caller.memberId, ctx.param('id'), ctx.param('engine'));
+    return noContent();
+  }),
   route('GET', '/v1/members', 'agent', (hub) => ok(hub.members)),
   route('GET', '/v1/personas', 'read', (hub) => ok(hub.personas)),
   route('GET', '/v1/teams', 'read', (hub) => ok(hub.teams)),
@@ -1567,6 +1610,19 @@ const ROUTES: Route[] = [
   route('PUT', '/v1/briefs/:kind/:id', 'device', putBrief),
   route('GET', '/v1/events', 'read', listEvents),
   route('GET', '/v1/activity', 'read', listEvents),
+  // Integrations: GitHub and Jira, read-only, over the recorded fixtures (integrations.ts).
+  route('GET', '/v1/integrations', 'device', (hub) => integrations.list(hub)),
+  route('POST', '/v1/integrations', 'device', (hub, ctx) => integrations.add(hub, ctx.caller.memberId, ctx.body)),
+  route('GET', '/v1/integrations/:id', 'device', (hub, ctx) => integrations.get(hub, ctx.param('id'))),
+  route('DELETE', '/v1/integrations/:id', 'device', (hub, ctx) => integrations.remove(hub, ctx.param('id'))),
+  route('POST', '/v1/integrations/:id/test', 'device', (hub, ctx) => integrations.test(hub, ctx.param('id'))),
+  route('POST', '/v1/integrations/:id/sync', 'device', (hub, ctx) => integrations.syncNow(hub, ctx.param('id'))),
+  route('PUT', '/v1/integrations/:id/credential', 'device', (hub, ctx) => integrations.setCredential(hub, ctx.param('id'), ctx.body)),
+  // Outward writes: every one approved first (writes.ts).
+  route('GET', '/v1/writes', 'device', (hub, ctx) => writes.list(hub, ctx.query)),
+  route('POST', '/v1/writes', 'device', (hub, ctx) => writes.request(hub, ctx.caller.memberId, ctx.body)),
+  route('GET', '/v1/writes/:id', 'device', (hub, ctx) => writes.get(hub, ctx.param('id'))),
+  route('POST', '/v1/writes/:id/retry', 'device', (hub, ctx) => writes.retry(hub, ctx.caller.memberId, ctx.param('id'))),
   // Recaps: from the fixture the recap engine wrote (recaps.ts).
   route('GET', '/v1/recaps/blocks', 'read', (hub, ctx) => ok(blocksPage(includedRecaps(hub), ctx.query))),
   route('GET', '/v1/recaps/days', 'read', (hub, ctx) => ok(daysPage(includedRecaps(hub), ctx.query))),

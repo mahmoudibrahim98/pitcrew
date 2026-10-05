@@ -106,6 +106,50 @@ pub fn check_socket_path(path: &str) -> Result<SocketKind, GatewayError> {
     ))
 }
 
+/// Whether `path` names an integration's credential route, `/v1/integrations/{id}/credential`
+/// (letter case and percent-escapes aside): only `gateway_integration_credential` sends there, so
+/// `gateway_request` refuses it (desktop-gateway.md, "Integration credentials").
+#[must_use]
+pub fn is_credential_route(path: &str) -> bool {
+    let segments: Vec<String> = route_of(path).split('/').map(decoded_lower).collect();
+    segments.len() >= 5
+        && segments.get(1).is_some_and(|s| s == "v1")
+        && segments.get(2).is_some_and(|s| s == "integrations")
+        && segments.get(4).is_some_and(|s| s == "credential")
+}
+
+/// A path segment with its `%XX` escapes decoded (bytes, lossily), lower-cased.
+fn decoded_lower(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| char::from(b).to_digit(16);
+        match (
+            bytes.get(i),
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
+            (Some(b'%'), Some(high), Some(low)) => {
+                out.push(u8::try_from(high * 16 + low).unwrap_or(b'%'));
+                i += 3;
+            }
+            (Some(b), _, _) => {
+                out.push(*b);
+                i += 1;
+            }
+            (None, _, _) => break,
+        }
+    }
+    String::from_utf8_lossy(&out).to_lowercase()
+}
+
+/// An integration's id in a path: a bare ULID or a display id such as `int_…`.
+#[must_use]
+pub fn is_integration_id(id: &str) -> bool {
+    is_id(id)
+}
+
 /// The path without its query.
 #[must_use]
 pub fn route_of(path: &str) -> &str {
@@ -216,6 +260,30 @@ mod tests {
                 ErrorCode::Invalid,
                 "{path}"
             );
+        }
+    }
+
+    #[test]
+    fn credential_routes_are_recognised_however_written() {
+        for path in [
+            "/v1/integrations/01J9ZQ/credential",
+            "/v1/integrations/01J9ZQ/credential?x=1",
+            "/v1/integrations/01J9ZQ/Credential",
+            "/v1/integrations/01J9ZQ/%63redential",
+            "/v1/%69ntegrations/01J9ZQ/credential",
+            "/v1/integrations/01J9ZQ/credential/",
+        ] {
+            assert!(is_credential_route(path), "{path}");
+        }
+        for path in [
+            "/v1/integrations",
+            "/v1/integrations/01J9ZQ",
+            "/v1/integrations/01J9ZQ/test",
+            "/v1/integrations/01J9ZQ/sync",
+            "/v1/tasks/credential",
+            "/v1/integrations/credential",
+        ] {
+            assert!(!is_credential_route(path), "{path}");
         }
     }
 

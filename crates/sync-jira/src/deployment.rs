@@ -63,7 +63,7 @@ pub trait Deployment {
     ) -> Result<(Vec<Value>, Option<PageState>), serde_json::Error>;
 }
 
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
         match byte {

@@ -20,8 +20,9 @@ use pitcrew_protocol::ids::{
     AskId, DispatchId, MemberId, SessionId, SubtaskId, TaskId, TaskKey, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Answer, Ask, AskKind, AskState, Brief, DispatchOutcome, Health, LinkBasis, MemberKind, Mover,
-    Receipt, Session, Subtask, SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
+    Answer, Ask, AskKind, AskState, Brief, DispatchOutcome, ExternalRef, Health, LinkBasis,
+    MemberKind, Mover, Receipt, Session, Subtask, SubtaskSource, Task, TaskStatus, Workstream,
+    WorkstreamStatus,
 };
 use pitcrew_protocol::transcript::{PlanItem, PlanStatus};
 use pitcrew_store::sql::Connection;
@@ -87,7 +88,7 @@ pub struct BriefEdit {
 }
 
 /// `PATCH /v1/workstreams/{id}`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
 pub struct WorkstreamPatch {
     /// New status.
     #[serde(default)]
@@ -95,6 +96,9 @@ pub struct WorkstreamPatch {
     /// New health.
     #[serde(default)]
     pub health: Option<Health>,
+    /// The full new list of links upstream (api-v1.md, "Linking a workstream upstream").
+    #[serde(default)]
+    pub external: Option<Vec<ExternalRef>>,
 }
 
 /// `POST /v1/tasks/{id}/comments`.
@@ -775,7 +779,7 @@ impl WorkService {
     /// # Errors
     ///
     /// `forbidden` for an agent; `not_found` for an unknown workstream; `invalid` when the patch
-    /// has neither a status nor a health.
+    /// has no status, health or links, or its links break a rule ([`crate::links::check_links`]).
     pub fn patch_workstream(
         &self,
         caller: &Caller,
@@ -783,24 +787,44 @@ impl WorkService {
         patch: WorkstreamPatch,
     ) -> Result<Workstream> {
         require_person(caller, "Changing a workstream")?;
-        if patch.status.is_none() && patch.health.is_none() {
-            return Err(WorkError::invalid("Give a status, a health, or both."));
+        if patch.status.is_none() && patch.health.is_none() && patch.external.is_none() {
+            return Err(WorkError::invalid(
+                "Give a status, a health, links (external), or several.",
+            ));
+        }
+        if let Some(external) = &patch.external {
+            crate::links::check_links(external)?;
         }
         let _guard = self.lock();
         let current = self.workstream(id)?;
         let status = patch.status.unwrap_or(current.status);
         let health = patch.health.unwrap_or(current.health);
-        if status == current.status && health == current.health {
+        let mut events = Vec::new();
+        if status != current.status || health != current.health {
+            events.push(self.by(
+                caller,
+                EventBody::WorkstreamChanged {
+                    workstream: current.id,
+                    status,
+                    health,
+                },
+            ));
+        }
+        if let Some(external) = patch.external
+            && external != current.external
+        {
+            events.push(self.by(
+                caller,
+                EventBody::WorkstreamLinked {
+                    workstream: current.id,
+                    external,
+                },
+            ));
+        }
+        if events.is_empty() {
             return Ok(current);
         }
-        self.append(&[self.by(
-            caller,
-            EventBody::WorkstreamChanged {
-                workstream: current.id,
-                status,
-                health,
-            },
-        )])?;
+        self.append(&events)?;
         self.workstream(id)
     }
 
@@ -905,7 +929,11 @@ pub(crate) fn brief_target_exists(conn: &Connection, target: &BriefTarget) -> Re
 }
 
 /// Why `caller` may not answer `ask`, or `None` if it may.
-fn answer_refusal(conn: &Connection, caller: &Caller, ask: &Ask) -> Result<Option<String>> {
+pub(crate) fn answer_refusal(
+    conn: &Connection,
+    caller: &Caller,
+    ask: &Ask,
+) -> Result<Option<String>> {
     let me = caller.member;
     if caller.scope == TokenScope::Agent {
         if ask.to != me {

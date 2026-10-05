@@ -55,7 +55,7 @@ use anyhow::{Context as _, bail};
 use axum::Extension;
 use pitcrew_api::{
     Activity, Bound, EventRefs, EventSource, HookIntake, HookSink, Listen, RecapSource, Recaps,
-    RouterParts, StoreSource, StreamConfig, TerminalConfig, Terminals,
+    RouterParts, StoreSource, StreamConfig, TerminalConfig,
 };
 use pitcrew_auth::{FileTokenStore, TokenError, TokenStore};
 use pitcrew_fixtures::DemoWorkspace;
@@ -168,6 +168,7 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
         state,
         listen: args.listen.clone(),
         started,
+        integration_fixtures: args.integration_fixtures.clone(),
     }));
     stop_runtime(runtime);
     if store.upgrade().is_none() {
@@ -512,6 +513,8 @@ struct Serving<'a> {
     state: &'a StateDir,
     listen: ListenArg,
     started: Instant,
+    /// `--integration-fixtures`: the integrations read these instead of the network (tests).
+    integration_fixtures: Option<std::path::PathBuf>,
 }
 
 /// Step 8 onwards: serve until a stop signal, then shut down in order.
@@ -526,6 +529,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         state,
         listen,
         started,
+        integration_fixtures,
     } = serving;
     let Hub {
         tokens,
@@ -556,12 +560,28 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
     // "Who may change a session through a hook"); without it they are only logged.
     let hook_sink: Arc<dyn HookSink> = Arc::new(Hooks(Arc::clone(&attached)));
     let hooks = HookIntake::start(hook_sink, HOOK_QUEUE).context("cannot start the hook intake")?;
-    let terminals: Arc<dyn Terminals> = Arc::new(SessionTerminals::new(
+    // Machine setup's routes, and its sign-in terminals, which the terminals route serves too.
+    let machine_setup = Arc::new(crate::machine_setup::MachineSetup::new(
         Arc::clone(&work),
-        Arc::clone(&attached),
+        state.root().to_path_buf(),
+        &runtime,
     ));
+    machine_setup.start();
+    // Kept for the stop: every sign-in terminal is stopped with the daemon.
+    let sign_ins = machine_setup.sign_ins();
+    let terminals = crate::machine_setup::SignInTerminals::new(
+        Arc::clone(&sign_ins),
+        SessionTerminals::new(Arc::clone(&work), Arc::clone(&attached)),
+    );
     let transcripts = Transcripts::new(Arc::clone(&work), Arc::clone(&attached));
     let sessions = Sessions::new(Arc::clone(&work), Arc::clone(&attached));
+    // GitHub and Jira (read-only): their connections, credentials and sync loop.
+    let integrations = Arc::new(crate::integrations::Integrations::open(
+        state.root(),
+        &work,
+        crate::integrations::upstream(integration_fixtures.as_deref())?,
+        crate::integrations::secret::GhCli::from_env(),
+    )?);
     // The activity index (`project=`, `workstream=`, and wider `task=` and `session=` matches).
     let refs: Arc<dyn EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
     // The recap index (`GET /v1/recaps/blocks` and `/days`), kept current on every query.
@@ -587,14 +607,14 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         .read(Recaps::new(recaps).routes())
         .read(pitcrew_hub_work::read_routes().layer(Extension(Arc::clone(&work))))
         .device(crate::scan::routes(Arc::clone(&work), homes.as_deref()))
+        .device(crate::machine_setup::routes(machine_setup))
         .device(crate::files::routes(Arc::clone(&work), state.root()))
         .device(crate::onboarding::routes(Arc::clone(&work)))
-        .device(pitcrew_api::terminal::routes(
-            terminals,
-            TerminalConfig::default(),
-        ))
+        // A sign-in's terminal opens only for the member who started it.
+        .device(terminals.routes(TerminalConfig::default()))
         .device(transcripts.routes())
         .device(sessions.routes())
+        .device(crate::integrations::routes(Arc::clone(&integrations)))
         .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))))
         // Board drafts (api-v1.md, "Board drafts"): the drafting agent's proposal, and the rest.
         .agent(pitcrew_hub_work::board_agent_routes().layer(Extension(Arc::clone(&work))))
@@ -645,6 +665,8 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
     if let Some(office) = office {
         let _ = workers.keep_office(office.spawn(Arc::clone(&work)));
     }
+    let syncing = integrations.spawn();
+    drop(integrations);
     // A workspace not set up yet: what needed a person starts once it is, without a restart.
     if let Some(set_up) = set_up {
         drop(tokio::spawn(crate::setup::after_setup(
@@ -718,17 +740,36 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
             runner.stop(DRAIN).await;
         }
     };
+    let syncing_stopped = syncing.stop(DRAIN);
     if failed.is_some() {
-        tokio::join!(office_stopped, runner_stopped);
+        tokio::join!(office_stopped, runner_stopped, syncing_stopped);
     } else {
-        tokio::join!(office_stopped, runner_stopped, finish(&mut serving));
+        tokio::join!(
+            office_stopped,
+            runner_stopped,
+            syncing_stopped,
+            finish(&mut serving)
+        );
     }
     drop(tokens);
+    // No sign-in outlives the daemon (nor a Codex login's localhost callback listener with it):
+    // stopped before the runtime is let go of, which would leave them running.
+    stop_sign_ins(sign_ins).await;
     // The runner has stopped: let go of its terminals' runtime, so tmux stores where each
     // terminal's output got to, or ptyd's connection closes (ptyd keeps the output and offsets);
     // the terminals keep running. Meanwhile the store closes.
     tokio::join!(runtime.detach(DETACH), close_store(store));
     failed.map_or(Ok(()), Err)
+}
+
+/// Stops every sign-in terminal, within [`DETACH`] (each runtime call is bounded anyway).
+async fn stop_sign_ins(sign_ins: Arc<crate::machine_setup::SignIns>) {
+    let stopping = tokio::task::spawn_blocking(move || sign_ins.stop_all());
+    if tokio::time::timeout(DETACH, stopping).await.is_err() {
+        tracing::warn!(
+            "the sign-in terminals did not stop in time; the next start removes what is left"
+        );
+    }
 }
 
 /// Builds the recap index once, on the blocking pool, so the first recap request does not read the

@@ -7,6 +7,9 @@
 //! Windows ends them too. No ssh child can outlive the call and send empty credentials to a
 //! jump host.
 //!
+//! Public so the daemon's machine check (`pitcrewd`'s `machine_setup::tools`) can end a version
+//! command and whatever it started the same way, without unsafe code of its own.
+//!
 //! **Unsafe code.** This is the only module of the crate that uses it: the workspace denies
 //! `unsafe_code`, and this module alone allows it. Here because the four
 //! Win32 calls below have no safe binding in the dependency tree, and tokio's `Child` hands out
@@ -26,11 +29,11 @@ use windows_sys::Win32::System::JobObjects::{
 
 /// A job that kills its processes when told to, and when its handle closes.
 #[derive(Debug)]
-pub(crate) struct Job(OwnedHandle);
+pub struct Job(OwnedHandle);
 
 impl Job {
     /// A new, empty job.
-    pub(crate) fn new() -> io::Result<Self> {
+    pub fn new() -> io::Result<Self> {
         // SAFETY: both arguments may be null (default security, no name). The result is
         // checked before use.
         let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -60,7 +63,7 @@ impl Job {
     }
 
     /// Puts a process in the job. Its later children join it too.
-    pub(crate) fn assign(&self, process: BorrowedHandle<'_>) -> io::Result<()> {
+    pub fn assign(&self, process: BorrowedHandle<'_>) -> io::Result<()> {
         // SAFETY: the job handle is live, and `BorrowedHandle` guarantees `process` is an open
         // handle for the duration of the call. The call only reads both.
         let ok = unsafe { AssignProcessToJobObject(self.raw(), process.as_raw_handle()) };
@@ -71,7 +74,7 @@ impl Job {
     }
 
     /// Ends every process in the job.
-    pub(crate) fn terminate(&self) {
+    pub fn terminate(&self) {
         // SAFETY: the job handle is live. Terminating an empty or finished job is harmless.
         unsafe {
             TerminateJobObject(self.raw(), 1);
@@ -85,7 +88,7 @@ impl Job {
 
 /// The process handle of a running child, borrowed for as long as the child is, or `None` once
 /// it has been reaped. (tokio's `Child` does not implement `AsHandle`.)
-pub(crate) fn handle_of(child: &tokio::process::Child) -> Option<BorrowedHandle<'_>> {
+pub fn handle_of(child: &tokio::process::Child) -> Option<BorrowedHandle<'_>> {
     let raw = child.raw_handle()?;
     // SAFETY: tokio owns this handle and closes it only when the child is reaped (`wait` or
     // `try_wait`, which need `&mut Child`) or dropped. Neither can happen while `child` is

@@ -144,6 +144,11 @@ the task key (`PAP-4`).
 | `POST /v1/setup` | `Setup` → `{ "workspace": Workspace, "me": Member, "machine": Machine }` | The first run (see below). Device tokens only. |
 | `GET /v1/machines` | → `Machine[]` | **read** |
 | `POST /v1/machines/{id}/scan` | → lines of `ScanFrame` (200) | Scans the machine's agent homes for onboarding. Device tokens only. See "Machine scan". |
+| `GET /v1/machines/{id}/check` | → `MachineCheck` | What the machine has for running agents. The hub's owner only. See "Machine setup". |
+| `GET /v1/machines/{id}/agents` | → `AgentAccount[]` | Each agent CLI's account, as its own status command reports it. The hub's owner only. |
+| `POST /v1/machines/{id}/agents/{engine}/sign-in` | `StartSignIn`? → `SignIn` (201, or 200) | Runs the CLI's own login in a terminal. The hub's owner only. |
+| `GET /v1/machines/{id}/agents/{engine}/sign-in` | → `SignIn` | That sign-in, and whether it still runs. The hub's owner only. |
+| `DELETE /v1/machines/{id}/agents/{engine}/sign-in` | → 204 | Stops that sign-in and removes its terminal. The hub's owner only. |
 | `GET /v1/members` | → `Member[]` | **agent** |
 | `GET /v1/personas` | → `Persona[]` | **read** |
 | `GET /v1/teams` | → `Team[]` | **read** |
@@ -194,7 +199,7 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 | `GET /v1/workstreams?project=` | → `Workstream[]` | **read** |
 | `GET /v1/workstreams/{id}` | → `Workstream` | **read** |
 | `POST /v1/workstreams` | `NewWorkstream` → `Workstream` (201) | See below. `404 not_found` for an unknown project. Emits `workstream_created`. |
-| `PATCH /v1/workstreams/{id}` | `{ "status"?, "health"? }` → `Workstream` | Emits `workstream_changed`. |
+| `PATCH /v1/workstreams/{id}` | `{ "status"?, "health"?, "external"? }` → `Workstream` | Emits `workstream_changed` for status and health, `workstream_linked` for `external`: see "Linking a workstream upstream". |
 
 `NewProject`, `NewWorkstream` and `NewTask` are Rust types in `crates/protocol/src/api.rs`.
 
@@ -216,6 +221,23 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 - An unknown `project` is `404 not_found`, although it is in the body.
 - `name` must not be blank. `status` defaults to `active`. Each location names a known machine and
   a non-empty path (`400`).
+
+**Linking a workstream upstream.** `PATCH /v1/workstreams/{id}` with `external: ExternalRef[]`
+replaces the workstream's linked external items (an empty list unlinks them all). People only.
+- At most 16 links, no two with the same `system` and `key`. Each `url`, when given, is an
+  `https://` URL of at most 2 KiB with no user name or password. `key` is 1 to 300 characters with
+  no control characters.
+- **What a sync acts on.** A `github` key `owner/repo` names the whole repository and
+  `owner/repo#milestone:<n>` one milestone; a `jira` key `DEMO` names the whole project and `DEMO-5`
+  an epic. Owner and repository names use GitHub's characters (`A-Z a-z 0-9 - _ .`, never `.` or
+  `..` alone); Jira keys are an uppercase letter, then uppercase letters, digits or `_`, then for an
+  epic `-<n>`. A key of any other shape is kept as a plain link, which no sync acts on. Anything
+  that breaks the rules above is `400 invalid`.
+- It appends `workstream_linked` `{ "workstream", "external" }` with the full new list. A patch
+  that changes nothing appends nothing. `status` and `health` may come in the same patch (then
+  `workstream_changed` comes first, in the same append); a patch with none of the three is
+  `400 invalid`.
+- Linking is what a sync acts on: see "Integrations".
 
 ### Tasks
 
@@ -644,6 +666,93 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
 - **The mock** answers with a fixed synthetic report (folders under `/home/sam/`), after about a
   second of progress, by the same rules: the hub's own machine only, `409` while one runs.
 
+### Machine setup
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/machines/{id}/check?row=` | → `MachineCheck` | `row` (optional) checks one row again. |
+| `GET /v1/machines/{id}/agents` | → `AgentAccount[]` | Claude Code, Codex, OpenCode, in that order. |
+| `POST /v1/machines/{id}/agents/{engine}/sign-in` | `StartSignIn` or none → `SignIn` | `201` when it starts one, `200` with the one still running. |
+| `GET /v1/machines/{id}/agents/{engine}/sign-in` | → `SignIn` | `404` when there is none. |
+| `DELETE /v1/machines/{id}/agents/{engine}/sign-in` | → `204` | Stops it, running or ended, and removes its terminal; `404` when there is none. |
+
+Onboarding's machine steps, and the machine-setup wizard's: check what a machine has for running
+agents, and sign in to each agent CLI with the CLI's own login. The types are in
+`crates/protocol/src/machine_setup.rs`.
+
+- **Who.** All five are for **the hub's owner only**: the member who set the hub up (its first
+  person, `POST /v1/setup`'s). An agent token gets `403`, and so does any other member's device
+  token, on every route and before anything else is looked at (the machine, the engine, the
+  body): on a shared hub, another person cannot sign the owner's machine in to their own account,
+  open the owner's sign-in, or read the owner's accounts. Before setup (no person yet) they are
+  `409`.
+
+- **Which machine.** Only the hub's own (its first `local` machine), as for the scan. An unknown or
+  malformed id is `404`; another machine of the workspace is `409 conflict`: a remote machine is
+  checked through its own hub (a remote workspace's, through the desktop gateway), or over SSH
+  while it is being connected (desktop-gateway.md, `RemoteProbe.check`). `engine` is `claude`,
+  `codex` or `opencode`; any other is `404`.
+- **The check.** `MachineCheck`: `{ "rows": MachineCheckRow[] }`, in this order: `cli_claude`,
+  `cli_codex`, `cli_opencode`, `tmux` (not on Windows, where PitCrew's terminals never use it),
+  `git`, `gh`, `disk`, and `slurm` only where `sbatch` is on the machine's `PATH`. (`helper` is a
+  row only of a check made over SSH before PitCrew is installed.)
+  - `MachineCheckRow`: `{ "id", "status": "ok" | "warn" | "missing", "detail", "version"?,
+    "fix"? }`. `detail` is one line for people: the tool's version line, the free space, or what
+    is wrong. `version` is the tool's first line of `--version` (`-V` for tmux), cleaned of
+    escapes and control characters, at most 120 characters.
+  - A tool is looked for on the `PATH` of the hub (absolute entries only) and asked only its
+    version, with no input, for at most 15 seconds; one that is not there is `missing`, one that
+    fails or does not answer is `warn` with why. tmux older than 3.2 is `warn`. `disk` is the free
+    space of the filesystem that holds the hub's state: `warn` under 5 GB. `slurm` is `warn` when
+    `squeue` or `scancel` is missing.
+  - **`fix`** says what PitCrew can do, and is absent on an `ok` row: `install_page` (the client
+    opens that tool's install page, from **its own** table of pages by the row's `id`; no URL
+    comes from the machine) or `install_helper` (install PitCrew's helper: the connect wizard's
+    next steps). **Nothing installs a system package**, and no route runs a fix: a fix is the
+    client's to show.
+  - `?row=<id>` answers that row alone (none, where it does not apply); an unknown `row` is `400`.
+- **Accounts.** `AgentAccount`: `{ "engine", "installed", "signed_in"?, "account"?, "detail"? }`,
+  from each CLI's **own status command**, never from its files: `claude auth status`, `codex
+  login status`, `opencode auth list`, each for at most 20 seconds.
+  - `signed_in` is what the CLI said; absent when it could not tell (not installed, a CLI too old
+    to have the command, a timeout, output not understood), with why in `detail`.
+  - `account` is a label: the e-mail address Claude Code prints, `ChatGPT` or `API key` for Codex
+    (never the rest of its line, which shows part of a key), the providers OpenCode lists. At most
+    120 characters, and never anything that looks like a key or a token.
+- **Sign-in.** `POST …/sign-in` runs the CLI's own login in a terminal on the machine, in the
+  person's home folder, with nothing added to its environment: `claude auth login`, `codex login`,
+  `opencode auth login`. `StartSignIn` is `{ "method"?: "browser" | "device_code" }`;
+  `device_code` is for a machine the browser cannot reach back to, and only Codex has it (`codex
+  login --device-auth`; `400` for the others). Unknown fields are `400`.
+  - The answer is `SignIn`: `{ "engine", "terminal", "command": String[], "running", "started" }`.
+    `terminal` is an id for the **terminals route** (`GET /v1/sessions/{terminal}/terminal`, see
+    "Terminals"), the only route that knows it: it is not a session, appends no event, and `GET
+    /v1/sessions/{terminal}` is `404`. The person drives the login there.
+  - **The terminal opens only for the member who started the sign-in** (the hub's owner): any
+    other member's device token gets `403` from the terminals route.
+  - **Only a CLI that answers its status command.** The login starts only once the CLI's own
+    status command (as for the accounts) has said whether it is signed in; otherwise `409`
+    ("Update Claude Code first: …"). An older Claude Code without `auth` would read `auth login` as
+    a prompt and start an agent instead.
+  - **One per CLI at a time:** asking while one runs answers that one (`200`); two asks at once
+    get the same one. An ended one is replaced by the next (`201`).
+  - Once its login ends (`running: false`), the terminal stays readable for 5 minutes, then it is
+    removed with its output; a login still running after 30 minutes is stopped. `DELETE
+    …/sign-in` stops it at once (the client leaves the sign-in, or skips it). A hub that stops
+    stops its sign-ins, and one that starts removes any sign-in terminal an earlier run left
+    (their ids are kept in its state directory; a session's terminal is never taken for one).
+  - `409` when the CLI is not installed, or does not answer its status command; `503` when the
+    machine has no terminal runtime (tmux 3.2 or newer, or pitcrew-ptyd), or it does not answer.
+  - **PitCrew never reads the login.** The terminal relays the CLI's screen and the person's keys,
+    which nothing parses, logs or keeps; what the login stores is the CLI's, in its own files.
+    After it ends, `GET …/agents` asks the CLI again.
+- **The mock** answers a fixed synthetic check (Claude Code, Codex, tmux and git there; OpenCode and
+  gh missing; no SLURM) and accounts (Codex signed in, Claude Code not, OpenCode not installed).
+  Its sign-in terminal shows a canned login and ends when Enter is pressed in it, or by itself
+  after about two seconds; Claude Code then reports `sam@example.com`. Its owner is the workspace's
+  first person (`dev-device-token`'s, `@sam`); `dev-second-device-token` is another person. Same
+  rules otherwise.
+
 ### Session import (device tokens only)
 
 - `POST /v1/import/dry-run` accepts `ImportFilter` and returns `{ "count": N }`.
@@ -670,6 +779,307 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   session lists, activity and recaps after committing a choice.
 - All three routes reject agent tokens with 403, before reading a body.
 
+### Integrations: GitHub and Jira
+
+A person connects GitHub repositories or Jira projects to the workspace, links workstreams to
+upstream scopes ("Linking a workstream upstream"), and the hub keeps tasks in step with upstream.
+**A sync only reads upstream**: no route here writes to GitHub or Jira, and every write goes
+through a person's approval first ("Outward writes", below). Every route is **device
+tokens only** (an agent token gets `403`, before anything else is checked). Types are in
+`crates/protocol/src/integrations.rs`.
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/integrations` | → `Integration[]` | Oldest first. |
+| `POST /v1/integrations` | `NewIntegration` → `Integration` (201) | See below. |
+| `GET /v1/integrations/{id}` | → `Integration` | |
+| `DELETE /v1/integrations/{id}` | → 204 | Forgets the connection, its stored credential and its sync state. Links on workstreams stay, as plain links. A sync of it under way applies nothing more and keeps no state. |
+| `POST /v1/integrations/{id}/test` | → `IntegrationCheck` | Reads upstream once with the credential (see below). Changes nothing. |
+| `POST /v1/integrations/{id}/sync` | → `Integration` (202) | Syncs now, in the background; `status.running` is `true` until it ends. |
+| `PUT /v1/integrations/{id}/credential` | `{ "secret": String }` → 204 | Stores the secret. See "Credentials". |
+
+`NewIntegration`: `{ "name": String, "settings": IntegrationSettings, "credential":
+"gh_cli" | "stored", "interval_minutes"?: u32 }`.
+- `name` is 1–80 characters after trimming (stored trimmed), no control characters.
+- `settings` is tagged by `kind`:
+  - `{ "kind": "github", "repos": String[], "api_base"?: String }`: 1–50 distinct `owner/repo`
+    (GitHub's characters, as for links). `api_base` is a GitHub Enterprise Server API root
+    (`https://ghe.example.com/api/v3`); absent means `https://api.github.com`, and that root given
+    explicitly is kept as absent.
+  - `{ "kind": "jira", "deployment": "cloud" | "data_center", "site": String, "projects":
+    String[], "email"?: String, "epic_link_field"?: String }`: `site` is the Jira root
+    (`https://jira.example.com`, a path allowed for Data Center); 1–50 distinct project keys;
+    `email` (1–254 characters with an `@`) is required for `cloud` and refused for
+    `data_center`; `epic_link_field` is `customfield_<digits>` (Data Center's epic link).
+  - Every URL is `https://`, at most 2 KiB, with no user name, password, query or fragment.
+- `credential`: `gh_cli` (GitHub only) reads `gh auth token --hostname <host>` on the hub's
+  machine at each sync and keeps nothing. The host is always named (`github.com`, or the
+  Enterprise server's), and `GH_HOST` is cleared for `gh`, so its default host never decides
+  which token is sent where. `stored` waits for a secret (`PUT …/credential`).
+- `interval_minutes` is 5–1440; default 15.
+- A repository or Jira project already in another integration is `409 conflict`, on any host:
+  workstream links and task sources name a repository or an issue key without its host, so the
+  same one on two hosts (github.com and an Enterprise server, or two Jira sites) would move each
+  other's tasks. Anything else malformed is `400 invalid`.
+- Each integration acts through a member of its own, owned by the person who added it: `@sync` (an
+  agent of that person, named "Tracker sync"), or `@tracker-sync` when `@sync` is another person's,
+  added with `member_added` on that person's first `POST`. When both handles are other people's,
+  the `POST` is `409 conflict`. Everything a sync changes is authored by its integration's member.
+
+`Integration`: `{ "id", "name", "settings", "credential": { "source": "gh_cli" | "stored",
+"stored": bool }, "interval_minutes", "added_by": MemberId, "added_at": ms, "status":
+SyncStatus, "links": IntegrationLink[] }`.
+- `credential.stored` says whether a secret is kept (always `false` for `gh_cli`). **No route ever
+  returns a credential.**
+- `SyncStatus`: `{ "running": bool, "last_attempt_at"?, "last_success_at"?, "next_at"?,
+  "rate_limited_until"?, "problems": SyncProblem[], "last_run"?: SyncCounts }` (times in ms).
+  `last_success_at` is the end of the last sync that read every scope and applied what it found
+  without a problem; that is the "last sync" people see. `problems` are the last sync's, each
+  `{ "scope": String, "message": String }` (`scope` is a repository, a Jira project, or `""` for
+  the whole integration), never holding a credential. `SyncCounts`: `{ "changes", "applied",
+  "conflicts", "skipped", "malformed" }`.
+- `IntegrationLink`: `{ "workstream": WorkstreamId, "scope": ExternalRef, "title"?: String }`: each
+  workstream link this integration syncs (its repositories, their milestones, its Jira projects and
+  their epics), with the upstream title once a sync has seen it.
+
+`IntegrationCheck` (`POST …/test`): `{ "ok": bool, "at": ms, "checks": [{ "scope", "ok",
+"message" }], "warnings": String[] }`. One check per repository (`GET /repos/{owner}/{repo}`) or
+per Jira project (`GET /myself`, then `GET /project/{key}`), and one with scope `""` for the
+credential itself. `warnings` says when the credential can do more than read (a GitHub
+credential with push or admin rights on a repository, or a classic token's broad scopes): a
+fine-grained, read-only token for these repositories is safer. `ok` is `true` when every check
+passed.
+
+**Credentials.**
+- `PUT /v1/integrations/{id}/credential`: `secret` is 1–4096 characters, no whitespace or control
+  characters. `409 conflict` for a `gh_cli` integration. It replaces any secret stored before. The
+  desktop sends it through the gateway's own command (`gateway_integration_credential`, see
+  `desktop-gateway.md`), never through `gateway_request`.
+- The hub keeps a secret in a private file (0600 in a 0700 folder; an owner-only DACL on Windows)
+  of its state directory, never in the event log, and never logs it.
+- Jira Cloud authenticates with `email` and the secret (an API token); Data Center with the secret
+  as a personal access token; GitHub with the secret or `gh auth token` as a bearer token.
+
+**What a sync does.** On a timer (`interval_minutes`, the first one soon after the hub starts or
+the integration is added) and on `POST …/sync`, one integration at a time:
+- It reads each scope incrementally (`ETag`s and `since` on GitHub, an `updated` cursor in JQL on
+  Jira), and stops at a rate limit until it lifts (`rate_limited_until`). Only what changed
+  upstream since the last read acts: a field, a move or a shipped workstream a person changed in
+  the hub stays as they left it until upstream changes again.
+- It reaches GitHub and Jira directly, or through the `http://` proxy `HTTPS_PROXY` names (not for
+  the hosts `NO_PROXY` names), with `CONNECT`: TLS stays end to end, so the proxy never sees a
+  credential.
+- **Issues become tasks only in a linked scope.** An open issue whose milestone (GitHub) or epic
+  (Jira) a workstream links becomes a task in that workstream; otherwise one whose repository or
+  Jira project a workstream links. So does an open issue a later sync finds moved into a milestone
+  or under an epic that routes to a workstream this way. Issues in no linked scope, and issues
+  already closed when first seen, are skipped (`skipped`). The task's `source` is the issue, its
+  status `todo`.
+- **Field owners** (the tables are in "Outward writes"). Title, description and labels belong to
+  upstream: an upstream change overwrites them (`task_updated`). The assignee belongs to the hub. A
+  change of milestone or epic moves the task to the workstream that links the new one (in the same
+  project); otherwise it stays.
+- **Moves follow `can_move(.., sync)`.** An upstream close moves the task to `done`, a reopen moves
+  a done task to `todo` (`task_moved`, mover `sync`). In-progress work is never touched: a move the
+  rules refuse becomes an ask instead (a **conflict**, below).
+- A merged pull request that closes a tracked issue is noted on its task (`comment_posted`, with
+  the pull request's link).
+- **Milestones and epics.** A closed milestone or epic moves the workstreams that link it to
+  `shipped` (`workstream_changed`), unless one of their tasks is in progress (a conflict). The
+  hub owns the workstream's name; the upstream title is shown on the link.
+- **Conflicts become asks**: `ask_raised`, kind `decision`, from `@sync` to the person who added
+  the integration, with the task when there is one. Nothing is changed; the person decides. The
+  same open conflict is not raised twice.
+- Upstream text is untrusted: titles, bodies and labels are capped and stripped of hidden
+  characters, labels are cut to the hub's rules (1–64 characters, at most 32), and links are kept
+  only on the tracker's own host.
+- Changing a scope's links makes the next sync read that scope's issues again from the start, so
+  issues that were out of scope before become tasks.
+- **Who sees it.** What a sync appends (`member_added`, `task_created`, `task_updated`,
+  `task_moved`, `workstream_changed`, `comment_posted`, `ask_raised`), and `workstream_linked`,
+  reaches `/v1/events`, `/v1/activity` and `/v1/stream` through the same visibility rule as every
+  event ("Session import"). None of it names a session, so it is non-session work: an import
+  choice never hides it. Those routes, like these, are device tokens only.
+
+**The mock** answers every route over the recorded fixtures in `apps/mock-hub/fixtures/`
+(`example-org/demo-repo` on GitHub, project `DEMO` on `https://jira.example.com`), or the folder
+`startServer({ integrationFixtures })` names, syncs at once on `POST …/sync`, and keeps credentials
+in memory only. The daemon reads them the same way when started with the hidden
+`--integration-fixtures <dir>` (tests only; it then never reaches the network). Both read the
+folder again at each sync, so a test changes what upstream says by adding a file whose name sorts
+first.
+
+### Outward writes: every one approved first
+
+PitCrew can change GitHub and Jira (create an issue from a task, comment, close or reopen, change
+the title, description or labels, set a milestone or epic), but **nothing is sent upstream until a
+person approves it**. A hub change that implies a write raises an ask of kind `approval` that shows
+exactly what will be sent; the hub sends it only after the person answers **Send**, and records
+the result as an event. Every route here is **device tokens only** (an agent token gets `403`
+before anything else is checked). Types are in `crates/protocol/src/writes.rs`.
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/writes?task=&state=` | → `UpstreamWrite[]` | Oldest first; `state` may repeat. |
+| `GET /v1/writes/{id}` | → `UpstreamWrite` | `id` is the approval ask's id. |
+| `POST /v1/writes` | `NewWrite` → `UpstreamWrite` (201) | A person asks for a write: see below. |
+| `POST /v1/writes/{id}/retry` | → `UpstreamWrite` (202) | Asks to send a `failed` write again: see "Retrying". |
+
+**Field owners, both ways.** Each field has one owner. A sync applies upstream's changes to the
+fields upstream owns ("What a sync does"); a person's change in PitCrew to a field upstream owns is
+a conflict, raised as an approval to send it. The hub's own fields are never sent.
+
+GitHub issue ↔ task:
+
+| Field | Owner | Upstream → PitCrew (a sync) | PitCrew → upstream (after approval) |
+|---|---|---|---|
+| `title` | GitHub | overwrites the task's title | a person's change: `update`, only when the hub holds upstream's title exactly ("Only what the hub holds exactly") |
+| `body` | GitHub | overwrites the task's description | a person's change: `update`, only when the hub holds upstream's body exactly |
+| `labels` | GitHub | overwrite the task's labels | a person's change: `update`, as the labels added and removed; every other label upstream is kept |
+| `milestone` | GitHub | moves the task to the workstream that links the new milestone (same project) | moving the task to a workstream that links another milestone of its repository: `update` |
+| `state` | both, through rules | a close moves the task to `done`, a reopen a done task to `todo`, when `can_move(.., sync)` allows | a move into `done` or `canceled` closes the issue (`close`, reason `completed` or `not_planned`); a move out of them reopens it (`reopen`) |
+| `assignees` | PitCrew | never read into the task | never sent |
+
+Jira issue ↔ task: the same, with `summary` for the title, `description` for the body, the
+**epic** for the milestone (Cloud's `parent`; Data Center's `epic_link_field`, so Data Center gets
+no epic writes without one), and the status category for the state (`close` is a transition into
+the Done category, `reopen` one into To Do; the first such transition the issue's workflow offers).
+The assignee belongs to PitCrew.
+
+**What raises an approval.**
+- **Implied by a change** in the event log, authored by anyone but a sync (any integration's own
+  sync member: a sync's changes come from upstream and are never sent back), on a task whose
+  `source` is an issue of a repository or Jira project an integration syncs:
+  - `task_moved` across the open/closed line (`done` and `canceled` are closed): `close` or `reopen`;
+  - `task_updated` with `title`, `description` or `labels`, or a `workstream` that links another
+    milestone or epic of the issue's repository or project: one `update` with those fields, for an
+    issue a sync has read (an `update` is checked against upstream's values as last read; a change
+    to an issue no sync has read yet, such as one PitCrew just created, proposes nothing).
+
+  Nothing is raised when upstream already has the value (as the last sync read it), and one change
+  raises one approval, never two (it names the change as `cause`). Creating a task never creates an
+  issue by itself.
+- **Only what the hub holds exactly is sent back.** A sync keeps upstream's text in the form the
+  hub can hold: hidden characters stripped, titles and bodies cut to their caps, Jira Cloud's rich
+  text turned into plain lines. Writing that copy back would replace what PitCrew never held, so:
+  - the **title** and the **description** are proposed only when the last read was lossless
+    (`IssueSnapshot::title_lossless` and `body_lossless` in the sync crates): what the hub holds
+    equals what upstream sent, and on Jira Cloud the description is plain paragraphs of
+    unformatted text, the form PitCrew writes. Otherwise that field is left out (the ask says so
+    when other fields are sent), nothing is raised for it alone, and the hub keeps its own value
+    until upstream next changes it;
+  - **labels** are sent as a change, `add_labels` and `remove_labels`: the labels the person added
+    and removed, against upstream's as last read and as the hub holds them (at most 32, each cut to
+    64 characters). Labels upstream has that the hub does not hold are never touched.
+- **Asked for by a person**, `POST /v1/writes` with `NewWrite`: `{ "task": TaskId, "operation":
+  "create_issue" | "comment", "text"?: String }`.
+  - `create_issue`: the task must not mirror an issue yet (`409`), and its workstream must link a
+    scope an integration syncs (`400` otherwise): the first such link in the workstream's list
+    names the repository or project, and the milestone or epic when it is one. It sends the task's
+    title, description and labels.
+  - `comment`: the task must mirror an issue of an integration (`409` otherwise); `text` is 1 to
+    65,536 characters, with no control characters but line breaks and tabs.
+  - `operation` anything else, an unknown task, or a missing `text` for a comment is `400`.
+
+**The approval ask.** `ask_raised` (kind `approval`, from the integration's own sync member, to the
+person who added the integration, with the task) and `write_proposed` (`{ "write": WriteProposal }`) are appended
+together. The ask's title names the tracker, the operation and the issue; its body lists every
+field as `before → after`; its options are `["Send", "Don't send"]`. `UpstreamWrite.proposal` holds
+the same, structured:
+
+`WriteProposal`: `{ "ask": AskId, "integration": IntegrationId, "system": "github" | "jira",
+"scope": String, "target"?: ExternalRef, "task"?: TaskId, "operation": WriteOperation, "before":
+WriteFields, "after": WriteFields, "requested_by": MemberId, "cause"?: EventId }`.
+- `scope` is the repository (`owner/repo`) or Jira project (`DEMO`); `target` the issue (absent for
+  `create_issue`).
+- `WriteOperation`: `create_issue`, `comment`, `update`, `close` or `reopen`.
+- `WriteFields`: `{ "title"?, "body"?, "labels"?: String[], "add_labels"?: String[],
+  "remove_labels"?: String[], "milestone"?: String, "epic"?: String, "state"?: "open" | "closed",
+  "close_reason"?: "completed" | "not_planned", "comment"? }`. `after` is **exactly what is sent**,
+  and only the fields being changed; `before` is upstream's value of each, as the last sync read it
+  (absent when the hub has not read it). `labels` in `after` is a new issue's whole list
+  (`create_issue`); an `update` sends `add_labels` and `remove_labels` instead, with upstream's
+  labels as last read in `before.labels`. `milestone` is a link key (`owner/repo#milestone:2`),
+  `epic` an issue key (`DEMO-5`).
+- `requested_by` is whose change implied it, or who asked; `cause` the event that implied it.
+
+**Answering, and what is sent.** `POST /v1/asks/{id}/answer` (a device token, the person the ask is
+addressed to) with `{ "option": 0 }` approves; any other answer is a denial.
+- **Approved:** the hub checks the write is still what the task says (each field of `after` still
+  equals the task's, the move's status is still on the same side of the open/closed line, the
+  integration still exists), then appends `write_started` (`{ "ask", "task"?, "attempt" }`).
+- **Upstream as it is now.** For an `update`, `close` or `reopen` it then reads the issue (one
+  `GET`: GitHub `…/issues/{n}`, Jira `…/issue/{key}?fields=…`) and compares it with `before`, field
+  by field:
+  - a field upstream already holds as `after` is not sent again;
+  - a field upstream changed since it was read (it is neither `before` nor `after`, or the
+    description now has formatting) means **nothing is sent**: `not_sent` ("Not sent: <issue>
+    changed upstream since this was proposed (title). …"). The next sync brings upstream's change
+    into the hub;
+  - labels are taken one by one: a label to add that upstream has, or one to remove that it no
+    longer has, is skipped, and a label to remove is removed under upstream's own spelling;
+  - when nothing is left to send, the write is `sent` with no request.
+- **What is sent:** what is left of `after`, with the integration's credential, and nothing else:
+  GitHub one `PATCH …/issues/{n}` (title, body, milestone, state), then `POST …/issues/{n}/labels`
+  with the labels to add, then one `DELETE …/issues/{n}/labels/{name}` per label to remove; Jira one
+  `PUT …/issue/{key}` with `fields` and `update.labels` (`add` and `remove`), or a transition. Each
+  request is sent once; a refusal stops the rest. Then `write_finished` (`{ "ask", "task"?,
+  "result": WriteResult }`):
+  - `{ "outcome": "sent", "created"?: ExternalRef, "url"?: String }`: `created` is the new issue
+    (`create_issue`), and the task's `source` becomes it; `url` links what was written;
+  - `{ "outcome": "failed", "message": String, "status"?: u16 }`: upstream refused it (its HTTP
+    status, its message capped and stripped of hidden characters) or could not be reached.
+  A write that is no longer what the task says, or whose integration is gone, is not sent:
+  `{ "outcome": "not_sent", "reason": String }`.
+- **Denied:** `write_finished` with `not_sent` ("Not sent: <person> chose not to."). Nothing reaches
+  upstream, and the hub keeps its own value.
+- Only an approval ask the hub raised with its `write_proposed` can send anything, and only when
+  it comes from the write's own integration's sync member and a person answered it: an ask of kind
+  `approval` raised through `POST /v1/asks` never does.
+
+`UpstreamWrite`: `{ "proposal": WriteProposal, "state": WriteState, "attempts": u32, "proposed_at":
+ms, "answered_at"?: ms, "answered_by"?: MemberId, "finished_at"?: ms, "result"?: WriteResult,
+"retry_requested_by"?: MemberId }`. `retry_requested_by` is the person whose retry waits to be
+sent (see "Retrying").
+`WriteState`: `pending` (waiting for the person), `approved` and `denied` (answered, about to be
+sent or recorded), `sending`, `sent`, `failed`, `not_sent`.
+
+**Retrying, and sending at most once.** Each attempt is one `write_started`, followed by exactly one
+`write_finished`.
+- `POST /v1/writes/{id}/retry` asks to send a `failed` write again, the same `after`: it appends
+  `write_retry_requested` (`{ "ask", "task"?, "by": MemberId }`, authored by that person) and
+  answers `202` with the write. A second request while one waits appends nothing (`202` too).
+  `409 conflict` in any other state (a sent write is never sent again); `403` for a person who may
+  not answer its ask; `404` for an unknown id.
+- A failed write starts again only with a `write_retry_requested` by a person that no
+  `write_started` has used yet, so the log shows who asked for each attempt after the first.
+- **Before a `create_issue` or a `comment` is sent again**, the hub looks upstream for the earlier
+  attempt, since the first may have arrived though its answer was lost:
+  - GitHub: `GET …/issues?state=all&sort=created&direction=desc&per_page=100&since=` for an issue
+    with the same title and body, created since the write was approved (ten minutes' margin), or
+    `GET …/issues/{n}/comments?since=&per_page=100` for a comment with the same text;
+  - Jira: `GET …/search/jql` (Cloud) or `…/search` (Data Center) with `project = "KEY" AND reporter
+    = currentUser() ORDER BY created DESC` for an issue with the same summary and description, or
+    `GET …/issue/{key}/comment?orderBy=-created&maxResults=100` for a comment with the same text,
+    created since.
+
+  When it is there, the attempt is `sent` with it (a found issue becomes the task's `source`) and
+  nothing is sent again; when the look-up fails, the attempt is `failed` and nothing is sent.
+- A result the hub could not record (its database was busy) is kept in memory and recorded first
+  at the next pass, before writes still `sending` are swept.
+- A `write_started` with no `write_finished` (the hub stopped while sending) is finished as `failed`
+  ("The hub stopped while sending; a retry first looks upstream for this attempt") when the hub
+  starts again. It is never sent again by itself.
+- Writes run one at a time with the integration's syncs, so a sync never reads an issue PitCrew is
+  creating before the task links it.
+
+**The mock** proposes, answers and records writes by the same rules, over the same fixtures: a
+write is `sent` when `apps/mock-hub/fixtures/` holds an exchange for its method and URL with a 2xx
+status, `failed` with that status otherwise, or with "no recorded fixture" when there is none. It
+reads the issue before an `update`, `close` or `reopen` from its copy of upstream, and looks for an
+earlier attempt before a retried create or comment in the same fixtures. A sent write changes the
+mock's copy of upstream, so its next sync agrees. The daemon's `--integration-fixtures` answers
+writes from the same files.
 
 ### Board drafts
 

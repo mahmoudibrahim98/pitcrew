@@ -10,6 +10,7 @@ import type { DraftCost } from "./DraftCost.ts";
 import type { DraftId } from "./DraftId.ts";
 import type { DraftedTask } from "./DraftedTask.ts";
 import type { Engine } from "./Engine.ts";
+import type { ExternalRef } from "./ExternalRef.ts";
 import type { Health } from "./Health.ts";
 import type { LinkBasis } from "./LinkBasis.ts";
 import type { Liveness } from "./Liveness.ts";
@@ -35,6 +36,8 @@ import type { Team } from "./Team.ts";
 import type { Workstream } from "./Workstream.ts";
 import type { WorkstreamId } from "./WorkstreamId.ts";
 import type { WorkstreamStatus } from "./WorkstreamStatus.ts";
+import type { WriteProposal } from "./WriteProposal.ts";
+import type { WriteResult } from "./WriteResult.ts";
 
 /**
  * What happened. On the wire: `{"type": "task_moved", "data": {…}}`.
@@ -199,7 +202,15 @@ status: WorkstreamStatus,
 /**
  * New health.
  */
-health: Health, } } | { "type": "task_created", "data": { 
+health: Health, } } | { "type": "workstream_linked", "data": { 
+/**
+ * The workstream.
+ */
+workstream: WorkstreamId, 
+/**
+ * The full new list.
+ */
+external: Array<ExternalRef>, } } | { "type": "task_created", "data": { 
 /**
  * The task.
  */
@@ -339,7 +350,47 @@ why?: string,
 /**
  * Evidence.
  */
-receipts: Array<Receipt>, } } | { "type": "board_draft_started", "data": { 
+receipts: Array<Receipt>, } } | { "type": "write_proposed", "data": { 
+/**
+ * Exactly what will be sent. Boxed: it is the largest body by far.
+ */
+write: WriteProposal, } } | { "type": "write_started", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * Which attempt, from 1.
+ */
+attempt: number, } } | { "type": "write_retry_requested", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * The person who asked.
+ */
+by: MemberId, } } | { "type": "write_finished", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * What came of it.
+ */
+result: WriteResult, } } | { "type": "board_draft_started", "data": { 
 /**
  * The draft.
  */

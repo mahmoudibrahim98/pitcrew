@@ -39,6 +39,50 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `calendar.tsx`, `calendar-dates.ts` | Calendar route: due tasks by month, filters for me/project/workstream, locale week starts, arrow-key day navigation, Enter to show a day's tasks, and a phone agenda. Calendar arithmetic uses UTC solely to keep date-only values stable. |
 | `timeline.tsx`, `scheduled-task.tsx`, `schedule.css` | Project Timeline: workstream rows on a shared week/month axis, exact due-date labels, a today line, undated tasks apart, and status symbols and borders. Scrolling stays in the timeline; task buttons open the drawer and regain focus when it closes. |
 | `people.tsx`, `ui.tsx` | Avatars; small shared pieces (candidates for `src/design`). |
+| `writes/` | Outward writes to GitHub and Jira (api-v1.md, "Outward writes"): `api.ts` (`writeClient`, `useTaskWrites`, `useWriteOf`, `useWriteActions`, `fieldRows`), `approval-card.tsx` (`ApprovalCard`, `WriteDiff`: an approval in the Inbox, field by field, with Send and Don't send) and `task-writes.tsx` (`TaskWrites`, the drawer's Upstream section). See "Outward writes" below. |
+| `integrations/` | GitHub and Jira (api-v1.md, "Integrations"; read-only upstream): `api.ts` (the wire types, `integrationClient`, `useIntegrations`, `useIntegrationActions`, `useStoreCredential`, and the links' `githubWebRoot`, `scopesOf` and `narrowerScope`), `integrations-page.tsx` (Settings › Integrations at `settings/integrations`: connect, credential, test, sync now, status and problems, linked workstreams, remove) and `workstream-links.tsx` (the workstream page's links upstream and their last sync, and the dialog that links or unlinks them). See "Integrations" below. |
+
+## Integrations
+
+- **The page** lists each connection with its sync's state (`syncState`: syncing, waiting on a rate
+  limit, needs a credential, problems, in sync), the last and next sync, the last run's counts, the
+  problems (`role="alert"`), and the workstreams it syncs. "Test" shows each check and the
+  warnings about a credential that can do more than read. Connecting GitHub offers `gh auth token`
+  on the hub's machine or a token entered next; Jira always takes a stored secret.
+- **Secrets.** The token field is an uncontrolled password input: on Save its value goes to
+  `integrationClient(api).storeCredential` once, through `useStoreCredential` (which keeps only
+  whether it is under way and its error, not a TanStack mutation, whose `variables` the mutation
+  cache would keep), and the field is cleared, so no React state, query or mutation cache holds it
+  (tested). In the desktop app the transport's
+  `storeCredential` is the gateway's own command (`gateway_integration_credential`), never
+  `gateway_request`; in a browser (development) it is `PUT …/credential`.
+- **Links.** A workstream's header shows its links (with the upstream title once synced) and its
+  integration's last sync; "Edit links" picks a connected repository or Jira project, optionally
+  narrowed to a milestone number or an epic key of that project (anything else is refused before
+  it is sent), and `PATCH`es the full list. Links point at the integration's own web host: an
+  Enterprise server's origin, not `github.com` (`githubWebRoot`). `workstream_linked`
+  refreshes the workstream and the integrations. The list polls every 30 s (2 s while one syncs):
+  a sync's status has no event of its own.
+
+## Outward writes
+
+- **In the Inbox**, an `approval` ask the hub raised for a write (`GET /v1/writes/{ask}` answers)
+  is an `ApprovalCard`: what it does and to which issue, who or what implied it, a row per field
+  sent (upstream's value now, struck through, and exactly what is sent), and the ask's own options
+  (Send, Don't send), answered in place through `POST /v1/asks/{id}/answer`. Labels show as the
+  change sent (`+ docs, − tests`), never a whole list. Any other ask, an approval an agent raised
+  itself included (`404`), stays the console's `QuestionCard`. When the write cannot be read for
+  any other reason, the card shows the ask's title and the error, and no buttons: the ask's own
+  text is only a short preview of what would be sent.
+- **In the task drawer**, "Upstream" lists the task's writes newest first (waiting for approval,
+  sent with a link, failed with upstream's message, or not sent and why), each with "What it
+  sends" and, when failed, Retry. A person can ask to create an issue from a task that mirrors
+  none, or to comment on the one it mirrors; both only propose a write, which waits in the Inbox.
+  The section shows when the task mirrors an issue, has writes, or (for a person) when an
+  integration is connected.
+- Write events invalidate the write queries (`keys.writes`), the asks on a proposal, and the task
+  on a result (a created issue becomes its `source`); `write_retry_requested` refreshes the write
+  lists and reads as "asked to send a failed write … again" in activity.
 
 ## The task page
 

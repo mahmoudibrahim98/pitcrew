@@ -6,8 +6,8 @@
 //! - Nested values (locations, receipts, external refs) are stored as their serde JSON.
 
 use pitcrew_protocol::ids::{
-    AskId, DispatchId, EventId, MachineId, MemberId, PersonaId, ProjectId, SessionId, SubtaskId,
-    TaskId, TeamId, TerminalId, WorkstreamId,
+    AskId, DispatchId, EventId, IntegrationId, MachineId, MemberId, PersonaId, ProjectId,
+    SessionId, SubtaskId, TaskId, TeamId, TerminalId, WorkstreamId,
 };
 use pitcrew_store::sql::types::Type;
 use pitcrew_store::sql::{self, Row};
@@ -35,6 +35,7 @@ id_text!(
     AskId,
     DispatchId,
     EventId,
+    IntegrationId,
     MachineId,
     MemberId,
     PersonaId,

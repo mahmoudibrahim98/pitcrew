@@ -56,11 +56,12 @@ describe('the first-run wizard', () => {
     expect((screen.getByLabelText('This machine’s name') as HTMLInputElement).value).toBe('This computer');
     fireEvent.click(continueButton());
 
-    // 3. Machine check: waits for the check, then a fixable row can be fixed.
+    // 3. Machine check: waits for the check, then a missing tool's fix (the fake pretends it was
+    // installed from its page).
     await heading('Checking the machine');
     const opencodeRow = await rowForTextAsync('OpenCode CLI');
     expect(within(opencodeRow).getByText('Missing')).toBeTruthy();
-    fireEvent.click(within(opencodeRow).getByRole('button', { name: 'Fix' }));
+    fireEvent.click(within(opencodeRow).getByRole('button', { name: 'Install OpenCode CLI…' }));
     await within(opencodeRow).findByText('OK');
     fireEvent.click(continueButton());
 

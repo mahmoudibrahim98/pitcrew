@@ -14,6 +14,8 @@
 //! | `agents/<agent id>.reader.token` | A reader token (it may only read) for an agent the Orchestrator's sessions run as, bound to that agent and its owner, given to those sessions' CLIs instead. Private (0600). |
 //! | `orchestrator.json` | The Orchestrator's conversations, per person (`WorkService::with_orchestrator_file`): not in the event log, so a person can clear theirs. Private (0600). |
 //! | `scratch/orchestrator-<member id>/` | The folder a person's Orchestrator sessions run in, with the CLIs' settings a session that only reads needs (`.claude/settings.json`). Private (0700). |
+//! | `integrations.json` | The GitHub and Jira connections (no secret), each with its sync member and last sync status (`crate::integrations`). Private (0600). |
+//! | `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream), and its stored secret when it has one. The folder is private (0700; an owner-only DACL on Windows), each file too (0600). Never in the event log. |
 //! | `run/pitcrewd.sock` | The private socket (Unix). |
 
 use anyhow::Context as _;
@@ -164,7 +166,19 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 /// # Errors
 /// It is not a regular file, cannot be read, or does not hold `what`.
 pub fn read_json<T: DeserializeOwned>(path: &Path, what: &str) -> io::Result<Option<T>> {
-    let Some(text) = read_regular(path, MAX_JSON_FILE)? else {
+    read_json_up_to(path, what, MAX_JSON_FILE)
+}
+
+/// [`read_json`] for a file of at most `max` bytes; a longer one does not parse.
+///
+/// # Errors
+/// As [`read_json`].
+pub fn read_json_up_to<T: DeserializeOwned>(
+    path: &Path,
+    what: &str,
+    max: u64,
+) -> io::Result<Option<T>> {
+    let Some(text) = read_regular(path, max)? else {
         return Ok(None);
     };
     serde_json::from_str(&text).map(Some).map_err(|e| {

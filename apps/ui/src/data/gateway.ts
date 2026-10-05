@@ -198,6 +198,14 @@ export function gatewayTransport(workspace: string, name: string | (() => string
     return { status: res.status, contentType: res.contentType ?? undefined, body: res.body ?? '' };
   }
 
+  // The secret goes to this command once and is kept nowhere here; the gateway refuses the
+  // credential route on `gateway_request` (desktop-gateway.md, "Integration credentials").
+  async function storeCredential(integration: string, secret: string): Promise<TransportResponse> {
+    const res = await call<unknown>('gateway_integration_credential', { workspace, integration, secret });
+    if (!isResponse(res)) throw toGatewayError({ code: 'internal', message: 'The gateway gave no answer for the credential.' });
+    return { status: res.status, contentType: res.contentType ?? undefined, body: res.body ?? '' };
+  }
+
   return {
     kind: 'desktop',
     get label() {
@@ -205,6 +213,7 @@ export function gatewayTransport(workspace: string, name: string | (() => string
     },
     request,
     openSocket: (path) => new GatewaySocket(workspace, path),
+    storeCredential,
   };
 }
 

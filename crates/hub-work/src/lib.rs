@@ -19,6 +19,10 @@
 //!   use with a token that may only read, followed from its transcript
 //!   ([`WorkService::ask_orchestrator`], [`WorkService::follow_orchestrator`]; the routes are
 //!   [`orchestrator_routes`]);
+//! - [`SyncCommands`]: what a tracker sync (GitHub, Jira) changes in the hub, as the sync's own
+//!   member with `Mover::Sync`, and [`links`], the workstream links a sync routes issues by;
+//! - [`writes`]: outward writes to GitHub and Jira, each proposed with an approval ask and started
+//!   only once a person answered "Send" (the commands are on [`SyncCommands`]);
 //! - the back office acting on the hub ([`BackOffice`], [`OfficeCommands`]): its run log is a
 //!   projection ([`projections_with_office`]), and the daemon calls [`WorkService::run_office`]
 //!   after each append to apply what it emitted.
@@ -85,6 +89,7 @@ mod dispatch;
 mod edits;
 mod error;
 mod import;
+pub mod links;
 mod office;
 mod orchestrator;
 mod orchestrator_routes;
@@ -97,6 +102,8 @@ mod safety;
 mod seed;
 mod service;
 mod setup;
+mod sync;
+pub mod writes;
 
 pub use activity::EventRefs;
 pub use board_routes::{board_agent_routes, board_device_routes};
@@ -124,6 +131,11 @@ pub use routes::{agent_routes, device_routes, read_routes, routes};
 pub use seed::demo_events;
 pub use service::{Clock, WorkService, WorkspaceAt};
 pub use setup::SetupListener;
+pub use sync::{
+    Outcome as SyncOutcome, SYNC_FALLBACK_HANDLE, SYNC_HANDLE, SYNC_NAME, SyncCommands, fit_labels,
+    fit_title,
+};
+pub use writes::WriteFilter;
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
