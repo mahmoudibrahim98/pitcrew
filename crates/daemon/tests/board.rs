@@ -158,7 +158,11 @@ fn a_stand_in_agent_drafts_a_board_through_pitcrew_and_only_accepted_tasks_are_m
         return;
     };
     let tmp = tempfile::tempdir().unwrap();
-    let (homes, out, bin) = (tmp.path().join("homes"), tmp.path().join("out"), tmp.path().join("bin"));
+    let (homes, out, bin) = (
+        tmp.path().join("homes"),
+        tmp.path().join("out"),
+        tmp.path().join("bin"),
+    );
     for dir in [&homes, &out, &bin] {
         private_folder(dir);
     }
@@ -180,10 +184,9 @@ fn a_stand_in_agent_drafts_a_board_through_pitcrew_and_only_accepted_tasks_are_m
     let mark = format!("board-{}-{nanos}", std::process::id());
     let _cleanup = Cleanup(mark.clone());
 
-    let path = std::env::join_paths(
-        std::iter::once(bin.clone())
-            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())),
-    )
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
     .unwrap();
     let endpoint = tmp.path().join("p");
     private_folder(&endpoint);
@@ -295,21 +298,44 @@ fn a_stand_in_agent_drafts_a_board_through_pitcrew_and_only_accepted_tasks_are_m
         eventually(&format!("the stand-in notes {name}"), || path.is_file());
         std::fs::read_to_string(path).unwrap()
     };
-    assert_eq!(read("submit.code").trim(), "0", "pitcrew: {}", read("submit.err"));
+    assert_eq!(
+        read("submit.code").trim(),
+        "0",
+        "pitcrew: {}",
+        read("submit.err")
+    );
     assert_eq!(
         read("submit.out"),
-        format!("Proposed 2 tasks for drf_{draft_id}. Nothing is created until a person reviews it.\n")
+        format!(
+            "Proposed 2 tasks for drf_{draft_id}. Nothing is created until a person reviews it.\n"
+        )
     );
-    assert_eq!(read("again.code").trim(), "4", "a second proposal is a conflict");
+    assert_eq!(
+        read("again.code").trim(),
+        "4",
+        "a second proposal is a conflict"
+    );
     assert!(read("again.err").contains("already has a proposal"));
     let prompt = read("prompt");
     assert!(prompt.contains(&format!("pitcrew board submit drf_{draft_id}")));
     assert!(prompt.contains(&format!("Session {SES5}")));
-    assert_eq!(prompt.len() as u64, shown["cost"]["prompt_bytes"].as_u64().unwrap());
-    assert!(!prompt.contains(&device), "the device token is never in a prompt");
-    assert!(!native.join("token-in-env").exists(), "no token in the environment");
+    assert_eq!(
+        prompt.len() as u64,
+        shown["cost"]["prompt_bytes"].as_u64().unwrap()
+    );
+    assert!(
+        !prompt.contains(&device),
+        "the device token is never in a prompt"
+    );
+    assert!(
+        !native.join("token-in-env").exists(),
+        "no token in the environment"
+    );
     let token_file = read("token-file");
-    assert!(token_file.ends_with(&format!("{}.token", id::WRITER)), "{token_file}");
+    assert!(
+        token_file.ends_with(&format!("{}.token", id::WRITER)),
+        "{token_file}"
+    );
 
     let proposed = current();
     assert_eq!(proposed["proposal"]["tasks"][0]["evidence"], json!([SES5]));
@@ -332,7 +358,11 @@ fn a_stand_in_agent_drafts_a_board_through_pitcrew_and_only_accepted_tasks_are_m
     assert_eq!(made[0]["status"], "in_progress");
     assert_eq!(made[0]["labels"], json!(["drafted"]));
     assert_eq!(made[0]["key"], "DRB-1");
-    let ses5 = ok(&daemon.get(&format!("/v1/sessions/{SES5}"), Some(&device)), 200, "session");
+    let ses5 = ok(
+        &daemon.get(&format!("/v1/sessions/{SES5}"), Some(&device)),
+        200,
+        "session",
+    );
     assert_eq!(ses5["task"], made[0]["id"]);
 
     // The drafting session ends with the test.

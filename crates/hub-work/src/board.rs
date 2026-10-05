@@ -87,7 +87,11 @@ impl WorkService {
     /// # Errors
     ///
     /// `forbidden` for an agent; `not_found` for an unknown workstream; database errors.
-    pub fn draft_preview(&self, caller: &Caller, workstream: &WorkstreamId) -> Result<DraftPreview> {
+    pub fn draft_preview(
+        &self,
+        caller: &Caller,
+        workstream: &WorkstreamId,
+    ) -> Result<DraftPreview> {
         crate::commands::require_person(caller, "Previewing a board draft")?;
         let workstream = self.workstream(workstream)?;
         let made = self.make_prompt(&workstream)?;
@@ -500,9 +504,9 @@ impl WorkService {
             }
             match draft.state {
                 DraftState::Running => Ok((draft, shape)),
-                DraftState::Proposed | DraftState::Reviewed => Err(WorkError::conflict(format!(
-                    "{id} already has a proposal."
-                ))),
+                DraftState::Proposed | DraftState::Reviewed => {
+                    Err(WorkError::conflict(format!("{id} already has a proposal.")))
+                }
                 DraftState::Ended => Err(WorkError::conflict(format!(
                     "{id} has ended: its session ended without a proposal."
                 ))),
@@ -562,17 +566,17 @@ impl WorkService {
                     )));
                 };
                 if !seen.insert(item) {
-                    return Err(WorkError::invalid(format!("accept: {item} is given twice.")));
+                    return Err(WorkError::invalid(format!(
+                        "accept: {item} is given twice."
+                    )));
                 }
                 accepted.push((item, index));
             }
             accepted.sort_unstable();
-            let workstream = query::workstream(c, &draft.workstream)?.ok_or_else(|| {
-                WorkError::conflict("The draft's workstream is no longer known.")
-            })?;
-            let project = query::project(c, &workstream.project)?.ok_or_else(|| {
-                WorkError::conflict("The draft's project is no longer known.")
-            })?;
+            let workstream = query::workstream(c, &draft.workstream)?
+                .ok_or_else(|| WorkError::conflict("The draft's workstream is no longer known."))?;
+            let project = query::project(c, &workstream.project)?
+                .ok_or_else(|| WorkError::conflict("The draft's project is no longer known."))?;
             let mut number = query::highest_task_number(c, &project.key)?;
             let mut tasks = Vec::with_capacity(accepted.len());
             let mut links: Vec<(SessionId, TaskId)> = Vec::new();
@@ -603,9 +607,8 @@ impl WorkService {
                     subtasks: Vec::new(),
                 };
                 for session in &proposed.evidence {
-                    let free = query::session(c, session)?.is_some_and(|s| {
-                        s.task.is_none() && s.workstream == Some(workstream.id)
-                    });
+                    let free = query::session(c, session)?
+                        .is_some_and(|s| s.task.is_none() && s.workstream == Some(workstream.id));
                     if free && linked.insert(*session) {
                         links.push((*session, task.id));
                     }
@@ -633,21 +636,23 @@ impl WorkService {
                 },
             ));
         }
-        events.push(self.by(
-            caller,
-            EventBody::BoardDraftReviewed {
-                draft: draft.id,
-                workstream: draft.workstream,
-                accepted: tasks
-                    .iter()
-                    .map(|(item, task)| DraftedTask {
-                        item: *item,
-                        task: task.id,
-                    })
-                    .collect(),
-                rejected,
-            },
-        ));
+        events.push(
+            self.by(
+                caller,
+                EventBody::BoardDraftReviewed {
+                    draft: draft.id,
+                    workstream: draft.workstream,
+                    accepted: tasks
+                        .iter()
+                        .map(|(item, task)| DraftedTask {
+                            item: *item,
+                            task: task.id,
+                        })
+                        .collect(),
+                    rejected,
+                },
+            ),
+        );
         self.append(&events)?;
         let created = self.read(|c| {
             let mut out = Vec::with_capacity(tasks.len());

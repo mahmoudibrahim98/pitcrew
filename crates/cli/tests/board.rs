@@ -51,7 +51,11 @@ fn route() -> String {
 fn submit_posts_the_proposal_as_given() {
     let server = FakeServer::tcp(routes(&[(route().as_str(), 201, draft(proposal()))]));
     let text = proposal().to_string();
-    let (code, out, err) = run_on(&server, &["board", "submit", &format!("drf_{DRAFT}")], &text);
+    let (code, out, err) = run_on(
+        &server,
+        &["board", "submit", &format!("drf_{DRAFT}")],
+        &text,
+    );
     assert_eq!((code, err.as_str()), (0, ""));
     assert_eq!(
         out,
@@ -69,7 +73,10 @@ fn submit_posts_the_proposal_as_given() {
 
     let (code, out, _) = run_on(&server, &["--json", "board", "submit", DRAFT], &text);
     assert_eq!(code, 0);
-    assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), draft(proposal()));
+    assert_eq!(
+        serde_json::from_str::<Value>(&out).unwrap(),
+        draft(proposal())
+    );
 }
 
 #[test]
@@ -110,8 +117,11 @@ fn the_daemons_refusals_keep_their_exit_codes() {
             status,
             api_error(code, "Synthetic refusal."),
         )]));
-        let (got, out, err) =
-            run_on(&server, &["board", "submit", DRAFT], &proposal().to_string());
+        let (got, out, err) = run_on(
+            &server,
+            &["board", "submit", DRAFT],
+            &proposal().to_string(),
+        );
         assert_eq!(got, exit, "{status}: {err}");
         assert!(out.is_empty());
         assert!(err.contains("Synthetic refusal."), "{err}");
@@ -124,7 +134,11 @@ fn a_persons_token_is_refused() {
         ("GET /v1/me", 200, sam()),
         (route().as_str(), 201, draft(proposal())),
     ]));
-    let (code, _, err) = run_on(&server, &["board", "submit", DRAFT], &proposal().to_string());
+    let (code, _, err) = run_on(
+        &server,
+        &["board", "submit", DRAFT],
+        &proposal().to_string(),
+    );
     assert_eq!(code, 2, "{err}");
     assert!(server.api_requests().iter().all(|r| r.route() != route()));
 }

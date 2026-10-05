@@ -36,10 +36,44 @@ pub const EMAIL: &str = "[email]";
 /// Token prefixes that mark a credential, matched case-sensitively, each followed by at least
 /// [`MIN_AFTER_PREFIX`] token characters.
 pub const PREFIXES: &[&str] = &[
-    "sk-", "sk_live_", "sk_test_", "rk_live_", "rk_test_", "pk_live_", "ghp_", "gho_", "ghu_",
-    "ghs_", "ghr_", "github_pat_", "glpat-", "gldt-", "xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-",
-    "xapp-", "AKIA", "ASIA", "AIza", "ya29.", "pcd_", "pca_", "npm_", "pypi-", "hf_", "dop_v1_",
-    "doo_v1_", "shpat_", "shpss_", "SG.", "glc_", "sq0atp-", "EAAC", "ATATT",
+    "sk-",
+    "sk_live_",
+    "sk_test_",
+    "rk_live_",
+    "rk_test_",
+    "pk_live_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "gldt-",
+    "xoxa-",
+    "xoxb-",
+    "xoxp-",
+    "xoxr-",
+    "xoxs-",
+    "xapp-",
+    "AKIA",
+    "ASIA",
+    "AIza",
+    "ya29.",
+    "pcd_",
+    "pca_",
+    "npm_",
+    "pypi-",
+    "hf_",
+    "dop_v1_",
+    "doo_v1_",
+    "shpat_",
+    "shpss_",
+    "SG.",
+    "glc_",
+    "sq0atp-",
+    "EAAC",
+    "ATATT",
 ];
 
 /// Token characters after a [`PREFIXES`] prefix for it to count as one.
@@ -181,7 +215,11 @@ enum Piece<'a> {
 
 /// Characters that end a word: whitespace, quotes, brackets, commas and semicolons.
 fn is_gap(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '|')
+    c.is_whitespace()
+        || matches!(
+            c,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '|'
+        )
 }
 
 /// The text as words and the gaps between them, in order.
@@ -405,8 +443,7 @@ fn is_jwt(word: &str) -> bool {
         && word.len() >= 30
         && parts.iter().all(|p| {
             !p.is_empty()
-                && p
-                    .chars()
+                && p.chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '=')
         })
 }
@@ -429,11 +466,7 @@ fn is_random(word: &str) -> bool {
         let upper = part.chars().any(|c| c.is_ascii_uppercase());
         let lower = part.chars().any(|c| c.is_ascii_lowercase());
         // A long path or a long snake-case name has separators every few letters; a key does not.
-        let longest_run = part
-            .split(['/', '_', '-'])
-            .map(str::len)
-            .max()
-            .unwrap_or(0);
+        let longest_run = part.split(['/', '_', '-']).map(str::len).max().unwrap_or(0);
         if base64 && upper && lower && digits > 0 && longest_run >= 20 {
             return true;
         }
@@ -534,23 +567,45 @@ mod tests {
             "src/very_long_module_name/with_a_longer_file_name_v2.rs",
         ] {
             let out = line(text, 500);
-            assert_eq!(out, Redacted { text: text.to_owned(), count: 0 }, "{text}");
+            assert_eq!(
+                out,
+                Redacted {
+                    text: text.to_owned(),
+                    count: 0
+                },
+                "{text}"
+            );
         }
     }
 
     #[test]
     fn known_tokens_are_replaced() {
         for (text, want) in [
-            ("export OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234", "export OPENAI_API_KEY=[redacted]"),
+            (
+                "export OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234",
+                "export OPENAI_API_KEY=[redacted]",
+            ),
             ("key sk-ant-api03-AbCdEfGhIjKlMnOp", "key [redacted]"),
-            ("push with ghp_16C7e42F292c6912E7710c838347Ae178B4a", "push with [redacted]"),
-            ("token github_pat_11ABCDEFG0123456789_abcdefghijklmnop", "token [redacted]"),
+            (
+                "push with ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+                "push with [redacted]",
+            ),
+            (
+                "token github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
+                "token [redacted]",
+            ),
             ("slack xoxb-123456789012-abcdefghijkl", "slack [redacted]"),
             ("aws AKIAIOSFODNN7EXAMPLE done", "aws [redacted] done"),
-            ("maps AIzaSyD-1234567890abcdefghijklmnopqrstu", "maps [redacted]"),
+            (
+                "maps AIzaSyD-1234567890abcdefghijklmnopqrstu",
+                "maps [redacted]",
+            ),
             ("pitcrew pca_Zm9vYmFyYmF6cXV4", "pitcrew [redacted]"),
             ("gitlab glpat-xxxxyyyyzzzz1234", "gitlab [redacted]"),
-            ("uses sk-learn-tutorial and ASIAN data", "uses sk-learn-tutorial and ASIAN data"),
+            (
+                "uses sk-learn-tutorial and ASIAN data",
+                "uses sk-learn-tutorial and ASIAN data",
+            ),
         ] {
             assert_eq!(r(text), want, "{text}");
         }
@@ -559,15 +614,27 @@ mod tests {
     #[test]
     fn named_values_are_replaced() {
         for (text, want) in [
-            ("curl -H 'Authorization: Bearer abc.def.ghi' x", "curl -H 'Authorization: Bearer [redacted]' x"),
+            (
+                "curl -H 'Authorization: Bearer abc.def.ghi' x",
+                "curl -H 'Authorization: Bearer [redacted]' x",
+            ),
             ("password=hunter22 and more", "password=[redacted] and more"),
             ("DB_PASSWORD: hunter22", "DB_PASSWORD: [redacted]"),
-            ("login --password hunter22 --user sam", "login --password [redacted] --user sam"),
-            ("GET /api?user=sam&access_token=abcdef123&page=2", "GET /api?user=sam&access_token=[redacted]&page=2"),
+            (
+                "login --password hunter22 --user sam",
+                "login --password [redacted] --user sam",
+            ),
+            (
+                "GET /api?user=sam&access_token=abcdef123&page=2",
+                "GET /api?user=sam&access_token=[redacted]&page=2",
+            ),
             ("secret:topsecretvalue", "secret:[redacted]"),
             ("Basic dXNlcjpwYXNz", "Basic [redacted]"),
             ("set PGPASSWORD=s3cr3t-value", "set PGPASSWORD=[redacted]"),
-            ("author: sam, tokens used 1200", "author: sam, tokens used 1200"),
+            (
+                "author: sam, tokens used 1200",
+                "author: sam, tokens used 1200",
+            ),
         ] {
             assert_eq!(r(text), want, "{text}");
         }
@@ -590,10 +657,7 @@ mod tests {
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
         assert_eq!(r(&format!("token={jwt}")), "token=[redacted]");
         assert_eq!(r(&format!("sent {jwt}")), "sent [redacted]");
-        assert_eq!(
-            r("key Zx9Qm2Lp8Rt4Vw6Yb1Nc3Hd5Jf7Kg0Ab"),
-            "key [redacted]"
-        );
+        assert_eq!(r("key Zx9Qm2Lp8Rt4Vw6Yb1Nc3Hd5Jf7Kg0Ab"), "key [redacted]");
         assert_eq!(
             r("hex 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"),
             "hex [redacted]"
@@ -608,7 +672,10 @@ mod tests {
         );
         assert_eq!(r("branch fix/sam@example.com"), "branch fix/[email]");
         assert_eq!(r("fix/AKIAIOSFODNN7EXAMPLE"), "fix/[redacted]");
-        assert_eq!(r(r"C:\Users\sam\ghp_16C7e42F292c6912E7710c838347Ae178B4a\x"), r"~\[redacted]\x");
+        assert_eq!(
+            r(r"C:\Users\sam\ghp_16C7e42F292c6912E7710c838347Ae178B4a\x"),
+            r"~\[redacted]\x"
+        );
     }
 
     #[test]
@@ -619,7 +686,10 @@ mod tests {
             r("cd /home/sam/work/paper && ls /Users/sam/Documents"),
             "cd ~/work/paper && ls ~/Documents"
         );
-        assert_eq!(r(r"opened C:\Users\sam\work\notes.md"), r"opened ~\work\notes.md");
+        assert_eq!(
+            r(r"opened C:\Users\sam\work\notes.md"),
+            r"opened ~\work\notes.md"
+        );
         assert_eq!(r("in /root/.config"), "in ~/.config");
         assert_eq!(r("in /rooted/x and a/home/b"), "in /rooted/x and a/home/b");
         assert_eq!(line("cwd=/home/sam", 100).count, 1);
@@ -631,12 +701,21 @@ mod tests {
             "-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA -----END OPENSSH PRIVATE KEY-----",
             500,
         );
-        assert_eq!(out, Redacted { text: REDACTED.to_owned(), count: 1 });
+        assert_eq!(
+            out,
+            Redacted {
+                text: REDACTED.to_owned(),
+                count: 1
+            }
+        );
     }
 
     #[test]
     fn hidden_and_control_characters_cannot_split_a_secret() {
-        assert_eq!(r("ghp_\u{200B}16C7e42F292c6912E7710c838347Ae178B4a"), "[redacted]");
+        assert_eq!(
+            r("ghp_\u{200B}16C7e42F292c6912E7710c838347Ae178B4a"),
+            "[redacted]"
+        );
         assert_eq!(r("pass\u{0}word"), "pass word");
         assert_eq!(r("a\n\tb\u{2028}c"), "a b c");
         assert_eq!(r("password=\u{202E}hunter22"), "password=[redacted]");

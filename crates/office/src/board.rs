@@ -284,11 +284,14 @@ pub fn summarize(facts: &DraftFacts) -> BoardSummary {
     // Room for the header (with the largest counts) and the closing line.
     let mut used = tasks_text.len() + 400;
     for session in sessions.iter().take(MAX_SESSIONS) {
-        let block = session_block(session, &mut clean);
+        // Its own count: a block left out is not sent, so its redactions are not shown.
+        let mut own = Cleaner::default();
+        let block = session_block(session, &mut own);
         if used + block.len() + 1 > MAX_SUMMARY_BYTES {
             break;
         }
         used += block.len() + 1;
+        clean.redacted += own.redacted;
         blocks.push(block);
     }
     let covered = blocks.len();
@@ -369,7 +372,5 @@ pub fn draft_prompt(facts: &DraftFacts, draft: &str) -> DraftPrompt {
 
 /// The longest prompt [`draft_prompt`] can make, in bytes: the template, the longest names and the
 /// longest summary. It goes on the agent CLI's command line, which every platform allows.
-pub const MAX_PROMPT_BYTES: usize = DRAFT_BOARD.template.len()
-    + MAX_SUMMARY_BYTES
-    + 2 * MAX_NAME_CHARS * 4
-    + 64;
+pub const MAX_PROMPT_BYTES: usize =
+    DRAFT_BOARD.template.len() + MAX_SUMMARY_BYTES + 2 * MAX_NAME_CHARS * 4 + 64;

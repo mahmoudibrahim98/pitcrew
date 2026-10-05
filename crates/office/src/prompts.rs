@@ -62,7 +62,14 @@ mod tests {
     #[test]
     fn the_draft_prompt_names_its_version_and_placeholders() {
         assert_eq!(DRAFT_BOARD.id(), "draft-board/v1");
-        for name in ["workstream", "project", "draft", "summary", "max_tasks", "max_title"] {
+        for name in [
+            "workstream",
+            "project",
+            "draft",
+            "summary",
+            "max_tasks",
+            "max_title",
+        ] {
             assert!(
                 DRAFT_BOARD.template.contains(&format!("{{{{{name}}}}}")),
                 "{name}"

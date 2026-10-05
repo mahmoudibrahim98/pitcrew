@@ -763,7 +763,14 @@ mod tests {
         let bare = "01J00000000000000000000000";
         assert_eq!(draft_ref(bare).unwrap(), bare);
         assert_eq!(draft_ref(&format!(" drf_{bare} ")).unwrap(), bare);
-        for bad in ["", "..", "PAP-1", "drf_", "tsk_01J0", "drf_01J0000000000000000000000/x"] {
+        for bad in [
+            "",
+            "..",
+            "PAP-1",
+            "drf_",
+            "tsk_01J0",
+            "drf_01J0000000000000000000000/x",
+        ] {
             assert!(draft_ref(bad).is_err(), "{bad}");
         }
     }

@@ -213,7 +213,12 @@ async fn started(work: &Arc<WorkService>, workstream: &str) -> Value {
     res.1
 }
 
-async fn propose(work: &Arc<WorkService>, draft: &str, who: pitcrew_protocol::api::Caller, body: Value) -> (u16, Value) {
+async fn propose(
+    work: &Arc<WorkService>,
+    draft: &str,
+    who: pitcrew_protocol::api::Caller,
+    body: Value,
+) -> (u16, Value) {
     call(
         &app(work),
         Some(who),
@@ -261,7 +266,13 @@ async fn a_preview_shows_what_would_be_sent_and_sends_nothing() {
     let summary = shown["summary"].as_str().expect("summary");
     // Submission's sessions (SES0001, SES0006 and the noisy one), most recently active first, and
     // its tasks; never another workstream's.
-    for want in [SES1, "01JB000000000000000SES0006", &noisy.0.to_string(), "PAP-1", "PAP-7"] {
+    for want in [
+        SES1,
+        "01JB000000000000000SES0006",
+        &noisy.0.to_string(),
+        "PAP-1",
+        "PAP-7",
+    ] {
         assert!(summary.contains(want), "missing {want} in\n{summary}");
     }
     assert!(!summary.contains(SES2), "{summary}");
@@ -294,10 +305,20 @@ async fn a_preview_shows_what_would_be_sent_and_sends_nothing() {
     // People only; an unknown workstream is 404.
     let app = app(&work);
     let path = format!("/v1/workstreams/{SUBMISSION}/board-draft");
-    expect(&call(&app, Some(agent(WRITER)), "GET", &path, None).await, 403);
+    expect(
+        &call(&app, Some(agent(WRITER)), "GET", &path, None).await,
+        403,
+    );
     let missing = WorkstreamId::new();
     expect(
-        &call(&app, Some(person(SAM)), "GET", &format!("/v1/workstreams/{missing}/board-draft"), None).await,
+        &call(
+            &app,
+            Some(person(SAM)),
+            "GET",
+            &format!("/v1/workstreams/{missing}/board-draft"),
+            None,
+        )
+        .await,
         404,
     );
 }
@@ -318,23 +339,41 @@ async fn nothing_is_created_until_the_person_accepts_and_rejected_items_create_n
     assert_eq!(draft["by"], SAM);
     assert_eq!(draft["prompt"], "draft-board/v1");
     // The start records the session and the draft, and creates no task.
-    assert_eq!(types_after(&work, rev), ["session_discovered", "board_draft_started"]);
+    assert_eq!(
+        types_after(&work, rev),
+        ["session_discovered", "board_draft_started"]
+    );
     assert_eq!(task_count(&work), tasks);
     // The agent's CLI starts where the workstream is, with the prompt the preview showed, naming
     // its draft.
     let starts = runner.starts();
     assert_eq!(starts.len(), 1);
     let request = &starts[0];
-    assert_eq!(request.session.0.to_string(), draft["session"].as_str().expect("session"));
+    assert_eq!(
+        request.session.0.to_string(),
+        draft["session"].as_str().expect("session")
+    );
     assert_eq!(request.cwd, "/home/sam/work/diffusion-paper/paper");
     assert_eq!(request.engine, Engine::Claude);
     assert_eq!(request.permission_mode, PermissionMode::AcceptEdits);
-    assert!(request.brief.contains(&format!("pitcrew board submit drf_{id}")), "{}", request.brief);
-    assert_eq!(request.brief.len() as u64, draft["cost"]["prompt_bytes"].as_u64().expect("bytes"));
+    assert!(
+        request
+            .brief
+            .contains(&format!("pitcrew board submit drf_{id}")),
+        "{}",
+        request.brief
+    );
+    assert_eq!(
+        request.brief.len() as u64,
+        draft["cost"]["prompt_bytes"].as_u64().expect("bytes")
+    );
     let session = work.session(&request.session).expect("session");
     assert_eq!(session.state, SessionState::Starting);
     assert_eq!(session.agent, Some(WRITER.parse().expect("writer")));
-    assert_eq!(session.workstream, Some(SUBMISSION.parse().expect("workstream")));
+    assert_eq!(
+        session.workstream,
+        Some(SUBMISSION.parse().expect("workstream"))
+    );
     assert_eq!(session.task, None);
 
     // The agent proposes: still nothing created.
@@ -342,12 +381,18 @@ async fn nothing_is_created_until_the_person_accepts_and_rejected_items_create_n
     let res = propose(&work, &id, agent(WRITER), three_tasks()).await;
     expect(&res, 201);
     assert_eq!(res.1["state"], "proposed");
-    assert_eq!(res.1["proposal"]["tasks"].as_array().expect("tasks").len(), 3);
+    assert_eq!(
+        res.1["proposal"]["tasks"].as_array().expect("tasks").len(),
+        3
+    );
     assert_eq!(res.1["proposal"]["note"], "Two sessions say the same.");
     assert_eq!(types_after(&work, rev), ["board_proposed"]);
     assert_eq!(task_count(&work), tasks);
     // Once only.
-    expect(&propose(&work, &id, agent(WRITER), three_tasks()).await, 409);
+    expect(
+        &propose(&work, &id, agent(WRITER), three_tasks()).await,
+        409,
+    );
 
     // The person accepts the first and the last: two tasks, drafted; the second creates nothing.
     let rev = latest(&work);
@@ -400,9 +445,23 @@ async fn nothing_is_created_until_the_person_accepts_and_rejected_items_create_n
     let all = call(&app, Some(person(SAM)), "GET", "/v1/board-drafts", None).await;
     expect(&all, 200);
     assert_eq!(all.1[0]["id"], id.as_str());
-    let other = call(&app, Some(person(SAM)), "GET", &format!("/v1/board-drafts?workstream={SEED_RUNS}"), None).await;
+    let other = call(
+        &app,
+        Some(person(SAM)),
+        "GET",
+        &format!("/v1/board-drafts?workstream={SEED_RUNS}"),
+        None,
+    )
+    .await;
     assert_eq!(other.1, json!([]));
-    let one = call(&app, Some(person(SAM)), "GET", &format!("/v1/board-drafts/{id}"), None).await;
+    let one = call(
+        &app,
+        Some(person(SAM)),
+        "GET",
+        &format!("/v1/board-drafts/{id}"),
+        None,
+    )
+    .await;
     assert_eq!(&one.1, reviewed);
 }
 
@@ -416,12 +475,28 @@ async fn accepting_none_creates_nothing_and_another_draft_may_start() {
 
     // One draft at a time: a second start waits for this one.
     let shown = preview(&work, SUBMISSION).await;
-    let again = start(&work, SUBMISSION, json!({ "agent": WRITER, "digest": shown["digest"] })).await;
+    let again = start(
+        &work,
+        SUBMISSION,
+        json!({ "agent": WRITER, "digest": shown["digest"] }),
+    )
+    .await;
     expect(&again, 409);
 
-    expect(&propose(&work, &id, agent(WRITER), three_tasks()).await, 201);
+    expect(
+        &propose(&work, &id, agent(WRITER), three_tasks()).await,
+        201,
+    );
     let shown = preview(&work, SUBMISSION).await;
-    expect(&start(&work, SUBMISSION, json!({ "agent": WRITER, "digest": shown["digest"] })).await, 409);
+    expect(
+        &start(
+            &work,
+            SUBMISSION,
+            json!({ "agent": WRITER, "digest": shown["digest"] }),
+        )
+        .await,
+        409,
+    );
     let rev = latest(&work);
     let res = review(&work, &id, json!([])).await;
     expect(&res, 200);
@@ -434,9 +509,20 @@ async fn accepting_none_creates_nothing_and_another_draft_may_start() {
     // Reviewed, the workstream may be drafted again; its drafting session is not in the summary.
     let shown = preview(&work, SUBMISSION).await;
     assert!(
-        !shown["summary"].as_str().expect("summary").contains(draft["session"].as_str().expect("session"))
+        !shown["summary"]
+            .as_str()
+            .expect("summary")
+            .contains(draft["session"].as_str().expect("session"))
     );
-    expect(&start(&work, SUBMISSION, json!({ "agent": WRITER, "digest": shown["digest"] })).await, 202);
+    expect(
+        &start(
+            &work,
+            SUBMISSION,
+            json!({ "agent": WRITER, "digest": shown["digest"] }),
+        )
+        .await,
+        202,
+    );
 }
 
 #[tokio::test]
@@ -448,9 +534,19 @@ async fn a_start_needs_the_preview_the_person_saw() {
     // The workstream changes: a new session's work.
     noisy_session(&work);
     let rev = latest(&work);
-    let res = start(&work, SUBMISSION, json!({ "agent": WRITER, "digest": shown["digest"] })).await;
+    let res = start(
+        &work,
+        SUBMISSION,
+        json!({ "agent": WRITER, "digest": shown["digest"] }),
+    )
+    .await;
     expect(&res, 409);
-    assert!(res.1["message"].as_str().expect("message").contains("preview"));
+    assert!(
+        res.1["message"]
+            .as_str()
+            .expect("message")
+            .contains("preview")
+    );
     for body in [
         json!({ "agent": WRITER }),
         json!({ "agent": WRITER, "digest": "00" }),
@@ -472,10 +568,31 @@ async fn who_may_start_propose_and_review() {
     let app = app(&work);
     let path = format!("/v1/workstreams/{SUBMISSION}/board-drafts");
     // An agent starts nothing.
-    expect(&call(&app, Some(agent(WRITER)), "POST", &path, Some(json!({ "digest": digest }))).await, 403);
+    expect(
+        &call(
+            &app,
+            Some(agent(WRITER)),
+            "POST",
+            &path,
+            Some(json!({ "digest": digest })),
+        )
+        .await,
+        403,
+    );
     // A person, or an unknown member, is no agent to run.
-    expect(&start(&work, SUBMISSION, json!({ "agent": SAM, "digest": digest })).await, 400);
-    expect(&start(&work, SUBMISSION, json!({ "agent": "01J00000000000000000000000", "digest": digest })).await, 400);
+    expect(
+        &start(&work, SUBMISSION, json!({ "agent": SAM, "digest": digest })).await,
+        400,
+    );
+    expect(
+        &start(
+            &work,
+            SUBMISSION,
+            json!({ "agent": "01J00000000000000000000000", "digest": digest }),
+        )
+        .await,
+        400,
+    );
     // Without an agent named, the back office drafts: the demo's @office is Sam's.
     let office = start(&work, SUBMISSION, json!({ "digest": digest })).await;
     expect(&office, 202);
@@ -487,11 +604,30 @@ async fn who_may_start_propose_and_review() {
         expect(&propose(&work, &id, who, three_tasks()).await, 403);
     }
     // Before the body is read: a forbidden caller hears 403 whatever it sent.
-    let res = call(&app, Some(agent(RUNNER)), "POST", &format!("/v1/board-drafts/{id}/proposal"), Some(json!([1]))).await;
+    let res = call(
+        &app,
+        Some(agent(RUNNER)),
+        "POST",
+        &format!("/v1/board-drafts/{id}/proposal"),
+        Some(json!([1])),
+    )
+    .await;
     expect(&res, 403);
     // An unknown draft is 404.
-    expect(&propose(&work, "01J00000000000000000000000", agent(WRITER), three_tasks()).await, 404);
-    expect(&review(&work, "01J00000000000000000000000", json!([])).await, 404);
+    expect(
+        &propose(
+            &work,
+            "01J00000000000000000000000",
+            agent(WRITER),
+            three_tasks(),
+        )
+        .await,
+        404,
+    );
+    expect(
+        &review(&work, "01J00000000000000000000000", json!([])).await,
+        404,
+    );
 
     // Nothing to review yet.
     expect(&review(&work, &id, json!([])).await, 409);
@@ -502,9 +638,19 @@ async fn who_may_start_propose_and_review() {
     };
     expect(&propose(&work, &id, office, three_tasks()).await, 201);
     // Agents never review, and never read drafts.
-    let res = call(&app, Some(agent(WRITER)), "POST", &format!("/v1/board-drafts/{id}/review"), Some(json!({"accept": [0]}))).await;
+    let res = call(
+        &app,
+        Some(agent(WRITER)),
+        "POST",
+        &format!("/v1/board-drafts/{id}/review"),
+        Some(json!({"accept": [0]})),
+    )
+    .await;
     expect(&res, 403);
-    expect(&call(&app, Some(agent(WRITER)), "GET", "/v1/board-drafts", None).await, 403);
+    expect(
+        &call(&app, Some(agent(WRITER)), "GET", "/v1/board-drafts", None).await,
+        403,
+    );
     // Bad reviews.
     for accept in [json!([3]), json!([0, 0]), json!([-1]), json!("all")] {
         expect(&review(&work, &id, accept).await, 400);
@@ -526,7 +672,10 @@ async fn proposals_are_bounded_checked_and_redacted() {
         json!([draft["session"]]),
         json!(["not-an-id"]),
     ] {
-        expect(&propose(&work, &id, agent(WRITER), task(evidence)).await, 400);
+        expect(
+            &propose(&work, &id, agent(WRITER), task(evidence)).await,
+            400,
+        );
     }
     for body in [
         json!({"tasks": [{"title": " ", "status": "todo"}]}),
@@ -543,7 +692,14 @@ async fn proposals_are_bounded_checked_and_redacted() {
         expect(&res, 400);
     }
     // Still running: nothing was stored.
-    let still = call(&app(&work), Some(person(SAM)), "GET", &format!("/v1/board-drafts/{id}"), None).await;
+    let still = call(
+        &app(&work),
+        Some(person(SAM)),
+        "GET",
+        &format!("/v1/board-drafts/{id}"),
+        None,
+    )
+    .await;
     assert_eq!(still.1["state"], "running");
 
     let res = propose(
@@ -569,7 +725,10 @@ async fn proposals_are_bounded_checked_and_redacted() {
     expect(&res, 200);
     let task = res.1["tasks"][0]["id"].as_str().expect("task").to_owned();
     let session = work.session(&noisy).expect("session");
-    assert_eq!(session.task.map(|t| t.0.to_string()).as_deref(), Some(task.as_str()));
+    assert_eq!(
+        session.task.map(|t| t.0.to_string()).as_deref(),
+        Some(task.as_str())
+    );
     assert_eq!(session.link_basis, Some(LinkBasis::Manual));
 }
 
@@ -579,15 +738,38 @@ async fn a_draft_whose_session_ends_without_a_proposal_has_ended() {
     let work = service(dir.path(), Some(Recorder::new(None)));
     let draft = started(&work, SUBMISSION).await;
     let id = draft["id"].as_str().expect("id").to_owned();
-    let session: SessionId = draft["session"].as_str().expect("session").parse().expect("id");
-    work.abandon_session(&session, "the test ends it").expect("end");
-    let one = call(&app(&work), Some(person(SAM)), "GET", &format!("/v1/board-drafts/{id}"), None).await;
+    let session: SessionId = draft["session"]
+        .as_str()
+        .expect("session")
+        .parse()
+        .expect("id");
+    work.abandon_session(&session, "the test ends it")
+        .expect("end");
+    let one = call(
+        &app(&work),
+        Some(person(SAM)),
+        "GET",
+        &format!("/v1/board-drafts/{id}"),
+        None,
+    )
+    .await;
     assert_eq!(one.1["state"], "ended");
-    expect(&propose(&work, &id, agent(WRITER), three_tasks()).await, 409);
+    expect(
+        &propose(&work, &id, agent(WRITER), three_tasks()).await,
+        409,
+    );
     expect(&review(&work, &id, json!([])).await, 409);
     // An ended draft does not hold the workstream.
     let shown = preview(&work, SUBMISSION).await;
-    expect(&start(&work, SUBMISSION, json!({ "agent": WRITER, "digest": shown["digest"] })).await, 202);
+    expect(
+        &start(
+            &work,
+            SUBMISSION,
+            json!({ "agent": WRITER, "digest": shown["digest"] }),
+        )
+        .await,
+        202,
+    );
 }
 
 #[tokio::test]
@@ -595,22 +777,37 @@ async fn a_start_the_runner_cannot_make_ends_the_draft() {
     let dir = tempfile::tempdir().expect("tempdir");
     let work = service(
         dir.path(),
-        Some(Recorder::new(Some(DispatchError::Rejected("no such folder".into())))),
+        Some(Recorder::new(Some(DispatchError::Rejected(
+            "no such folder".into(),
+        )))),
     );
     let shown = preview(&work, SUBMISSION).await;
-    let res = start(&work, SUBMISSION, json!({ "agent": WRITER, "digest": shown["digest"] })).await;
+    let res = start(
+        &work,
+        SUBMISSION,
+        json!({ "agent": WRITER, "digest": shown["digest"] }),
+    )
+    .await;
     expect(&res, 409);
     let drafts = work.board_drafts(None).expect("drafts");
     assert_eq!(drafts.len(), 1);
     assert_eq!(drafts[0].state, pitcrew_protocol::board::DraftState::Ended);
-    assert_eq!(work.session(&drafts[0].session).expect("session").state, SessionState::Ended);
+    assert_eq!(
+        work.session(&drafts[0].session).expect("session").state,
+        SessionState::Ended
+    );
 
     // Without a runner link, nothing is stored at all.
     let dir = tempfile::tempdir().expect("tempdir");
     let work = service(dir.path(), None);
     let shown = preview(&work, SUBMISSION).await;
     let rev = latest(&work);
-    let res = start(&work, SUBMISSION, json!({ "agent": WRITER, "digest": shown["digest"] })).await;
+    let res = start(
+        &work,
+        SUBMISSION,
+        json!({ "agent": WRITER, "digest": shown["digest"] }),
+    )
+    .await;
     expect(&res, 503);
     assert_eq!(latest(&work), rev);
 }

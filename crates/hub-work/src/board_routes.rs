@@ -8,10 +8,10 @@
 //! - [`board_device_routes`]: the preview, the start, the list, one draft, and the review. Mount
 //!   with `RouterParts::device`; each handler refuses agents itself too.
 
+use crate::error::WorkError;
 use crate::routes::{
     Created, Person, Reply, Segments, Who, Work, blocking, decode, exists, json, path_id,
 };
-use crate::error::WorkError;
 use axum::Json;
 use axum::Router;
 use axum::body::Body as RawBody;
@@ -133,7 +133,10 @@ async fn propose(
     body: RawBody,
 ) -> Created<BoardDraft> {
     let id: DraftId = path_id(&id, "board draft")?;
-    blocking(Arc::clone(&w), move |w| w.check_draft_proposer(&caller, &id)).await?;
+    blocking(Arc::clone(&w), move |w| {
+        w.check_draft_proposer(&caller, &id)
+    })
+    .await?;
     let bytes = axum::body::to_bytes(body, MAX_PROPOSAL_BYTES)
         .await
         .map_err(|_| {
