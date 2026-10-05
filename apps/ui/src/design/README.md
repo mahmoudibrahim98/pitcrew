@@ -1,5 +1,10 @@
 # design (stream L)
 
+Engine marks (`engines/*.svg`) are from Simple Icons (CC0): Claude and OpenCode from the
+upstream icon set, OpenAI's mark for Codex from version 15.0.0. `EngineLogo` masks the local
+asset with the surrounding text colour; no image request leaves the app. Sources:
+https://github.com/simple-icons/simple-icons and https://github.com/simple-icons/simple-icons/tree/15.0.0.
+
 Components built on `@pitcrew/tokens` and Radix primitives. Import from `index.ts`. Every one is
 keyboard operable, works light and dark (Tailwind classes resolve to the `--pc-*` tokens), and
 honours reduced motion through the tokens' durations. See `docs/build/streams/L.md`.

@@ -75,6 +75,22 @@ test('the projects tree works from the keyboard', async ({ page }) => {
   await expect(paper).toBeFocused();
 });
 
+test('navigation uses icons and the palette reopens a recent project from the keyboard', async ({ page }) => {
+  await openShell(page);
+  for (const id of ['projects-list', 'members', 'calendar', 'integrations']) {
+    await expect(sidebar(page).locator(`[data-nav="${id}"] svg`)).toHaveCount(1);
+  }
+  await tree(page).getByRole('treeitem', { name: /^Paper · Diffusion study/ }).click();
+  await expect(heading(page, 'Paper · Diffusion study')).toBeVisible();
+  await sidebar(page).getByRole('link', { name: 'Home', exact: true }).click();
+  await expect(heading(page, 'Home')).toBeVisible();
+  await page.keyboard.press('Control+KeyK');
+  await expect(page.getByRole('option').first()).toContainText('Recent · Project');
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(new RegExp(`/projects/${PAPER}$`));
+  await expect(heading(page, 'Paper · Diffusion study')).toBeVisible();
+});
+
 test('Ctrl . switches layouts, and each layout reopens where it was left', async ({ page }) => {
   await openShell(page);
   await tree(page).getByRole('treeitem', { name: /^Tooling/ }).click();

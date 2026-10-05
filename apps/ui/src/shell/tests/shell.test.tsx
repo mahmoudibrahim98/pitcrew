@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within, waitFor } from '@testing-library/react';
 import type { QueryClient } from '@tanstack/react-query';
 import { createMemoryHistory, createRoute, RouterProvider } from '@tanstack/react-router';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -35,6 +35,7 @@ afterEach(async () => {
   queryClient?.clear();
   localStorage.clear();
   useShell.setState(initialShellState);
+  vi.restoreAllMocks();
 });
 
 function renderApp(features: Feature[], path = '/', socket?: SocketFactory) {
@@ -60,6 +61,23 @@ const silentStream: SocketFactory = () => ({ onmessage: null, onclose: null, one
 const sidebar = () => screen.getByRole('complementary', { name: 'Sidebar' });
 
 describe('feature registration', () => {
+  it('puts recently visited live items first in the palette and opens one with Enter', async () => {
+    vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(432);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(640);
+    const router = renderApp([]);
+    await screen.findByRole('heading', { level: 1, name: 'Home' }, { timeout: 8_000 });
+    await router.navigate({ href: `/w/${WORKSPACE}/projects/01JB000000000000000PRJ0001` });
+    await screen.findByRole('heading', { level: 1, name: 'Paper · Diffusion study' });
+    await router.navigate({ href: `/w/${WORKSPACE}/home` });
+    await screen.findByRole('heading', { level: 1, name: 'Home' });
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    const search = await screen.findByRole('combobox', { name: 'Search' });
+    await waitFor(() => expect(screen.getAllByRole('option')[0]?.textContent).toContain('Recent · Project'));
+    fireEvent.keyDown(search, { key: 'Enter' });
+    await screen.findByRole('heading', { level: 1, name: 'Paper · Diffusion study' });
+    expect(router.state.location.pathname).toBe(`/w/${WORKSPACE}/projects/01JB000000000000000PRJ0001`);
+    expect(screen.queryByRole('combobox')).toBeNull();
+  });
   it("shows a stub feature's nav entry in the sidebar and routes to its page", async () => {
     const stub = defineFeature({
       id: 'stub',

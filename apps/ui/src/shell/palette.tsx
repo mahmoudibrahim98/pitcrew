@@ -2,7 +2,7 @@
 // and sessions from the live query cache, plus the features' commands and "+ New" items. Keyboard
 // first (the ARIA combobox pattern); results are virtualised. Loaded on demand.
 
-import { useRouter } from '@tanstack/react-router';
+import { useParams, useRouter } from '@tanstack/react-router';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useId, useRef, useState, type KeyboardEvent } from 'react';
 import { useProjects, useSessions, useTasks, useWorkstreams } from '../data/index.ts';
@@ -38,6 +38,7 @@ interface Item {
   hint: string;
   keys?: readonly string[];
   fields: readonly string[];
+  href?: string;
   run(): void;
 }
 
@@ -58,6 +59,7 @@ function useItems(opener: Element | null): Item[] {
   const router = useRouter();
   const ws = useWorkspaceId();
   const layout = useLayout();
+  const params: { task?: string; session?: string } = useParams({ strict: false });
   const registry = useRegistry();
   const setCreating = useShell((s) => s.setCreating);
   const projects = useProjects().data ?? [];
@@ -73,8 +75,22 @@ function useItems(opener: Element | null): Item[] {
     create: (id) => setCreating(id, opener),
   };
   const projectName = new Map(projects.map((p) => [p.id, p.name]));
+  const actionItems: Item[] = [];
+  if (params.task !== undefined) {
+    for (const [label, field] of [['Move open task…', 'Status'], ['Assign open task…', 'Assignee'], ['Dispatch open task…', 'Dispatch to']] as const) {
+      const main = document.getElementById('main');
+      const control = main?.querySelector<HTMLSelectElement>(`select[aria-label="${field}"]`) ??
+        [...(main?.querySelectorAll('label') ?? [])].filter((node) => node.textContent?.trim() === field).map((node) => document.getElementById(node.htmlFor)).find((node) => node instanceof HTMLSelectElement);
+      if (!(control instanceof HTMLSelectElement) || control.disabled) continue;
+      actionItems.push({ id: `action:${field}`, kind: 'command', label, hint: 'Open task', fields: [label], run: () => window.setTimeout(() => { control.scrollIntoView({ block: 'nearest' }); control.focus(); }, 0) });
+    }
+  }
+  if (params.session !== undefined && sessions.some((session) => session.id === params.session)) {
+    actionItems.push({ id: 'action:link', kind: 'command', label: 'Link open session…', hint: 'Open session', fields: ['link open session task workstream'], run: () => useShell.getState().setLinkingSession(params.session ?? null) });
+  }
 
   return [
+    ...actionItems,
     ...registry.commands
       .filter((c) => inLayout(c.layout, layout))
       .map<Item>((c) => ({
@@ -102,6 +118,7 @@ function useItems(opener: Element | null): Item[] {
       label: p.name,
       code: p.key,
       hint: 'Project',
+      href: paths.project(ws, p.id),
       fields: [p.name, p.key],
       run: () => go(paths.project(ws, p.id)),
     })),
@@ -110,6 +127,7 @@ function useItems(opener: Element | null): Item[] {
       kind: 'workstream',
       label: w.name,
       hint: projectName.get(w.project) ?? 'Workstream',
+      href: paths.workstream(ws, w.project, w.id),
       fields: [w.name, projectName.get(w.project) ?? ''],
       run: () => go(paths.workstream(ws, w.project, w.id)),
     })),
@@ -119,6 +137,7 @@ function useItems(opener: Element | null): Item[] {
       label: t.title,
       code: t.key,
       hint: 'Task',
+      href: paths.task(ws, t.key),
       fields: [t.key, t.title],
       run: () => go(paths.task(ws, t.key)),
     })),
@@ -128,6 +147,7 @@ function useItems(opener: Element | null): Item[] {
       label: s.title ?? s.status_line ?? s.cwd,
       code: s.engine,
       hint: `Session · ${s.state}`,
+      href: paths.session(ws, s.id),
       fields: [s.title ?? '', s.status_line ?? '', s.engine, s.branch ?? '', s.cwd],
       run: () => go(paths.session(ws, s.id)),
     })),
@@ -138,12 +158,18 @@ function Results({ close, opener }: { close(): void; opener: Element | null }) {
   // TanStack Virtual keeps state in a mutable object the compiler cannot see change.
   'use no memo';
   const items = useItems(opener);
+  const ws = useWorkspaceId();
+  const recent = useShell((s) => s.workspaces[ws]?.recent);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
   const listId = useId();
 
-  const results = query.trim() === '' ? items : rank(query, items, (item) => item.fields);
+  const recentItems = (recent ?? []).flatMap((href) => {
+    const item = items.find((entry) => entry.href === href.split('?')[0]);
+    return item === undefined ? [] : [{ ...item, hint: `Recent · ${item.hint}` }];
+  });
+  const results = query.trim() === '' ? [...recentItems, ...items.filter((item) => !recentItems.some((entry) => entry.id === item.id))] : rank(query, items, (item) => item.fields);
   const current = Math.min(active, Math.max(results.length - 1, 0));
   // eslint-disable-next-line react-hooks/incompatible-library -- opted out of memoisation above
   const virtualizer = useVirtualizer({
@@ -181,6 +207,9 @@ function Results({ close, opener }: { close(): void; opener: Element | null }) {
     } else if (event.key === 'Enter') {
       event.preventDefault();
       choose(results[current]);
+    } else if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault();
+      moveTo(event.key === 'Home' ? 0 : results.length - 1);
     }
   }
 
@@ -283,7 +312,7 @@ export function Palette() {
         onCloseAutoFocus={(event) => {
           event.preventDefault();
           // A "New …" result opened its dialog, which holds focus now.
-          if (useShell.getState().creating !== null) return;
+          if (useShell.getState().creating !== null || useShell.getState().linkingSession !== null) return;
           const navigated = hrefAtRun.current !== null && hrefAtRun.current !== window.location.href;
           const target = navigated ? document.getElementById('main') : opener;
           if (target instanceof HTMLElement && target.isConnected) target.focus();

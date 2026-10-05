@@ -1,5 +1,12 @@
 # shell (stream L)
 
+The loading screen appears while lazy routes load, with a static first-paint message in
+`index.html`. Navigation uses SVG icons even for entries that omit their own icon.
+The palette puts up to twelve recently visited live items first, scoped to the workspace;
+deleted items disappear. On an open task it focuses the existing status, assignee or dispatch
+control, and on an open session it opens the existing link dialog. No palette command silently
+submits a change. Home/End, arrows, Page Up/Down and Enter navigate the results.
+
 The frame every feature lives in: the sidebar, the two layouts and their switcher, the
 workspace-scoped routes, the palette, the Orchestrator panel frame, "+ New", and the **feature
 registration interface** through which the console (M), projects (N) and onboarding (O) plug in.

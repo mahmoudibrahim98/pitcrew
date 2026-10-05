@@ -4,6 +4,7 @@ export { Button } from './button.tsx';
 export { Dialog, DialogClose, DialogContent, DialogFooter, DialogTrigger } from './dialog.tsx';
 export { FOCUS_RING } from './focus.ts';
 export * from './icons.tsx';
+export { EngineLogo, ENGINE_NAMES } from './engine-logo.tsx';
 export { Kbd } from './kbd.tsx';
 export {
   Menu,
