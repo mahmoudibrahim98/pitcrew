@@ -258,7 +258,8 @@ Onboarding hooks use synthetic in-memory configuration text, person/machine-boun
 
 ## Settings after setup
 
-`settings.ts` mirrors owner metadata/workspace naming and device profile/default-agent edits.
+`settings.ts` mirrors owner metadata/workspace naming and device profile edits; recipe edits
+reuse the directory route and ownership checks.
 It validates the same fields and authors the existing directory events, without reading any
 filesystem or invoking a CLI. The data folder and log destination are synthetic.
 Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.
