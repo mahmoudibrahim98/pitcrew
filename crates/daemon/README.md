@@ -735,6 +735,10 @@ one module and one line of the routes in `src/serve.rs`.
   prefix of each transcript, one indexed row of an OpenCode store). A first `progress` frame goes
   out at once; the walk's ticks (at most every 100 ms) wait for no client: one reading slowly
   misses some, never the last tick or the last frame.
+- **Detected agents:** before a successful report is sent, the hub atomically creates an owned
+  agent member and default-permission persona for each engine with a positive session count.
+  Existing owned agents with that engine are reused; `@office` has no persona and does not count.
+  Repeated scans create no duplicates. Empty, failed and disconnected scans provision nothing.
 - **What it logs:** one line per scan, `scanned this machine's agent homes`, with its counts and
   how long it took, at info. Never a path: the report goes to the person who asked, and nowhere
   else.

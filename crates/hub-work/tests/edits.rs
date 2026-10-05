@@ -844,6 +844,7 @@ fn project_statuses_default_in_the_command_too() {
         .create_project(
             &person(SAM),
             pitcrew_hub_work::NewProject {
+                first_workstream: None,
                 key: ProjectKey::new("CMD").expect("key"),
                 name: "Through the command".into(),
                 lead: None,
@@ -861,6 +862,7 @@ fn project_statuses_default_in_the_command_too() {
         .create_project(
             &agent(WRITER),
             pitcrew_hub_work::NewProject {
+                first_workstream: None,
                 key: ProjectKey::new("AGT").expect("key"),
                 name: "By an agent".into(),
                 lead: None,

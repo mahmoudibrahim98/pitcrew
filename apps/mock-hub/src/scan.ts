@@ -8,7 +8,7 @@
 // the client went away meanwhile (409 for a second one).
 
 import type { Hub } from './state.ts';
-import type { MachineId, ScanFrame, ScanReport } from './types.ts';
+import type { MachineId, MemberId, ScanFrame, ScanReport } from './types.ts';
 import { conflict, notFound } from './validate.ts';
 
 /** Where a streamed answer's lines go: `server.ts` writes them to the response. */
@@ -16,6 +16,7 @@ export interface LineSink {
   /** Writes one line (it ends with `\n`); dropped once the client has gone. */
   write(line: string): void;
   end(): void;
+  canceled?(): boolean;
 }
 
 /** A route's answer written over time, as newline-delimited JSON. */
@@ -40,7 +41,7 @@ function runningOn(hub: Hub): Set<MachineId> {
 }
 
 /** Checks the request and claims the machine; the answer, written once `server.ts` starts it. */
-export function startScan(hub: Hub, id: string): StreamedBody {
+export function startScan(hub: Hub, id: string, person: MemberId): StreamedBody {
   const machine = hub.findMachine(id);
   if (machine === undefined) {
     throw notFound(`No machine ${id}.`);
@@ -70,6 +71,9 @@ export function startScan(hub: Hub, id: string): StreamedBody {
         hub.later(step * i, () => send({ type: 'progress', scanned, total, ...(path === undefined ? {} : { path }) }));
       }
       hub.later(hub.delays.scan, () => {
+        if (!sink.canceled?.()) {
+          hub.ensureEngineAgents(person, report.counts.by_engine.filter((e) => e.count > 0).map((e) => e.engine));
+        }
         send({ type: 'done', report });
         machines.delete(machine.id);
         sink.end();
