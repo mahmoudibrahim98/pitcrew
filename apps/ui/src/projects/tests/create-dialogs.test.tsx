@@ -92,7 +92,7 @@ describe('create dialogs against the mock hub', () => {
     fireEvent.click(dialog.getByRole('button', { name: 'Create' }));
     expect(await dialog.findByRole('alert')).toHaveProperty('textContent', 'Enter an absolute path for this machine.');
     expect((await api.projects()).some((p) => p.name === 'Synthetic project')).toBe(false);
-    fill(dialog, 'Root path', '/home/sam/synthetic');
+    fill(dialog, 'Root path', process.platform === 'win32' ? 'C:/synthetic/project' : '/home/sam/synthetic');
     fireEvent.click(dialog.getByRole('button', { name: 'Create' }));
     expect((await dialog.findByRole('alert')).textContent).toContain('PAP');
     fill(dialog, 'Key', 'SYN');
