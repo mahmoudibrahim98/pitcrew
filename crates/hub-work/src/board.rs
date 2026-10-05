@@ -591,7 +591,7 @@ impl WorkService {
         self.check_draft_proposer(caller, id)?;
         let shape = checked_shape(proposal)?;
         let choice = self.import_choice();
-        let _guard = self.lock();
+        let guard = self.lock();
         let (draft, proposal) = self.read(|c| {
             let draft = find(c, id)?;
             proposer(caller, &draft)?;
@@ -632,7 +632,9 @@ impl WorkService {
                 note: proposal.note,
             },
         )])?;
-        // Its one thing is done: its token stops now, and its CLI is ended.
+        drop(guard);
+        // Its one thing is done: its token stops now, and its CLI is ended (without the command
+        // lock: the runner link never waits on the service, but it need not hold it either).
         self.finish_confined(&draft.session);
         self.board_draft(id)
     }
