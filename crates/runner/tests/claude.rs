@@ -414,18 +414,22 @@ fn a_deleted_transcript_is_dropped_and_keeps_its_session_if_it_returns() {
         "the deletion is noticed"
     );
 
+    sink.wait_for(4, WAIT)
+        .expect("deleted transcript becomes idle");
+    assert_eq!(common::label(&sink.events()[3]), "state:Idle");
+
     // A file comes back at the path (restored, or rewritten; it may even reuse the inode): same
     // session, read again from the start.
     std::fs::write(&path, lines.concat()).unwrap();
     runner.rescan();
-    sink.wait_for(4, WAIT).expect("events after it came back");
+    sink.wait_for(7, WAIT).expect("events after it came back");
     std::thread::sleep(Duration::from_millis(300));
     runner.stop();
     let events = sink.events();
     assert!(events[3..].iter().all(|e| session_of(e) == Some(session)));
     assert_eq!(
-        labels(&events[3..5]),
-        ["tool:TodoWrite", "tool:Read"],
+        labels(&events[3..7]),
+        ["state:Idle", "state:Working", "tool:TodoWrite", "tool:Read"],
         "from the start: {:?}",
         labels(&events)
     );

@@ -15,6 +15,28 @@ use crate::model::{
 use crate::runner::Capability;
 use serde::{Deserialize, Serialize};
 
+/// Launch choices advertised by a reachable machine's runner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SessionOptions {
+    /// Absolute path syntax: `windows` or `unix`.
+    pub platform: String,
+    /// Executable agent CLIs, with their supported permission modes.
+    pub engines: Vec<SessionEngine>,
+}
+
+/// One installed CLI's launch options.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SessionEngine {
+    /// CLI engine.
+    pub engine: crate::model::Engine,
+    /// Modes supported by this engine and allowed by this runner.
+    pub permission_modes: Vec<crate::model::PermissionMode>,
+    /// Characters a first prompt cannot pass through this installed CLI's wrapper.
+    pub first_prompt_forbidden: Vec<String>,
+}
+
 /// The revision a person has read in a workspace, project or workstream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]

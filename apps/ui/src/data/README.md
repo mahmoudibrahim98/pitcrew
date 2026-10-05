@@ -224,6 +224,11 @@ splits `summary.text` into its receipted clauses and the plain joining text, con
 byte spans correctly — never `summary.text.slice(span.range.start, span.range.end)`, which is
 wrong as soon as the text holds a character outside ASCII.
 
+`api.sessionOptions(machine)` reads installed engines/platform/allowed modes;
+`api.startSession(start)` sends the launch request and returns the new session with its terminal.
+The console's shared dialog sets that detail cache immediately and invalidates session lists;
+the stream also carries the discovery. Titles and first prompts remain in the dialog until sent.
+
 `api.createPersona`/`editPersona` and `createTeam`/`editTeam` use the device-only directory write
 routes. Their `persona_saved`, `member_added` and `team_saved` events already invalidate the shared
 lists; creation forms also refresh their own lists on success. Machines expose their optional

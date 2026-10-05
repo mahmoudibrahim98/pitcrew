@@ -269,6 +269,13 @@ test.tsx`'s proposal tests use the mock's demo data (the PAP project brief has a
 for Accept and Keep current; a `next` step on the proposal itself is injected at the `fetch` layer
 (`withProposedNext`) since that fixture's own proposal has none.
 
+## Start session
+
+A workstream's **Start session** opens the console's shared New session dialog with its
+machine and folder prefilled from the workstream's locations. Multiple locations remain
+selectable. The console owns launching and opens the resulting session's terminal in the
+workbench; this entry does not register another shell create item.
+
 ## Creation dialogs
 
 `new-entities.tsx` owns Project, Agent, Team and contextual Workstream entries. Project suggests an

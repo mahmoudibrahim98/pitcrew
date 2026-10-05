@@ -873,5 +873,19 @@ export interface BriefEdit {
   pinned: boolean;
 }
 
+export interface SessionOptions {
+  platform: 'windows' | 'unix';
+  engines: { engine: Engine; permission_modes: PermissionMode[]; first_prompt_forbidden?: string[] }[];
+}
+export interface StartSession {
+  workstream?: WorkstreamId;
+  machine: MachineId;
+  engine: Engine;
+  cwd: string;
+  permission_mode?: PermissionMode;
+  brief?: string;
+  title?: string;
+}
+
 export type PersonaEdit = Omit<Persona, 'id'>;
 export type TeamEdit = Omit<Team, 'id'>;
