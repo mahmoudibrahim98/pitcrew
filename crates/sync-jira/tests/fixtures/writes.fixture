@@ -5,6 +5,13 @@ HTTP/1.1 201
 
 {"id":"10013","key":"DEMO-13","self":"https://jira.example.com/rest/api/3/issue/10013"}
 ### pitcrew-github-fixture ###
+GET https://jira.example.com/rest/api/3/issue/DEMO-13?fields=summary%2Cdescription%2Cstatus%2Clabels%2Cparent%2Cissuetype%2Cupdated HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 200
+
+{"id":"10013","key":"DEMO-13","fields":{"summary":"Write the release notes","description":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"For v1."}]}]},"status":{"statusCategory":{"key":"new"}},"labels":["needs-triage"],"parent":{"key":"DEMO-5"},"issuetype":{"name":"Task"},"updated":"2026-01-03T09:00:00.000+0000"}}
+### pitcrew-github-fixture ###
 POST https://jira.example.com/rest/api/3/issue/DEMO-13/comment HTTP/1.1
 Accept: application/json
 

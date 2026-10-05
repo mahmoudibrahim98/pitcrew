@@ -1,5 +1,6 @@
 //! Outward writes against recorded fixtures (`tests/fixtures/writes.fixture`): each approved write
-//! is exactly one request, carrying exactly its fields, and a refusal is reported, never retried.
+//! is exactly its requests, each carrying exactly its fields (labels as a change, never the whole
+//! list), and a refusal is reported, never retried.
 
 use pitcrew_sync_github::fixture::ReplayTransport;
 use pitcrew_sync_github::write::{IssueEdit, IssueWrite, StateChange, WriteConfig, WriteError};
@@ -25,7 +26,7 @@ fn repo() -> RepoRef {
 }
 
 #[tokio::test]
-async fn each_write_is_one_request_with_exactly_its_fields() {
+async fn each_write_sends_exactly_its_fields_and_labels_as_a_change() {
     let transport = transport();
     let config = config();
     let created = pitcrew_sync_github::write::send(
@@ -92,6 +93,29 @@ async fn each_write_is_one_request_with_exactly_its_fields() {
             message: "Validation Failed".into()
         }
     );
+    // Read before an edit, then labels as a change: one added, one removed, the rest kept.
+    let now = pitcrew_sync_github::write::read_issue(&transport, &config, &repo(), 8)
+        .await
+        .expect("read");
+    assert_eq!(
+        now.labels,
+        vec!["docs".to_string(), "needs triage".to_string()]
+    );
+    pitcrew_sync_github::write::send(
+        &transport,
+        &config,
+        &IssueWrite::Edit {
+            repo: repo(),
+            number: 8,
+            edit: IssueEdit {
+                add_labels: vec!["release".into()],
+                remove_labels: vec!["needs triage".into()],
+                ..IssueEdit::default()
+            },
+        },
+    )
+    .await
+    .expect("relabelled");
 
     let sent = transport.requests_sent();
     let shown: Vec<(Method, String, Value)> = sent
@@ -100,7 +124,11 @@ async fn each_write_is_one_request_with_exactly_its_fields() {
             (
                 r.method,
                 r.url.clone(),
-                serde_json::from_slice(&r.body).expect("JSON body"),
+                if r.body.is_empty() {
+                    Value::Null
+                } else {
+                    serde_json::from_slice(&r.body).expect("JSON body")
+                },
             )
         })
         .collect();
@@ -128,6 +156,17 @@ async fn each_write_is_one_request_with_exactly_its_fields() {
                 Method::Patch,
                 format!("{api}/issues/1"),
                 json!({"milestone": 99})
+            ),
+            (Method::Get, format!("{api}/issues/8"), Value::Null),
+            (
+                Method::Post,
+                format!("{api}/issues/8/labels"),
+                json!({"labels": ["release"]})
+            ),
+            (
+                Method::Delete,
+                format!("{api}/issues/8/labels/needs%20triage"),
+                Value::Null
             ),
         ]
     );

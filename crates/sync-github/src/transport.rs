@@ -24,6 +24,8 @@ pub enum Method {
     Patch,
     /// `PUT`: change a Jira issue.
     Put,
+    /// `DELETE`: remove one label from a GitHub issue.
+    Delete,
 }
 
 impl Method {
@@ -35,6 +37,7 @@ impl Method {
             Method::Post => "POST",
             Method::Patch => "PATCH",
             Method::Put => "PUT",
+            Method::Delete => "DELETE",
         }
     }
 }

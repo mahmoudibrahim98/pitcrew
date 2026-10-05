@@ -88,6 +88,13 @@ pub struct IssueSnapshot {
     pub(crate) assignees: Vec<String>,
     pub(crate) milestone_number: Option<u64>,
     pub(crate) updated_at: GithubTimestamp,
+    /// Whether `title` is exactly the title GitHub sent: nothing hidden was stripped, nothing was
+    /// cut. `false` in a state saved before this was kept, until the issue is read again.
+    #[serde(default)]
+    pub(crate) title_lossless: bool,
+    /// Whether `body` is exactly the body GitHub sent (as for `title_lossless`).
+    #[serde(default)]
+    pub(crate) body_lossless: bool,
 }
 
 impl IssueSnapshot {
@@ -125,6 +132,18 @@ impl IssueSnapshot {
     #[must_use]
     pub fn milestone_number(&self) -> Option<u64> {
         self.milestone_number
+    }
+
+    /// Whether [`Self::title`] is exactly what GitHub sent, so writing it back loses nothing.
+    #[must_use]
+    pub fn title_lossless(&self) -> bool {
+        self.title_lossless
+    }
+
+    /// Whether [`Self::body`] is exactly what GitHub sent, so writing it back loses nothing.
+    #[must_use]
+    pub fn body_lossless(&self) -> bool {
+        self.body_lossless
     }
 }
 

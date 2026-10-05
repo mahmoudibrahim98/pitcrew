@@ -1,10 +1,13 @@
 //! Outward writes against recorded fixtures (`tests/fixtures/writes.fixture`), Jira Cloud: each
 //! approved write is exactly one request with exactly its fields (a transition reads the
-//! workflow's transitions first), and a refusal is reported, never retried.
+//! workflow's transitions first; labels change by `update`, never as a whole list), the issue is
+//! read as Jira has it now, and a refusal is reported, never retried.
 
 use pitcrew_sync_github::fixture::ReplayTransport;
 use pitcrew_sync_github::transport::Method;
-use pitcrew_sync_jira::write::{Flavor, IssueEdit, IssueWrite, WriteConfig, WriteError, send};
+use pitcrew_sync_jira::write::{
+    Flavor, IssueEdit, IssueWrite, WriteConfig, WriteError, read_issue, send,
+};
 use pitcrew_sync_jira::{JiraAuth, ProjectRef, StatusCategory};
 use serde_json::{Value, json};
 
@@ -34,7 +37,7 @@ fn text(t: &str) -> Value {
 }
 
 #[tokio::test]
-async fn each_write_is_one_request_with_exactly_its_fields() {
+async fn each_write_is_one_request_with_exactly_its_fields_and_labels_as_a_change() {
     let transport = transport();
     let config = config();
     let created = send(
@@ -51,6 +54,17 @@ async fn each_write_is_one_request_with_exactly_its_fields() {
     .await
     .expect("created");
     assert_eq!(created.key.as_deref(), Some("DEMO-13"));
+    let now = read_issue(&transport, &config, "DEMO-13")
+        .await
+        .expect("read");
+    assert_eq!(now.summary, "Write the release notes");
+    assert_eq!(now.labels, vec!["needs-triage".to_string()]);
+    assert_eq!(now.category, StatusCategory::New);
+    assert_eq!(now.epic.as_deref(), Some("DEMO-5"));
+    assert_eq!(
+        (now.description.as_str(), now.description_lossless),
+        ("For v1.\n", true)
+    );
     send(
         &transport,
         &config,
@@ -68,7 +82,8 @@ async fn each_write_is_one_request_with_exactly_its_fields() {
             key: "DEMO-13".into(),
             edit: IssueEdit {
                 summary: Some("Write the v1 release notes".into()),
-                labels: Some(vec!["docs".into()]),
+                add_labels: vec!["docs".into()],
+                remove_labels: vec!["needs-triage".into()],
                 ..IssueEdit::default()
             },
         },
@@ -126,6 +141,13 @@ async fn each_write_is_one_request_with_exactly_its_fields() {
                     "project": {"key": "DEMO"}, "issuetype": {"name": "Task"}}}))
             ),
             (
+                Method::Get,
+                format!(
+                    "{api}/issue/DEMO-13?fields=summary%2Cdescription%2Cstatus%2Clabels%2Cparent%2Cissuetype%2Cupdated"
+                ),
+                None
+            ),
+            (
                 Method::Post,
                 format!("{api}/issue/DEMO-13/comment"),
                 Some(json!({"body": text("Drafted in PitCrew.")}))
@@ -133,8 +155,8 @@ async fn each_write_is_one_request_with_exactly_its_fields() {
             (
                 Method::Put,
                 format!("{api}/issue/DEMO-13"),
-                Some(json!({"fields": {"summary": "Write the v1 release notes",
-                    "labels": ["docs"]}}))
+                Some(json!({"fields": {"summary": "Write the v1 release notes"},
+                    "update": {"labels": [{"add": "docs"}, {"remove": "needs-triage"}]}}))
             ),
             (
                 Method::Get,

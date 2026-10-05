@@ -8,19 +8,28 @@
 //! - [`IssueWrite::Create`]: `POST {api}/issue`;
 //! - [`IssueWrite::Comment`]: `POST {api}/issue/{key}/comment`;
 //! - [`IssueWrite::Edit`]: `PUT {api}/issue/{key}` with only the fields it sets (summary,
-//!   description, labels, the epic);
+//!   description, the epic) and labels as a change (`update.labels`, `add` and `remove`), never
+//!   the whole list, so labels it does not name are kept;
 //! - [`IssueWrite::Transition`]: a read of `GET {api}/issue/{key}/transitions`, then `POST` of the
 //!   first transition into the wanted status category (Done to close, To Do to reopen). No such
 //!   transition means nothing is sent.
+//!
+//! Two reads serve a write, never the sync: [`read_issue`] (`GET {api}/issue/{key}`), which the
+//! hub compares with what the write expects just before an edit or a transition, and
+//! [`find_earlier`], which looks for an earlier attempt at a create or a comment before it is sent
+//! again.
 //!
 //! Issue keys are checked before they reach a URL (`^[A-Z][A-Z0-9_]*-[1-9][0-9]*$`, as the read
 //! side checks them). Answers are untrusted: messages are capped and stripped of hidden
 //! characters, and a created issue's key must have that shape too.
 
 use crate::auth::JiraAuth;
+use crate::change::{description_is_lossless, description_text};
+use crate::deployment::percent_encode;
 use crate::jql::ProjectRef;
 use crate::state::StatusCategory;
-use crate::wire::looks_like_issue_key;
+use crate::time::JiraTimestamp;
+use crate::wire::{WireFields, looks_like_issue_key};
 use pitcrew_sync_github::bounds::{cap_chars, strip_hidden};
 use pitcrew_sync_github::transport::{Method, Request, Response, Transport};
 use serde_json::{Value, json};
@@ -92,17 +101,31 @@ pub fn adf(text: &str) -> Value {
     json!({"type": "doc", "version": 1, "content": content})
 }
 
-/// The fields an edit sets; `None` leaves a field as it is.
+/// The fields an edit sets; `None` (or an empty list) leaves a field as it is.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IssueEdit {
     /// New summary.
     pub summary: Option<String>,
     /// New description.
     pub description: Option<String>,
-    /// The whole new label list.
-    pub labels: Option<Vec<String>>,
+    /// Labels to add; the issue's other labels are kept.
+    pub add_labels: Vec<String>,
+    /// Labels to remove, as Jira spells them; the issue's other labels are kept.
+    pub remove_labels: Vec<String>,
     /// The epic's key.
     pub epic: Option<String>,
+}
+
+impl IssueEdit {
+    /// Whether it changes nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.summary.is_none()
+            && self.description.is_none()
+            && self.epic.is_none()
+            && self.add_labels.is_empty()
+            && self.remove_labels.is_empty()
+    }
 }
 
 /// One write to one Jira site.
@@ -292,14 +315,27 @@ pub fn request(
                 config,
                 edit.summary.as_deref(),
                 edit.description.as_deref(),
-                edit.labels.as_deref(),
+                None,
                 edit.epic.as_deref(),
             )?;
+            let mut body = serde_json::Map::new();
+            if !f.is_empty() {
+                body.insert("fields".into(), Value::Object(f));
+            }
+            let labels: Vec<Value> = edit
+                .add_labels
+                .iter()
+                .map(|l| json!({ "add": l }))
+                .chain(edit.remove_labels.iter().map(|l| json!({ "remove": l })))
+                .collect();
+            if !labels.is_empty() {
+                body.insert("update".into(), json!({ "labels": labels }));
+            }
             with_body(
                 config,
                 Method::Put,
                 format!("{api}/issue/{}", checked_key(key)?),
-                &json!({ "fields": f }),
+                &Value::Object(body),
             )
         }
         IssueWrite::Transition { key, .. } => {
@@ -454,6 +490,184 @@ pub async fn send<T: Transport>(
             key: None,
             url: Some(browse(key)),
         }),
+    }
+}
+
+fn get(config: &WriteConfig, url: String) -> Request {
+    Request {
+        method: Method::Get,
+        url,
+        headers: headers(config, false),
+        body: Vec::new(),
+    }
+}
+
+async fn read_json<T: Transport>(transport: &T, request: Request) -> Result<Value, WriteError> {
+    let response = exchange(transport, request).await?;
+    if let Some(e) = refused(&response) {
+        return Err(e);
+    }
+    serde_json::from_slice(&response.body)
+        .map_err(|_| WriteError::Unsupported("Jira's answer is not JSON.".into()))
+}
+
+/// An issue as Jira has it now: what an edit or a transition is checked against just before it is
+/// sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueNow {
+    /// Its summary, exactly as Jira sent it.
+    pub summary: String,
+    /// Its description as text, as the sync reads it.
+    pub description: String,
+    /// Whether `description` is the whole description (see
+    /// [`crate::change::description_is_lossless`]).
+    pub description_lossless: bool,
+    /// Its labels, as Jira spells them.
+    pub labels: Vec<String>,
+    /// Its status category.
+    pub category: StatusCategory,
+    /// Its epic's key (Cloud's `parent`, else Data Center's epic link field).
+    pub epic: Option<String>,
+}
+
+/// Reads issue `key` as Jira has it now (`GET {api}/issue/{key}?fields=…`): one request.
+///
+/// # Errors
+///
+/// [`WriteError::Unsupported`] for a malformed key (nothing is sent) or an answer without the
+/// issue's fields; [`WriteError::Refused`] for any status but 2xx; [`WriteError::Unreachable`]
+/// when the transport fails.
+pub async fn read_issue<T: Transport>(
+    transport: &T,
+    config: &WriteConfig,
+    key: &str,
+) -> Result<IssueNow, WriteError> {
+    let mut wanted = "summary,description,status,labels,parent,issuetype,updated".to_owned();
+    if let (Flavor::DataCenter, Some(field)) = (config.flavor, &config.epic_link_field) {
+        wanted.push(',');
+        wanted.push_str(field);
+    }
+    let url = format!(
+        "{}/issue/{}?fields={}",
+        config.api(),
+        checked_key(key)?,
+        percent_encode(&wanted)
+    );
+    let answer = read_json(transport, get(config, url)).await?;
+    let fields: WireFields = answer
+        .get("fields")
+        .cloned()
+        .and_then(|f| serde_json::from_value(f).ok())
+        .ok_or_else(|| WriteError::Unsupported("Jira's answer has no issue fields.".into()))?;
+    let description = description_text(&fields.description);
+    let epic_link = match config.flavor {
+        Flavor::Cloud => None,
+        Flavor::DataCenter => config.epic_link_field.as_deref(),
+    };
+    Ok(IssueNow {
+        description_lossless: description_is_lossless(fields.description.as_ref(), &description),
+        description,
+        epic: fields.epic_key(epic_link),
+        category: StatusCategory::from_key(&fields.status.status_category.key),
+        labels: fields.labels,
+        summary: fields.summary,
+    })
+}
+
+/// Whether Jira's `created` is no earlier than `since_unix` (seconds).
+fn created_since(item: &Value, since_unix: i64) -> bool {
+    item.get("created")
+        .and_then(Value::as_str)
+        .and_then(|at| JiraTimestamp::new(at).to_instant())
+        .is_some_and(|at| at.as_second() >= since_unix)
+}
+
+/// Text as Jira holds what this module wrote: `config.text(text)`, or nothing for an empty
+/// description Jira may keep as `null`.
+fn holds_text(config: &WriteConfig, value: Option<&Value>, text: &str) -> bool {
+    match value {
+        None | Some(Value::Null) => text.trim().is_empty(),
+        Some(value) => *value == config.text(text),
+    }
+}
+
+/// Looks upstream for an earlier attempt at `write`, made since `since_unix` (seconds): for a
+/// create, an issue the credential's own account reported in its project with exactly its summary
+/// and description (a search, newest first); for a comment, one on the issue with exactly its
+/// text (the newest 100). One request; an edit or a transition has none and finds nothing. Before
+/// a create or a comment is sent again, so a first attempt that arrived although its answer was
+/// lost is not made twice.
+///
+/// # Errors
+///
+/// [`WriteError::Unsupported`] for a malformed key (nothing is sent) or an answer that is not
+/// JSON; [`WriteError::Refused`] for any status but 2xx; [`WriteError::Unreachable`] when the
+/// transport fails.
+pub async fn find_earlier<T: Transport>(
+    transport: &T,
+    config: &WriteConfig,
+    write: &IssueWrite,
+    since_unix: i64,
+) -> Result<Option<Written>, WriteError> {
+    let api = config.api();
+    let site = config.site.trim_end_matches('/');
+    match write {
+        IssueWrite::Create {
+            project,
+            summary,
+            description,
+            ..
+        } => {
+            let jql = format!(
+                "project = \"{}\" AND reporter = currentUser() ORDER BY created DESC",
+                project.as_str()
+            );
+            let (path, paging) = match config.flavor {
+                Flavor::Cloud => ("/search/jql", ""),
+                Flavor::DataCenter => ("/search", "&startAt=0"),
+            };
+            let url = format!(
+                "{api}{path}?jql={}{paging}&maxResults=50&fields={}",
+                percent_encode(&jql),
+                percent_encode("summary,description,created")
+            );
+            let answer = read_json(transport, get(config, url)).await?;
+            Ok(answer
+                .get("issues")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|issue| {
+                    let f = issue.get("fields");
+                    f.is_some_and(|f| {
+                        created_since(f, since_unix)
+                            && f.get("summary").and_then(Value::as_str) == Some(summary.as_str())
+                            && holds_text(config, f.get("description"), description)
+                    })
+                })
+                .and_then(|issue| issue.get("key").and_then(Value::as_str))
+                .filter(|key| looks_like_issue_key(key))
+                .map(|key| Written {
+                    key: Some(key.to_owned()),
+                    url: Some(format!("{site}/browse/{key}")),
+                }))
+        }
+        IssueWrite::Comment { key, body } => {
+            let key = checked_key(key)?;
+            let url = format!("{api}/issue/{key}/comment?orderBy=-created&maxResults=100");
+            let answer = read_json(transport, get(config, url)).await?;
+            Ok(answer
+                .get("comments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|c| created_since(c, since_unix) && holds_text(config, c.get("body"), body))
+                .then(|| Written {
+                    key: None,
+                    url: Some(format!("{site}/browse/{key}")),
+                }))
+        }
+        IssueWrite::Edit { .. } | IssueWrite::Transition { .. } => Ok(None),
     }
 }
 
@@ -646,6 +860,132 @@ mod tests {
             Err(WriteError::Unsupported(_))
         ));
         assert!(none.requests_sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_edit_of_labels_alone_sends_only_the_change() {
+        let url = "https://jira.example.com/rest/api/2/issue/DEMO-1";
+        let transport = ReplayTransport::from_exchanges(vec![answer("PUT", url, 204, "")]);
+        let write = IssueWrite::Edit {
+            key: "DEMO-1".into(),
+            edit: IssueEdit {
+                remove_labels: vec!["billing".into()],
+                ..IssueEdit::default()
+            },
+        };
+        send(&transport, &data_center(None), &write).await.unwrap();
+        assert_eq!(
+            body(&transport.requests_sent()[0]),
+            json!({"update": {"labels": [{"remove": "billing"}]}}),
+            "no fields, and never the whole list"
+        );
+        assert!(IssueEdit::default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_issue_is_read_with_its_epic_link_field_on_data_center() {
+        let url = "https://jira.example.com/rest/api/2/issue/DEMO-1?fields=summary%2Cdescription%2Cstatus%2Clabels%2Cparent%2Cissuetype%2Cupdated%2Ccustomfield_10008";
+        let transport = ReplayTransport::from_exchanges(vec![answer(
+            "GET",
+            url,
+            200,
+            r#"{"key":"DEMO-1","fields":{"summary":"S","description":"Plain *wiki* text.","status":{"statusCategory":{"key":"done"}},"labels":["a"],"issuetype":{"name":"Task"},"updated":"2026-01-01T00:00:00.000+0000","customfield_10008":"DEMO-5"}}"#,
+        )]);
+        let now = read_issue(
+            &transport,
+            &data_center(Some("customfield_10008")),
+            "DEMO-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            now,
+            IssueNow {
+                summary: "S".into(),
+                description: "Plain *wiki* text.".into(),
+                description_lossless: true,
+                labels: vec!["a".into()],
+                category: StatusCategory::Done,
+                epic: Some("DEMO-5".into()),
+            }
+        );
+        // A malformed key reads nothing.
+        let none = ReplayTransport::from_exchanges(vec![]);
+        assert!(matches!(
+            read_issue(&none, &cloud(), "DEMO-1/../x").await,
+            Err(WriteError::Unsupported(_))
+        ));
+        assert!(none.requests_sent().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_earlier_attempt_is_found_by_its_exact_text_since_it_was_approved() {
+        // 2026-03-01T10:00:00Z
+        let since = 1_772_359_200;
+        let search = format!(
+            "{API}/search/jql?jql=project%20%3D%20%22DEMO%22%20AND%20reporter%20%3D%20currentUser%28%29%20ORDER%20BY%20created%20DESC&maxResults=50&fields=summary%2Cdescription%2Ccreated"
+        );
+        let doc = |t: &str| adf(t).to_string();
+        let issues = format!(
+            r#"{{"issues":[
+              {{"key":"DEMO-15","fields":{{"summary":"Notes","description":{},"created":"2026-03-01T09:00:00.000+0000"}}}},
+              {{"key":"DEMO-14","fields":{{"summary":"Notes","description":{},"created":"2026-03-01T10:05:00.000+0000"}}}},
+              {{"key":"DEMO-13","fields":{{"summary":"Notes","description":{},"created":"2026-03-01T11:01:00.000+0100"}}}}
+            ]}}"#,
+            doc("For v1."),
+            doc("For v2."),
+            doc("For v1.")
+        );
+        let transport = ReplayTransport::from_exchanges(vec![answer("GET", &search, 200, &issues)]);
+        let create = IssueWrite::Create {
+            project: ProjectRef::new("DEMO").unwrap(),
+            summary: "Notes".into(),
+            description: "For v1.".into(),
+            labels: vec![],
+            epic: None,
+        };
+        // Not the one made before, not the one with another description.
+        assert_eq!(
+            find_earlier(&transport, &cloud(), &create, since)
+                .await
+                .unwrap(),
+            Some(Written {
+                key: Some("DEMO-13".into()),
+                url: Some("https://jira.example.com/browse/DEMO-13".into()),
+            })
+        );
+        let comments = format!("{API}/issue/DEMO-1/comment?orderBy=-created&maxResults=100");
+        let listed = format!(
+            r#"{{"comments":[{{"id":"1","body":{},"created":"2026-03-01T09:59:00.000+0000"}}]}}"#,
+            doc("Done.")
+        );
+        let transport = ReplayTransport::from_exchanges(vec![
+            answer("GET", &comments, 200, &listed),
+            answer("GET", &comments, 200, &listed.replace("09:59", "10:01")),
+        ]);
+        let comment = IssueWrite::Comment {
+            key: "DEMO-1".into(),
+            body: "Done.".into(),
+        };
+        assert_eq!(
+            find_earlier(&transport, &cloud(), &comment, since)
+                .await
+                .unwrap(),
+            None,
+            "a comment made before the approval is not this one"
+        );
+        assert!(
+            find_earlier(&transport, &cloud(), &comment, since)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            transport
+                .requests_sent()
+                .iter()
+                .all(|r| r.method == Method::Get)
+        );
     }
 
     #[test]
