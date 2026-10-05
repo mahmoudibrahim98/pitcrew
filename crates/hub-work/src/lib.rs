@@ -13,7 +13,7 @@
 //!   sessions, for the runner link);
 //! - board drafts: an agent drafts a workstream's board from its history, and nothing is created
 //!   until a person accepts it ([`WorkService::start_draft`]; the routes are
-//!   [`board_agent_routes`] and [`board_device_routes`], mounted apart from the others);
+//!   [`board_session_routes`] and [`board_device_routes`], mounted apart from the others);
 //! - [`SyncCommands`]: what a tracker sync (GitHub, Jira) changes in the hub, as the sync's own
 //!   member with `Mover::Sync`, and [`links`], the workstream links a sync routes issues by;
 //! - [`writes`]: outward writes to GitHub and Jira, each proposed with an approval ask and started
@@ -99,11 +99,11 @@ mod sync;
 pub mod writes;
 
 pub use activity::EventRefs;
-pub use board_routes::{board_agent_routes, board_device_routes};
+pub use board_routes::{board_device_routes, board_session_routes};
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, SessionLink, WorkstreamPatch};
 pub use dispatch::{
-    DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT, MAX_BRIEF, NEVER_STARTED,
-    NewDispatch, RecordedStart, SessionRequest,
+    CONFINED_BRIEF, Confinement, DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT,
+    MAX_BRIEF, NEVER_STARTED, NewDispatch, PROMPT_FILE, RecordedStart, SessionRequest,
 };
 pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};

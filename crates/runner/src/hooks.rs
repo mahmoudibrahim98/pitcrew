@@ -100,6 +100,7 @@ impl Sender {
         let scope = match self.0.scope {
             TokenScope::Device => 0,
             TokenScope::Agent => 1,
+            TokenScope::Session(_) => 2,
         };
         (self.0.member, scope, self.0.on_behalf_of)
     }
@@ -112,6 +113,9 @@ pub(crate) fn refusal(sender: &Sender, agent: &SessionAgent) -> Option<&'static 
     // Every scope and every answer is matched explicitly: a new one must be decided here.
     match (caller.scope, agent) {
         (_, SessionAgent::Unknown) => Some("the session's agent is unknown"),
+        // A session token answers only for its own run's resource; it sends no hooks (the API
+        // refuses it on the hook routes before this).
+        (TokenScope::Session(_), _) => Some("a session token sends no hooks"),
         (TokenScope::Agent, SessionAgent::Agent { agent: runs_as, .. }) => {
             (*runs_as != caller.member).then_some("the session is another agent's")
         }

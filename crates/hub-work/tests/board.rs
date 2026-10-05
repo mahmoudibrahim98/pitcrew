@@ -1,18 +1,22 @@
 //! Board drafts through the routes (api-v1.md, "Board drafts"): the preview sends nothing, the
-//! start sends what the preview showed, only the drafting agent proposes, and **nothing is
-//! created until a person accepts it**; rejected items create nothing. A test double stands in
-//! for the runner link.
+//! start sends what the preview showed, confined, only the drafting session's own token proposes
+//! (and the session is finished then), and **nothing is created until a person accepts it**;
+//! rejected items create nothing. A test double stands in for the runner link.
 
 mod common;
 
 use axum::Router;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use common::{RUNNER, SAM, SEED_RUNS, SUBMISSION, WRITER, agent, call, demo, expect, open, person};
-use pitcrew_hub_work::{
-    DispatchError, DispatchRequest, Dispatcher, SessionRequest, TaskFilter, WorkService,
-    agent_routes, board_agent_routes, board_device_routes, device_routes,
+use common::{
+    PAPER, PARSERS, RUNNER, SAM, SEED_RUNS, SUBMISSION, TOOLING, WRITER, agent, call, demo, expect,
+    open, person,
 };
+use pitcrew_hub_work::{
+    CONFINED_BRIEF, DispatchError, DispatchRequest, Dispatcher, SessionRequest, TaskFilter,
+    WorkService, agent_routes, board_device_routes, board_session_routes, device_routes,
+};
+use pitcrew_protocol::api::{Caller, NewTask, TokenScope};
 use pitcrew_protocol::board::{DRAFTED_LABEL, MAX_PROPOSAL_BYTES};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{SessionId, WorkstreamId};
@@ -20,6 +24,7 @@ use pitcrew_protocol::import::{ImportFilter, ImportMode};
 use pitcrew_protocol::model::{Engine, LinkBasis, PermissionMode, Receipt, Session, SessionState};
 use serde_json::{Value, json};
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const LAPTOP: &str = "01JB000000000000000MCH0001";
@@ -30,10 +35,11 @@ const SES2: &str = "01JB000000000000000SES0002";
 /// A synthetic token, of a shape the redaction knows; never a real one.
 const TOKEN: &str = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";
 
-/// Records every start, and answers as told.
+/// Records every start and every finish, and answers as told.
 #[derive(Debug)]
 struct Recorder {
     starts: Mutex<Vec<SessionRequest>>,
+    finished: Mutex<Vec<SessionId>>,
     fail: Option<DispatchError>,
 }
 
@@ -41,6 +47,7 @@ impl Recorder {
     fn new(fail: Option<DispatchError>) -> Arc<Self> {
         Arc::new(Self {
             starts: Mutex::new(Vec::new()),
+            finished: Mutex::new(Vec::new()),
             fail,
         })
     }
@@ -48,6 +55,15 @@ impl Recorder {
     fn starts(&self) -> Vec<SessionRequest> {
         self.starts.lock().expect("starts").clone()
     }
+
+    fn finished(&self) -> Vec<SessionId> {
+        self.finished.lock().expect("finished").clone()
+    }
+}
+
+/// Where the test double says a confined session runs: a synthetic private folder.
+fn folder_of(session: &SessionId) -> String {
+    format!("/home/sam/.cache/pitcrew/scratch/{}", session.0)
 }
 
 impl Dispatcher for Recorder {
@@ -58,6 +74,34 @@ impl Dispatcher for Recorder {
     fn start_session(&self, request: &SessionRequest) -> Result<(), DispatchError> {
         self.starts.lock().expect("starts").push(request.clone());
         self.fail.clone().map_or(Ok(()), Err)
+    }
+
+    fn confined_folder(&self, session: &SessionId) -> Option<String> {
+        Some(folder_of(session))
+    }
+
+    fn finish_session(&self, session: &SessionId) -> Result<(), DispatchError> {
+        self.finished.lock().expect("finished").push(*session);
+        Ok(())
+    }
+}
+
+/// The session token the hub's runner link would give a draft's CLI: bound to its session, acting
+/// as its agent for the agent's owner.
+fn drafter(draft: &Value) -> Caller {
+    let session: SessionId = draft["session"]
+        .as_str()
+        .expect("session")
+        .parse()
+        .expect("session id");
+    Caller {
+        member: draft["agent"]
+            .as_str()
+            .expect("agent")
+            .parse()
+            .expect("agent id"),
+        scope: TokenScope::Session(session),
+        on_behalf_of: Some(SAM.parse().expect("sam")),
     }
 }
 
@@ -87,7 +131,7 @@ async fn require_device(request: axum::extract::Request, next: Next) -> Response
 /// The work routes and the board routes, mounted as the daemon mounts them.
 fn app(work: &Arc<WorkService>) -> Router {
     agent_routes()
-        .merge(board_agent_routes())
+        .merge(board_session_routes())
         .merge(
             device_routes()
                 .merge(board_device_routes())
@@ -360,8 +404,9 @@ async fn nothing_is_created_until_the_person_accepts_and_rejected_items_create_n
         ["session_discovered", "board_draft_started"]
     );
     assert_eq!(task_count(&work), tasks);
-    // The agent's CLI starts where the workstream is, with the prompt the preview showed, naming
-    // its draft.
+    // The agent's CLI starts confined in a private folder of its own, never the workstream's,
+    // with the prompt the preview showed, naming its draft; and never in its persona's mode
+    // (@writer's is accept-edits).
     let starts = runner.starts();
     assert_eq!(starts.len(), 1);
     let request = &starts[0];
@@ -369,9 +414,32 @@ async fn nothing_is_created_until_the_person_accepts_and_rejected_items_create_n
         request.session.0.to_string(),
         draft["session"].as_str().expect("session")
     );
-    assert_eq!(request.cwd, "/home/sam/work/diffusion-paper/paper");
+    assert_eq!(request.cwd, folder_of(&request.session));
+    assert_eq!(request.branch, None);
     assert_eq!(request.engine, Engine::Claude);
-    assert_eq!(request.permission_mode, PermissionMode::AcceptEdits);
+    assert_eq!(request.permission_mode, PermissionMode::Default);
+    let confinement = request.confinement.clone().expect("confined");
+    assert_eq!(confinement.commands, ["board submit"]);
+    assert_eq!(confinement.writes, ["proposal.json"]);
+    assert_eq!(
+        confinement.max_runtime,
+        std::time::Duration::from_secs(30 * 60)
+    );
+    match request.start_command() {
+        pitcrew_protocol::runner::RunnerCommand::StartSession {
+            brief,
+            confined,
+            permission_mode,
+            cwd,
+            ..
+        } => {
+            assert!(confined);
+            assert_eq!(permission_mode, PermissionMode::Default);
+            assert_eq!(brief.as_deref(), Some(CONFINED_BRIEF));
+            assert_eq!(cwd, folder_of(&request.session));
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(
         request
             .brief
@@ -385,6 +453,7 @@ async fn nothing_is_created_until_the_person_accepts_and_rejected_items_create_n
     );
     let session = work.session(&request.session).expect("session");
     assert_eq!(session.state, SessionState::Starting);
+    assert_eq!(session.cwd, folder_of(&request.session));
     assert_eq!(session.agent, Some(WRITER.parse().expect("writer")));
     assert_eq!(
         session.workstream,
@@ -392,10 +461,13 @@ async fn nothing_is_created_until_the_person_accepts_and_rejected_items_create_n
     );
     assert_eq!(session.task, None);
 
-    // The agent proposes: still nothing created.
+    // The draft's session token proposes: still nothing created; and its session is finished
+    // (its token stops, its CLI is ended).
+    assert!(runner.finished().is_empty());
     let rev = latest(&work);
-    let res = propose(&work, &id, agent(WRITER), three_tasks()).await;
+    let res = propose(&work, &id, drafter(&draft), three_tasks()).await;
     expect(&res, 201);
+    assert_eq!(runner.finished(), [request.session]);
     assert_eq!(res.1["state"], "proposed");
     assert_eq!(
         res.1["proposal"]["tasks"].as_array().expect("tasks").len(),
@@ -406,7 +478,7 @@ async fn nothing_is_created_until_the_person_accepts_and_rejected_items_create_n
     assert_eq!(task_count(&work), tasks);
     // Once only.
     expect(
-        &propose(&work, &id, agent(WRITER), three_tasks()).await,
+        &propose(&work, &id, drafter(&draft), three_tasks()).await,
         409,
     );
 
@@ -500,7 +572,7 @@ async fn accepting_none_creates_nothing_and_another_draft_may_start() {
     expect(&again, 409);
 
     expect(
-        &propose(&work, &id, agent(WRITER), three_tasks()).await,
+        &propose(&work, &id, drafter(&draft), three_tasks()).await,
         201,
     );
     let shown = preview(&work, SUBMISSION).await;
@@ -541,19 +613,84 @@ async fn accepting_none_creates_nothing_and_another_draft_may_start() {
     );
 }
 
+/// A service whose clock the test sets.
+fn service_at(dir: &Path, runner: Arc<Recorder>, now: Arc<AtomicI64>) -> Arc<WorkService> {
+    let demo = demo();
+    let work = WorkService::new(open(&dir.join("hub.db")), demo.workspace.clone())
+        .with_hub_machine(LAPTOP.parse().expect("machine"))
+        .with_clock(Arc::new(move || now.load(Ordering::SeqCst)))
+        .with_dispatcher(runner);
+    let work = Arc::new(work);
+    work.seed(&demo).expect("seed");
+    work
+}
+
+/// A task for `workstream`, made by Sam: a change to what its draft would send.
+fn add_task(work: &WorkService, workstream: &str, title: &str) {
+    let project = if workstream == PARSERS {
+        TOOLING
+    } else {
+        PAPER
+    };
+    work.create_task(
+        &person(SAM),
+        NewTask {
+            project: project.parse().expect("project"),
+            workstream: Some(workstream.parse().expect("workstream")),
+            title: title.into(),
+            description: None,
+            status: None,
+            priority: None,
+            assignee: None,
+            labels: None,
+            due: None,
+        },
+    )
+    .expect("task");
+}
+
 #[tokio::test]
-async fn a_start_needs_the_preview_the_person_saw() {
+async fn a_start_sends_the_preview_the_person_saw() {
     let dir = tempfile::tempdir().expect("tempdir");
     let runner = Recorder::new(None);
-    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let now = Arc::new(AtomicI64::new(1_790_900_000_000));
+    let work = service_at(dir.path(), Arc::clone(&runner), Arc::clone(&now));
+
+    // The workstream moves on after its preview (a new session's work): a start with that
+    // preview's digest, while it is kept, sends exactly what the person saw.
     let shown = preview(&work, SUBMISSION).await;
-    // The workstream changes: a new session's work.
-    noisy_session(&work);
-    let rev = latest(&work);
+    let noisy = noisy_session(&work);
+    now.fetch_add(9 * 60 * 1000, Ordering::SeqCst);
     let res = start(
         &work,
         SUBMISSION,
         json!({ "agent": WRITER, "digest": shown["digest"] }),
+    )
+    .await;
+    expect(&res, 202);
+    let request = &runner.starts()[0];
+    assert!(
+        request
+            .brief
+            .contains(shown["summary"].as_str().expect("summary"))
+    );
+    assert!(!request.brief.contains(&noisy.0.to_string()));
+    assert_eq!(
+        request.brief.len() as u64,
+        shown["cost"]["prompt_bytes"].as_u64().expect("bytes")
+    );
+    assert_eq!(res.1["cost"], shown["cost"]);
+
+    // A preview the person has seen a newer one of starts nothing.
+    let first = preview(&work, SEED_RUNS).await;
+    add_task(&work, SEED_RUNS, "Synthetic new task");
+    let newer = preview(&work, SEED_RUNS).await;
+    assert_ne!(first["digest"], newer["digest"]);
+    let rev = latest(&work);
+    let res = start(
+        &work,
+        SEED_RUNS,
+        json!({ "agent": WRITER, "digest": first["digest"] }),
     )
     .await;
     expect(&res, 409);
@@ -563,16 +700,115 @@ async fn a_start_needs_the_preview_the_person_saw() {
             .expect("message")
             .contains("preview")
     );
+    // Nor one kept past its time, once the workstream changed.
+    let old = preview(&work, SEED_RUNS).await;
+    now.fetch_add(11 * 60 * 1000, Ordering::SeqCst);
+    add_task(&work, SEED_RUNS, "Another synthetic task");
+    let rev_after = latest(&work);
+    expect(
+        &start(
+            &work,
+            SEED_RUNS,
+            json!({ "agent": WRITER, "digest": old["digest"] }),
+        )
+        .await,
+        409,
+    );
     for body in [
         json!({ "agent": WRITER }),
         json!({ "agent": WRITER, "digest": "00" }),
         json!([]),
     ] {
-        let res = start(&work, SUBMISSION, body.clone()).await;
+        let res = start(&work, SEED_RUNS, body.clone()).await;
         assert!(matches!(res.0, 400 | 409), "{body}: {res:?}");
     }
-    assert_eq!(latest(&work), rev, "a refused start stores nothing");
-    assert!(runner.starts().is_empty());
+    assert_eq!(latest(&work), rev_after, "a refused start stores nothing");
+    assert!(rev_after > rev);
+    assert_eq!(runner.starts().len(), 1);
+    // A preview kept past its time still starts while the workstream is as it was.
+    let kept = preview(&work, SEED_RUNS).await;
+    now.fetch_add(11 * 60 * 1000, Ordering::SeqCst);
+    expect(
+        &start(
+            &work,
+            SEED_RUNS,
+            json!({ "agent": WRITER, "digest": kept["digest"] }),
+        )
+        .await,
+        202,
+    );
+}
+
+/// The daemon ends every draft still running when it starts (their session tokens were in its
+/// memory): each draft ends, and the dispatcher finishes its session.
+#[tokio::test]
+async fn running_drafts_end_when_the_hub_restarts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(None);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let draft = started(&work, SUBMISSION).await;
+    let session: SessionId = draft["session"]
+        .as_str()
+        .expect("session")
+        .parse()
+        .expect("id");
+    assert_eq!(work.running_draft_sessions().expect("running"), [session]);
+    assert_eq!(
+        work.end_running_drafts("the hub restarted").expect("end"),
+        1
+    );
+    assert_eq!(runner.finished(), [session]);
+    assert_eq!(
+        work.session(&session).expect("session").state,
+        SessionState::Ended
+    );
+    let drafts = work.board_drafts(None).expect("drafts");
+    assert_eq!(drafts[0].state, pitcrew_protocol::board::DraftState::Ended);
+    assert!(work.running_draft_sessions().expect("running").is_empty());
+    assert_eq!(work.end_running_drafts("again").expect("end"), 0);
+    // A confined session ends once, however often it is ended.
+    let rev = latest(&work);
+    work.end_confined_session(&session, "again").expect("end");
+    assert_eq!(latest(&work), rev);
+}
+
+/// One board-draft event that cannot be read hides no other draft: it is logged and skipped.
+#[tokio::test]
+async fn an_unreadable_draft_event_is_skipped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = service(dir.path(), Some(Recorder::new(None)));
+    let first = started(&work, SUBMISSION).await;
+    let second = started(&work, SEED_RUNS).await;
+    {
+        // The log is append-only: a damaged event (or one a newer hub wrote) is appended.
+        let conn = pitcrew_store::sql::Connection::open(dir.path().join("hub.db")).expect("db");
+        conn.execute(
+            "INSERT INTO events (id, at, workspace, author, on_behalf_of, type, data)
+             VALUES ('synthetic-damaged-1', 0, 'w', 'a', NULL, 'board_draft_started',
+                     '{\"draft\": 7}')",
+            [],
+        )
+        .expect("damage");
+    }
+    let ids: Vec<String> = work
+        .board_drafts(None)
+        .expect("drafts")
+        .iter()
+        .map(|d| d.id.0.to_string())
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            second["id"].as_str().expect("id"),
+            first["id"].as_str().expect("id")
+        ]
+    );
+    let id: pitcrew_protocol::ids::DraftId =
+        first["id"].as_str().expect("id").parse().expect("draft id");
+    assert_eq!(
+        work.board_draft(&id).expect("draft").state,
+        pitcrew_protocol::board::DraftState::Running
+    );
 }
 
 #[tokio::test]
@@ -615,8 +851,27 @@ async fn who_may_start_propose_and_review() {
     assert_eq!(office.1["agent"], "01JB000000000000000MEM0006");
     let id = office.1["id"].as_str().expect("id").to_owned();
 
-    // Only the drafting agent proposes: not a person, not another agent, not @writer.
-    for who in [person(SAM), agent(RUNNER), agent(WRITER)] {
+    // Only the draft's own session token proposes: not a person, not another agent, not @office's
+    // own agent token, and not another session's token of @office's.
+    let office_agent = Caller {
+        member: "01JB000000000000000MEM0006".parse().expect("office"),
+        scope: TokenScope::Agent,
+        on_behalf_of: Some(SAM.parse().expect("sam")),
+    };
+    let elsewhere = Caller {
+        scope: TokenScope::Session(SessionId::new()),
+        ..office_agent
+    };
+    let mut as_runner = drafter(&office.1);
+    as_runner.member = RUNNER.parse().expect("runner");
+    for who in [
+        person(SAM),
+        agent(RUNNER),
+        agent(WRITER),
+        office_agent,
+        elsewhere,
+        as_runner,
+    ] {
         expect(&propose(&work, &id, who, three_tasks()).await, 403);
     }
     // Before the body is read: a forbidden caller hears 403 whatever it sent.
@@ -634,7 +889,7 @@ async fn who_may_start_propose_and_review() {
         &propose(
             &work,
             "01J00000000000000000000000",
-            agent(WRITER),
+            drafter(&office.1),
             three_tasks(),
         )
         .await,
@@ -647,12 +902,10 @@ async fn who_may_start_propose_and_review() {
 
     // Nothing to review yet.
     expect(&review(&work, &id, json!([])).await, 409);
-    let office = pitcrew_protocol::api::Caller {
-        member: "01JB000000000000000MEM0006".parse().expect("office"),
-        scope: pitcrew_protocol::api::TokenScope::Agent,
-        on_behalf_of: Some(SAM.parse().expect("sam")),
-    };
-    expect(&propose(&work, &id, office, three_tasks()).await, 201);
+    expect(
+        &propose(&work, &id, drafter(&office.1), three_tasks()).await,
+        201,
+    );
     // Agents never review, and never read drafts.
     let res = call(
         &app,
@@ -689,7 +942,7 @@ async fn proposals_are_bounded_checked_and_redacted() {
         json!(["not-an-id"]),
     ] {
         expect(
-            &propose(&work, &id, agent(WRITER), task(evidence)).await,
+            &propose(&work, &id, drafter(&draft), task(evidence)).await,
             400,
         );
     }
@@ -704,7 +957,7 @@ async fn proposals_are_bounded_checked_and_redacted() {
         json!([]),
         json!({"tasks": [{"title": "T", "status": "todo", "description": "d".repeat(MAX_PROPOSAL_BYTES)}]}),
     ] {
-        let res = propose(&work, &id, agent(WRITER), body).await;
+        let res = propose(&work, &id, drafter(&draft), body).await;
         expect(&res, 400);
     }
     // Still running: nothing was stored.
@@ -721,7 +974,7 @@ async fn proposals_are_bounded_checked_and_redacted() {
     let res = propose(
         &work,
         &id,
-        agent(WRITER),
+        drafter(&draft),
         json!({
             "tasks": [{"title": format!("  Rotate {TOKEN}  "), "status": "todo",
                        "description": "Mail sam@example.com", "evidence": [noisy, noisy]}],
@@ -778,7 +1031,7 @@ async fn a_draft_whose_session_ends_without_a_proposal_has_ended() {
     .await;
     assert_eq!(one.1["state"], "ended");
     expect(
-        &propose(&work, &id, agent(WRITER), three_tasks()).await,
+        &propose(&work, &id, drafter(&draft), three_tasks()).await,
         409,
     );
     expect(&review(&work, &id, json!([])).await, 409);
@@ -857,7 +1110,7 @@ async fn sessions_the_import_choice_hides_are_neither_sent_nor_evidence() {
     let res = propose(
         &work,
         id,
-        agent(WRITER),
+        drafter(&draft),
         json!({"tasks": [{"title": "T", "status": "todo", "evidence": [SES1]}]}),
     )
     .await;

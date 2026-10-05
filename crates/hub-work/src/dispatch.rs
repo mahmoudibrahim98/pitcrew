@@ -135,6 +135,7 @@ impl DispatchRequest {
             account: None,
             permission_mode: self.permission_mode,
             session: Some(self.session),
+            confined: false,
         }
     }
 }
@@ -187,8 +188,9 @@ pub trait Dispatcher: Send + Sync + std::fmt::Debug {
 
     /// Starts a session the hub stored for an agent outside a dispatch: a board draft's
     /// (`crate::board`). Called as [`Dispatcher::start`] is, with the session already stored
-    /// (`starting`, the agent named); on an error the hub ends it. The default refuses, as
-    /// [`DispatchError::Unavailable`].
+    /// (`starting`, the agent named); on an error the hub ends it. A request with a
+    /// [`Confinement`] is a run PitCrew starts on its own behalf: see [`Confinement`] for what the
+    /// runner link must do. The default refuses, as [`DispatchError::Unavailable`].
     ///
     /// # Errors
     ///
@@ -199,6 +201,63 @@ pub trait Dispatcher: Send + Sync + std::fmt::Debug {
             "this hub's runner link starts only dispatched sessions".into(),
         ))
     }
+
+    /// The private folder a confined session `session` will run in, for the hub's record of it
+    /// (its `cwd`), asked before it is stored. `None` (the default): the runner link chooses at
+    /// start, and the session's folder is known once the runner reports it.
+    fn confined_folder(&self, session: &SessionId) -> Option<String> {
+        let _ = session;
+        None
+    }
+
+    /// A confined session has done its one thing (a draft's proposal is in): its token must stop
+    /// working **now**, before this returns, and its CLI is to be ended soon after, without
+    /// blocking the caller. Also called to end one the hub gave up on. The default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError`]: the runner link could not do it; the hub logs it.
+    fn finish_session(&self, session: &SessionId) -> std::result::Result<(), DispatchError> {
+        let _ = session;
+        Ok(())
+    }
+}
+
+/// The one line a confined session's CLI is started with: its prompt is in [`PROMPT_FILE`], in
+/// its folder. Plain words, so it passes a Windows `.cmd` shim (pitcrew-ptyd refuses
+/// `" % ! ^ & | < > ( )` there) and shows nothing of the prompt on the command line.
+pub const CONFINED_BRIEF: &str =
+    "Read the file prompt.md in this folder and follow its instructions.";
+
+/// The file in a confined session's folder that holds its prompt.
+pub const PROMPT_FILE: &str = "prompt.md";
+
+/// How a run PitCrew starts on its own behalf is confined: a board draft's now (`crate::board`),
+/// and every such run after it. The hub decides it; the runner link carries it out, for every CLI
+/// alike, whatever the person's own settings for that CLI say:
+///
+/// - **A fresh private folder**: made new for the session (never reused), owner-only, outside the
+///   PitCrew state directory, holding only [`PROMPT_FILE`] (the request's `brief`) and the CLI's
+///   settings files; removed when the session ends. The request's `cwd` is ignored.
+/// - **The CLI's confined launch shape** (the runner's `StartSession` with `confined`), started
+///   with [`CONFINED_BRIEF`], in the default permission mode (the request's is ignored).
+/// - **Its settings files** pre-approve only `pitcrew <command> …` for each of [`Self::commands`]
+///   and writing each of [`Self::writes`] in the folder, and deny what the CLI's settings can deny
+///   (web fetch and search; the state directory).
+/// - **A session token** (`TokenScope::Session`) bound to the session, in place of its agent's
+///   token: it reaches only the routes mounted for session tokens, for this session's own
+///   resource. Kept in memory only; revoked at [`Dispatcher::finish_session`], when the session
+///   ends, and with the daemon.
+/// - **At most [`Self::max_runtime`]**: then its CLI is ended, and its session with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Confinement {
+    /// The `pitcrew` commands the CLI may run without asking, each as its words after `pitcrew`
+    /// (`board submit`).
+    pub commands: Vec<String>,
+    /// The files in its folder it may write without asking (`proposal.json`).
+    pub writes: Vec<String>,
+    /// The longest it runs.
+    pub max_runtime: std::time::Duration,
 }
 
 /// A session the hub stored for an agent outside a dispatch (a board draft's), for
@@ -227,24 +286,38 @@ pub struct SessionRequest {
     pub permission_mode: PermissionMode,
     /// The session's name.
     pub name: String,
-    /// The first prompt.
+    /// The first prompt; for a confined session, the contents of its [`PROMPT_FILE`].
     pub brief: String,
+    /// A run PitCrew starts on its own behalf: how it is confined. `None` for a session a
+    /// person starts, which runs as they set it up.
+    pub confinement: Option<Confinement>,
 }
 
 impl SessionRequest {
-    /// The runner command that starts it.
+    /// The runner command that starts it. A confined session starts in `default` mode with
+    /// [`CONFINED_BRIEF`], never its prompt, on the command line.
     #[must_use]
     pub fn start_command(&self) -> RunnerCommand {
+        let confined = self.confinement.is_some();
         RunnerCommand::StartSession {
             engine: self.engine,
             cwd: self.cwd.clone(),
             name: self.name.clone(),
-            brief: Some(self.brief.clone()),
+            brief: Some(if confined {
+                CONFINED_BRIEF.to_owned()
+            } else {
+                self.brief.clone()
+            }),
             persona: self.persona,
             model: self.model.clone(),
             account: None,
-            permission_mode: self.permission_mode,
+            permission_mode: if confined {
+                PermissionMode::Default
+            } else {
+                self.permission_mode
+            },
             session: Some(self.session),
+            confined,
         }
     }
 }
@@ -683,6 +756,38 @@ impl WorkService {
         Ok(())
     }
 
+    /// Ends a confined session in the log (a draft's that ran past its time, or that the hub
+    /// gave up on): `session_ended`, authored by its agent for its owner, unless it has ended
+    /// already. Whether the runner reported it or not. Its CLI is the runner link's to end.
+    ///
+    /// # Errors
+    ///
+    /// `not_found` for an unknown session; database errors.
+    pub fn end_confined_session(&self, session: &SessionId, reason: &str) -> Result<()> {
+        let _guard = self.lock();
+        let (found, owner) = self.read(|c| {
+            let found = query::session(c, session)?
+                .ok_or_else(|| WorkError::not_found(format!("No session {session}.")))?;
+            let owner = match &found.agent {
+                Some(agent) => query::member(c, agent)?.and_then(|m| m.owner),
+                None => None,
+            };
+            Ok((found, owner))
+        })?;
+        if found.state == SessionState::Ended {
+            return Ok(());
+        }
+        let author = match found.agent {
+            Some(agent) => agent,
+            None => self.read(query::first_person)?.ok_or_else(|| {
+                WorkError::internal("a session is stored, but the workspace has no person")
+            })?,
+        };
+        tracing::info!(%session, reason, "ending a confined session");
+        self.append(&[self.event(author, owner, EventBody::SessionEnded { session: *session })])?;
+        Ok(())
+    }
+
     /// Sessions on `machine` that the hub stored ahead of the runner and the runner has not
     /// reported yet (state `starting`, no CLI id): what the runner link reconciles.
     ///
@@ -864,5 +969,20 @@ pub(crate) fn refused(error: &DispatchError) -> WorkError {
         DispatchError::Failed(why) => {
             WorkError::internal(format!("the session could not start: {why}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The line a confined run's CLI is started with passes a Windows `.cmd` shim: pitcrew-ptyd
+    /// refuses control characters and `" % ! ^ & | < > ( )` in a batch file's arguments.
+    #[test]
+    fn the_confined_brief_is_cmd_safe_and_names_the_prompt_file() {
+        assert!(!CONFINED_BRIEF.chars().any(|c| c.is_control()
+            || matches!(c, '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>' | '(' | ')')));
+        assert!(CONFINED_BRIEF.contains(PROMPT_FILE));
+        assert!(CONFINED_BRIEF.len() < 100);
     }
 }

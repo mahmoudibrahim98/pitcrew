@@ -1,14 +1,20 @@
 //! A board draft, end to end: the real binary with a seeded demo, its terminals in the
 //! pitcrew-ptyd cargo built next to it, and a stand-in `claude` first on its `PATH` that answers
 //! the draft the way the prompt asks, **through the real `pitcrew` CLI** cargo built next to
-//! `pitcrewd` (`pitcrew board submit <draft>`, with the agent's token file the daemon gave it).
+//! `pitcrewd` (`pitcrew board submit <draft> --file proposal.json`, with the session token's file
+//! the daemon gave it).
 //!
 //! The test previews a workstream's draft, starts it with the preview's digest, and checks that:
-//! - the stand-in was started as the drafting agent with the prompt the preview measured, naming
-//!   its draft and the workstream's session, with an agent token's file and no token in its
-//!   environment;
-//! - its proposal arrives (`pitcrew` exits 0), a second one is refused (`pitcrew` exits 4), and
-//!   **no task exists** until the person reviews it;
+//! - the stand-in was started confined (`--permission-mode=default --setting-sources=project
+//!   --strict-mcp-config`), with one short line on its command line, in a fresh private folder
+//!   of its own outside the state directory and the workstream's folder, holding only
+//!   `prompt.md` (the prompt the preview measured, naming its draft and the workstream's session)
+//!   and `.claude/settings.json`; with a session token's file, not its agent's, and no token in
+//!   its environment;
+//! - its session token does nothing else (`pitcrew task list` is refused);
+//! - its proposal arrives (`pitcrew` exits 0), and then its token is gone, so a second one is
+//!   refused; **no task exists** until the person reviews it;
+//! - its CLI is ended soon after, and its folder removed;
 //! - the review creates the accepted task only, labelled `drafted`, and links its evidence session.
 //!
 //! Unix only (the stand-in is a shell script). pitcrew-ptyd and pitcrew must have been built next
@@ -32,29 +38,37 @@ const MARK: &str = "PITCREW_TEST_RUN";
 /// The demo's session on the gpu box, linked to nothing: the draft's evidence.
 const SES5: &str = "01JB000000000000000SES0005";
 
-/// A stand-in for Claude Code started with a draft's prompt: it notes what it was given, then
-/// submits a proposal twice with the real `pitcrew` (`$PITCREW_TEST_CLI`), citing the first
-/// session the summary names, and waits to be ended.
+/// A stand-in for Claude Code started for a draft: it notes what it was given and where, reads
+/// its prompt from `prompt.md`, tries another verb with its token, then writes its proposal to
+/// `proposal.json` and submits it twice with the real `pitcrew` (`$PITCREW_TEST_CLI`), citing the
+/// first session the summary names, and waits to be ended.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 id=
 for arg in "$@"; do
   case "$arg" in --session-id=*) id=${arg#--session-id=} ;; esac
 done
 [ -n "$id" ] || { echo "no --session-id" >&2; exit 2; }
-for prompt in "$@"; do :; done
 out="@OUT@/$id"
 mkdir -p "$out"
-printf '%s' "$prompt" > "$out/prompt"
+printf '%s\n' "$@" > "$out/args"
+pwd > "$out/cwd"
+ls -A > "$out/files"
+ls -ld . | cut -c1-10 > "$out/mode"
+cat .claude/settings.json > "$out/settings" 2> /dev/null
+cp prompt.md "$out/prompt"
+prompt=$(cat prompt.md)
 printf '%s' "${PITCREW_TOKEN_FILE:-}" > "$out/token-file"
 if [ -n "${PITCREW_TOKEN:-}" ]; then : > "$out/token-in-env"; fi
+"$PITCREW_TEST_CLI" task list > /dev/null 2> "$out/other.err"
+echo $? > "$out/other.code"
 draft=$(printf '%s\n' "$prompt" | sed -n 's/^pitcrew board submit \(drf_[0-9A-Z]*\).*/\1/p' | head -n 1)
 evidence=$(printf '%s\n' "$prompt" | sed -n 's/^Session \([0-9A-Z]\{26\}\)$/\1/p' | head -n 1)
-proposal="{\"tasks\": [{\"title\": \"Finish the synthetic paper\", \"status\": \"in_progress\", \"evidence\": [\"$evidence\"]}, {\"title\": \"A synthetic idea\", \"status\": \"backlog\"}], \"note\": \"Drafted by the stand-in.\"}"
-printf '%s' "$proposal" | "$PITCREW_TEST_CLI" board submit "$draft" > "$out/submit.out" 2> "$out/submit.err"
-echo $? > "$out/submit.part" && mv "$out/submit.part" "$out/submit.code"
-printf '%s' "$proposal" | "$PITCREW_TEST_CLI" board submit "$draft" > /dev/null 2> "$out/again.err"
-echo $? > "$out/again.part" && mv "$out/again.part" "$out/again.code"
+printf '%s' "{\"tasks\": [{\"title\": \"Finish the synthetic paper\", \"status\": \"in_progress\", \"evidence\": [\"$evidence\"]}, {\"title\": \"A synthetic idea\", \"status\": \"backlog\"}], \"note\": \"Drafted by the stand-in.\"}" > proposal.json
 trap 'exit 0' INT TERM
+"$PITCREW_TEST_CLI" board submit "$draft" --file proposal.json > "$out/submit.out" 2> "$out/submit.err"
+echo $? > "$out/submit.part" && mv "$out/submit.part" "$out/submit.code"
+"$PITCREW_TEST_CLI" board submit "$draft" --file proposal.json > /dev/null 2> "$out/again.err"
+echo $? > "$out/again.part" && mv "$out/again.part" "$out/again.code"
 while :; do sleep 1; done
 "#;
 
@@ -310,14 +324,75 @@ fn a_stand_in_agent_drafts_a_board_through_pitcrew_and_only_accepted_tasks_are_m
             "Proposed 2 tasks for drf_{draft_id}. Nothing is created until a person reviews it.\n"
         )
     );
-    assert_eq!(
-        read("again.code").trim(),
-        "4",
-        "a second proposal is a conflict"
+    // Once it has proposed, its token is gone: a second proposal is refused.
+    assert!(
+        matches!(read("again.code").trim(), "2" | "3"),
+        "a second proposal is refused: {}",
+        read("again.err")
     );
-    assert!(read("again.err").contains("already has a proposal"));
+    // Its session token does nothing but propose: not even a task list.
+    assert_eq!(read("other.code").trim(), "3", "{}", read("other.err"));
+    assert!(
+        read("other.err").contains("may only answer"),
+        "{}",
+        read("other.err")
+    );
+
+    // Started confined: its shape, and one short line in place of the prompt.
+    let args: Vec<String> = read("args").lines().map(str::to_owned).collect();
+    for flag in [
+        "--permission-mode=default",
+        "--setting-sources=project",
+        "--strict-mcp-config",
+    ] {
+        assert!(args.iter().any(|a| a == flag), "{flag}: {args:?}");
+    }
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some(pitcrew_hub_work::CONFINED_BRIEF)
+    );
+    assert!(
+        !args.iter().any(|a| a.contains(SES5)),
+        "the summary is never on the command line"
+    );
+    // In a fresh private folder of its own, outside the state directory and the workstream's
+    // folder, holding only its prompt and its settings.
+    let cwd = PathBuf::from(read("cwd").trim());
+    assert!(
+        !cwd.starts_with(tmp.path().join("state")),
+        "{}",
+        cwd.display()
+    );
+    assert!(!cwd.starts_with(&paper), "{}", cwd.display());
+    assert!(
+        cwd.ends_with(draft["session"].as_str().unwrap()),
+        "{}",
+        cwd.display()
+    );
+    assert_eq!(
+        read("files").lines().collect::<Vec<_>>(),
+        [".claude", "prompt.md"]
+    );
+    assert_eq!(read("mode").trim(), "drwx------");
+    let settings: Value = serde_json::from_str(&read("settings")).unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"][0],
+        "Bash(pitcrew board submit:*)"
+    );
+    assert!(
+        settings["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d
+                .as_str()
+                .is_some_and(|d| d.starts_with("Read(//") && d.contains("state"))),
+        "{settings}"
+    );
     let prompt = read("prompt");
-    assert!(prompt.contains(&format!("pitcrew board submit drf_{draft_id}")));
+    assert!(prompt.contains(&format!(
+        "pitcrew board submit drf_{draft_id} --file proposal.json"
+    )));
     assert!(prompt.contains(&format!("Session {SES5}")));
     assert_eq!(
         prompt.len() as u64,
@@ -331,11 +406,27 @@ fn a_stand_in_agent_drafts_a_board_through_pitcrew_and_only_accepted_tasks_are_m
         !native.join("token-in-env").exists(),
         "no token in the environment"
     );
+    let session = draft["session"].as_str().unwrap().to_owned();
     let token_file = read("token-file");
     assert!(
-        token_file.ends_with(&format!("{}.token", id::WRITER)),
-        "the CLI was not given the drafting agent's own token file"
+        token_file.ends_with(&format!("sessions/{session}.token")),
+        "the CLI was given its agent's token file, not its session token's"
     );
+    assert!(!token_file.ends_with(&format!("{}.token", id::WRITER)));
+
+    // Its CLI is ended soon after it proposed, and its folder and token file go.
+    eventually("the drafting session ends", || {
+        ok(
+            &daemon.get(&format!("/v1/sessions/{session}"), Some(&device)),
+            200,
+            "session",
+        )["state"]
+            == "ended"
+    });
+    eventually("the draft's folder is removed", || !cwd.exists());
+    eventually("the token file is removed", || {
+        !Path::new(&token_file).exists()
+    });
 
     let proposed = current();
     assert_eq!(proposed["proposal"]["tasks"][0]["evidence"], json!([SES5]));
@@ -365,13 +456,5 @@ fn a_stand_in_agent_drafts_a_board_through_pitcrew_and_only_accepted_tasks_are_m
     );
     assert_eq!(ses5["task"], made[0]["id"]);
 
-    // The drafting session ends with the test.
-    let session = draft["session"].as_str().unwrap();
-    let ended = daemon.post(
-        &format!("/v1/sessions/{session}/end"),
-        Some(&device),
-        &json!({"mode": "kill"}),
-    );
-    assert!(matches!(ended.status, 204 | 409), "{}", ended.body);
     daemon.stop();
 }

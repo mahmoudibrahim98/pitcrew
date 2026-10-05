@@ -393,6 +393,9 @@ fn may_command(caller: Caller, agent: SessionAgent) -> bool {
         (TokenScope::Device, SessionAgent::Agent { owner, .. }) => owner == Some(caller.member),
         (TokenScope::Agent, SessionAgent::NoAgent) => false,
         (TokenScope::Agent, SessionAgent::Agent { agent, .. }) => agent == caller.member,
+        // A session token answers only for its own run's resource (the API refuses it here
+        // before this).
+        (TokenScope::Session(_), _) => false,
     }
 }
 
@@ -610,6 +613,7 @@ async fn start(
         account: None,
         permission_mode,
         session: None,
+        confined: false,
     };
     let commands = runner.commands.clone();
     let checking = command.clone();
@@ -1504,6 +1508,7 @@ mod tests {
             account: None,
             permission_mode: PermissionMode::Default,
             session: Some(recorded.id),
+            confined: false,
         };
         let answer = rt.block_on(sessions.start_recorded(&parts, command, recorded, as_lee, false));
         assert_eq!(code(&answer), "Unavailable");

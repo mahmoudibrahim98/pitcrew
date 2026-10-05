@@ -25,6 +25,7 @@
 
 mod agents;
 mod cli;
+mod confined;
 mod cors;
 mod dispatch;
 mod files;

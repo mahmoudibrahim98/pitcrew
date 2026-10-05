@@ -85,6 +85,33 @@ async fn an_agent_token_on_an_agent_route_sees_the_agent_and_its_owner() {
 }
 
 #[tokio::test]
+async fn a_session_token_reaches_only_the_session_routes() {
+    let f = Fixture::new();
+    for path in [
+        "/v1/me",
+        "/v1/device-only",
+        "/v1/agent-files/x",
+        "/v1/agent-files/x/y",
+    ] {
+        let (status, body) = call(f.app(), get_request(path, Some(&f.session_token))).await;
+        assert_eq!(status, 403, "{path}");
+        assert_eq!(body["code"], "forbidden");
+    }
+    let (status, body) = call(
+        f.app(),
+        get_request("/v1/session-answer", Some(&f.session_token)),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body, serde_json::to_value(f.session).unwrap());
+    // The session routes are open to agents and people too; each checks the session itself.
+    for token in [&f.agent_token, &f.device_token] {
+        let (status, _) = call(f.app(), get_request("/v1/session-answer", Some(token))).await;
+        assert_eq!(status, 200);
+    }
+}
+
+#[tokio::test]
 async fn a_revoked_token_is_unauthorized() {
     let f = Fixture::new();
     let id = f
