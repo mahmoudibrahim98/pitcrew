@@ -75,6 +75,7 @@ fn a_taken_handle_falls_back_to_the_other_one() {
         name: "Someone".into(),
         owner: None,
         persona: None,
+        avatar: None,
     };
     work.store()
         .append(&[Event::now(

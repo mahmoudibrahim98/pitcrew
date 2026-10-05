@@ -1106,6 +1106,7 @@ mod tests {
             name: handle.trim_start_matches('@').into(),
             owner,
             persona: None,
+            avatar: None,
         }
     }
 

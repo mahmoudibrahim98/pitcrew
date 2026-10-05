@@ -162,6 +162,7 @@ impl World {
             name: "Lead".into(),
             owner: None,
             persona: None,
+            avatar: None,
         }];
         for (i, a) in self.agents.iter().enumerate() {
             members.push(agent(*a, self.person, &format!("@agent{}", i + 1)));
@@ -199,6 +200,7 @@ pub fn agent(id: MemberId, owner: MemberId, handle: &str) -> Member {
         name: handle.trim_start_matches('@').into(),
         owner: Some(owner),
         persona: None,
+        avatar: None,
     }
 }
 

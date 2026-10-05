@@ -162,6 +162,7 @@ export interface Member {
   name: string;
   owner?: MemberId;
   persona?: PersonaId;
+  avatar?: { initials: string; colour: string };
 }
 
 export interface Persona {

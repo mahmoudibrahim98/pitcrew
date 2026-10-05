@@ -255,6 +255,7 @@ mod tests {
                 name: "Lee".into(),
                 owner: None,
                 persona: None,
+                avatar: None,
             },
             machine: Machine {
                 id: MachineId::new(),

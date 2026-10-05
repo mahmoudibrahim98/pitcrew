@@ -1244,6 +1244,7 @@ fn someone(kind: MemberKind, handle: &str, owner: Option<MemberId>) -> Member {
         name: handle.trim_start_matches('@').into(),
         owner,
         persona: None,
+        avatar: None,
     }
 }
 

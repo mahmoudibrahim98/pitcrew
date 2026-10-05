@@ -586,6 +586,7 @@ fn member(n: u128, handle: &str) -> Member {
         name: handle.into(),
         owner: None,
         persona: None,
+        avatar: None,
     }
 }
 

@@ -734,3 +734,12 @@ skipped engines. No-change previews cannot set the wizard's installed flag.
 Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
+
+## Settings after setup
+
+Profile edits use `member_added`, preserving identity and ownership while validating names,
+unique handles and avatar initials/colour. Directory version 2 owns `work_avatars`, created
+during projection reset and rebuilt from those same events. Existing default-agent recipe
+edits use `persona_saved`; the workspace owner changes them for future sessions. Workspace
+renaming holds the command lock and calls the daemon persistence seam before changing the
+live name. Settings requests are strict; unchanged profiles and recipes append no event.

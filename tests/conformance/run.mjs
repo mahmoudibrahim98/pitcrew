@@ -244,6 +244,7 @@ try {
     ['tests/conformance/import.test.mjs'],
     ['tests/conformance/integrations.test.mjs'],
     ['tests/conformance/writes.test.mjs'],
+    ['tests/conformance/settings.test.mjs'],
   ]) {
     suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,

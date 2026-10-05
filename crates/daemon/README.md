@@ -1318,3 +1318,10 @@ skipped engines. No-change previews cannot set the wizard's installed flag.
 Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
+
+## Settings after setup
+
+`GET /v1/settings` exposes the data folder, owner, daemon/protocol versions and log destination
+only to the workspace owner. `PUT /v1/settings/workspace` saves the name atomically to
+`workspace.json` before changing the live work service. Device-only profile and existing
+default-agent recipe edits come from hub-work. See api-v1.md, "Settings after setup".

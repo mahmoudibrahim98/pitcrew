@@ -42,6 +42,7 @@ mod runtime;
 mod scan;
 mod serve;
 mod sessions;
+mod settings;
 mod setup;
 mod state;
 mod terminals;

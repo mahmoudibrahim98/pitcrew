@@ -22,6 +22,8 @@ points without control characters; handles follow the setup rules and cannot be 
 - `PUT /v1/settings/workspace`: `{name}` → `Workspace`. Owner-only. The daemon atomically saves
   `workspace.json` before updating its live name; the UI refreshes workspace data after success.
   Like setup naming, this does not append a work event.
+- `PUT /v1/machines/{id}`: `{name}` → `Machine`. Owner-only, 1–60 trimmed code points
+  without controls. Appends `machine_added`; unknown machine ids are `404`.
 
 Settings reuses machine checks, CLI accounts and sign-in, hook previews/install, safety and
 integration routes. Remote machines are managed through their own workspace transport. Theme

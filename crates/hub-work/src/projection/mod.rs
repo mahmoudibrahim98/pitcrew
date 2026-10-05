@@ -79,7 +79,8 @@ pub const NAMES: [&str; 11] = [
 ];
 
 /// Every table the work model owns, children before parents (the order `reset` clears them in).
-pub const TABLES: [&str; 26] = [
+pub const TABLES: [&str; 27] = [
+    "work_avatars",
     "work_safety",
     "work_read_cursors",
     "work_team_members",

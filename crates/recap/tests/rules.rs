@@ -320,6 +320,7 @@ fn hostile_names_are_cleaned_in_prose() {
         name: "x".into(),
         owner: Some(w.person),
         persona: None,
+        avatar: None,
     });
     let mut log = Log::new();
     log.add(

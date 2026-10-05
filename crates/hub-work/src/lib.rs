@@ -88,6 +88,7 @@ pub mod routes;
 mod safety;
 mod seed;
 mod service;
+mod settings;
 mod setup;
 mod sync;
 pub mod writes;
