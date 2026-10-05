@@ -24,7 +24,12 @@ recap fact discriminants and UTF-8 span ranges. No UI declaration or wire format
 their parts are new. The UI's `data/types.ts` lists the three events (their payloads' board parts
 from these bindings) and `data/invalidation.ts` refreshes the drafts' queries on them; the projects
 views declare the board types they use in `apps/ui/src/projects/board-drafts.ts`, the same shapes
-as the generated ones.
+as the generated ones. Since #54's review, `board-drafts.ts` re-exports the generated board types
+(`BoardDraft`, `BoardProposal`, `DraftCost`, `DraftPreview`, `DraftState`, `DraftedTask`,
+`ProposedTask`, `StartDraft`, `UsageEstimate`) instead of declaring them; only `DraftReviewed` is
+composed (the generated `BoardDraft` and the UI's `Task`). `TokenScope` gained
+`{ "session": SessionId }`, and `RunnerCommand`'s `start_session` an optional `confined`; neither
+is a UI type.
 
 ## Different names and missing declarations
 

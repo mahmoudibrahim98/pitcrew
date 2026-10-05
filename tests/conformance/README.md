@@ -92,11 +92,15 @@ Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 `board.test.mjs` runs on both targets, alone, last ("Board drafts"): the
 preview's shape, sizes and estimate, and that it stores nothing; a start refused for a stale
 digest, a person or an unknown member as the agent, and while another draft runs; device-only
-routes; only the drafting agent proposes, within the bounds (evidence of another workstream's
-session, `canceled`, a blank title, a body over 32 KiB); a proposal creates no task; a review
-creates exactly the accepted items, labelled `drafted`, and nothing for the rejected one, once;
-and the three events' shapes. On the daemon the draft's CLI is the stand-in `claude`, in the
-temporary home, as for a dispatch; it never proposes by itself (the suite's agent token does).
+routes; only the draft's session token proposes (its agent's token is refused, and the session
+token reaches no other route: `GET /v1/me`, `/v1/tasks`, `/v1/board-drafts`), within the bounds
+(evidence of another workstream's session, `canceled`, a blank title, a body over 32 KiB), and
+stops once it has (`401`); a proposal creates no task; a review creates exactly the accepted
+items, labelled `drafted`, and nothing for the rejected one, once; and the three events' shapes.
+The suite proposes with the session token as the draft's CLI would: `run.mjs` makes a private
+folder (`PITCREW_CONFORMANCE_SESSION_TOKENS`) where the mock writes each draft's token
+(`sessionTokenDir`) and, on the daemon, the stand-in `claude` (confined, in its private folder in
+the temporary home's cache) copies the one it was given; it never proposes by itself.
 
 Session launch coverage now checks person-only machine options, platform and supported modes,
 unknown/unreachable machines, title validation, and an unnamed no-prompt start returning a

@@ -481,6 +481,9 @@ async function main(): Promise<void> {
     scanWindow: parseScanWindow(process.env['PITCREW_MOCK_SCAN_WINDOW']),
     fresh,
     log: (line) => console.log(line),
+    // A folder where board drafts' session tokens are also written, for tests that propose as a
+    // draft's CLI would.
+    ...(process.env['PITCREW_MOCK_SESSION_TOKENS'] ? { sessionTokenDir: process.env['PITCREW_MOCK_SESSION_TOKENS'] } : {}),
   });
   console.log(`PitCrew mock hub on ${server.url}`);
   if (fresh) {

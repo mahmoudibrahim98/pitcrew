@@ -49,17 +49,22 @@ pitcrew comment <task> <text…> [--mention @member]…
 pitcrew ask <@member> <title…> [--option <text>]… [--body <text>] [--task <task>] [--kind question]
 pitcrew reply <ask> [<text…>] [--option <n>]   # options are numbered from 1, as `check` shows
 pitcrew check                                  # asks for you, mentions, your asks and their answers
-pitcrew board submit <draft>  < proposal.json  # a board draft's proposal (see below)
+pitcrew board submit <draft> --file proposal.json  # a board draft's proposal (see below)
 ```
 
 A text of `-` is read from stdin.
 
-**`board submit`** answers the board draft an agent was started for (api-v1.md, "Board drafts";
-the prompt names the draft, `drf_…`). It reads the proposal's JSON on stdin,
-`{"tasks": [{"title", "status", "description"?, "evidence": [<session id>]}], "note"?}`, refuses
-one over 32 KiB or that is not a JSON object before anything is sent (exit 2), and posts it with
-the agent's token. Only the draft's own agent may (exit 3 otherwise), once (exit 4 after); the
-daemon checks the rest (exit 2). Nothing is created until a person reviews the proposal.
+**`board submit`** answers the board draft a CLI was started for (api-v1.md, "Board drafts";
+the prompt names the draft, `drf_…`). It reads the proposal's JSON,
+`{"tasks": [{"title", "status", "description"?, "evidence": [<session id>]}], "note"?}`, from
+`--file <path>` (the prompt asks for `--file proposal.json`, which works in every shell, PowerShell
+and `cmd.exe` included), or on stdin with `--file -` or no `--file`; refuses one over 32 KiB, one
+that is not a JSON object, and a person's device token, before anything is sent (exit 2); and
+posts it with the token it was given: the draft's **session token**, which may do nothing else,
+so this verb, unlike the others, never asks `GET /v1/me` whose token it holds. Only the draft's own
+session token may propose (exit 3 otherwise, its agent's own token included), once: the token is
+revoked once the proposal is in, so a second try fails (exit 2 or 3). The daemon checks the rest
+(exit 2). Nothing is created until a person reviews the proposal.
 
 | Exit | Meaning |
 |---|---|

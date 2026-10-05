@@ -32,14 +32,15 @@ export interface Hub {
 
 interface HubProcessModule {
   freePort(): Promise<number>;
-  spawnHub(port: number): Promise<Hub>;
+  spawnHub(port: number, env?: Record<string, string>): Promise<Hub>;
 }
 
 const HUB_PROCESS = '../../../tests/hub-process.ts';
 
-export async function startHub(): Promise<Hub> {
+/** A fresh mock hub; `env` adds `PITCREW_MOCK_*` settings to its environment. */
+export async function startHub(env: Record<string, string> = {}): Promise<Hub> {
   const { freePort, spawnHub } = (await import(/* @vite-ignore */ HUB_PROCESS)) as HubProcessModule;
-  return spawnHub(await freePort());
+  return spawnHub(await freePort(), env);
 }
 
 const clients = new Set<QueryClient>();

@@ -395,28 +395,48 @@ accepts it** (`src/board.rs`, `src/board_routes.rs`; api-v1.md, "Board drafts"; 
   become the office's bounded, redacted summary inside `draft-board/v1`
   (`pitcrew_office::board::draft_prompt`). The answer carries the summary, its cost and the
   SHA-256 of the prompt (made with a placeholder draft id of the real one's length, so the sizes
-  are exact). Nothing is appended.
-- **Start** (`start_draft`, people only): the prompt is made again and must have the preview's
+  are exact). Its files are relative to the session's folder or the workstream's
+  (`pitcrew_office::board::relative_to`). Nothing is appended; the prompt is kept in memory
+  (`Previews`, the workstream's latest, for `PREVIEW_KEPT_MS`, 10 minutes).
+- **Start** (`start_draft`, people only): the workstream's latest preview, while kept and with the
+  start's digest, is what is sent, exactly; else the prompt is made again and must have that
   digest (`409` otherwise: the workstream changed). Under the command lock: the agent (named, or
   the caller's `@office`) must be one of the caller's own, and no other draft of the workstream
-  may be running or waiting for review. It runs where the workstream is (its first location, the
-  project's root, else the hub's machine in `~`), on a live machine, with a dispatcher whose
-  `can_start` agrees. One append: `session_discovered` (`starting`, the agent, linked to the
-  workstream by hand) and `board_draft_started` (sizes and the prompt's version, never the
-  summary). Then, without the lock, `Dispatcher::start_session` (a `SessionRequest`, the prompt as
-  its brief, the draft's real id in it); a failure ends the session (`abandon_session`) and
-  answers as a dispatch's failure would.
-- **Propose** (`propose_board`): the draft's own agent only (`check_draft_proposer`, which the
-  route asks before reading the body), once, at most 32 KiB, each field bounded and redacted
+  may be running or waiting for review. It runs on the hub's own machine (`draft_machine`, live),
+  never in the workstream's folder, with a dispatcher whose `can_start` agrees. One append:
+  `session_discovered` (`starting`, the agent, linked to the workstream by hand, its `cwd` the
+  folder `Dispatcher::confined_folder` names) and `board_draft_started` (sizes and the prompt's
+  version, never the summary). Then, without the lock, `Dispatcher::start_session` with a
+  **confined** `SessionRequest`: the prompt (the draft's real id in it) for its `prompt.md`, the
+  `default` permission mode whatever the persona's, and `draft_confinement()` (`pitcrew board
+  submit`, `proposal.json`, `DRAFT_MAX_RUNTIME` 30 minutes); a failure ends the session
+  (`abandon_session`) and answers as a dispatch's failure would.
+- **Propose** (`propose_board`): only the session token of the draft's own session
+  (`TokenScope::Session`, `check_draft_proposer`, which the route asks before reading the body;
+  its agent's own token is refused), once, at most 32 KiB, each field bounded and redacted
   (`checked_shape`), evidence only among the sessions the preview would list. Appends
-  `board_proposed`.
+  `board_proposed`, then `Dispatcher::finish_session` (its token stops at once, its CLI is ended).
 - **Review** (`review_draft`, people only): accepted indexes (any, all or none). One append:
-  `task_created` per accepted item (next keys of the project, in the workstream, at the proposed
-  status, label `drafted`), `session_linked` (manual) for evidence sessions still without a task,
-  and `board_draft_reviewed`. Rejected items create nothing; a draft is reviewed once.
+  `task_created` per accepted item, made by `create_task`'s own checks (`commands::plan_task`:
+  next keys of the project, in the workstream, at the proposed status, label `drafted`),
+  `session_linked` (manual) for evidence sessions still without a task, and
+  `board_draft_reviewed`. Rejected items create nothing; a draft is reviewed once.
+- **When the hub restarts**: `end_running_drafts` ends every draft still running, and its session
+  (`end_confined_session`), since its session token lived in the last daemon's memory.
 - **Where drafts live:** in the log only. `load_drafts` folds the three event types (read through
-  the store's type index), so no projection or migration is needed; a running draft whose
-  session has ended (or is unknown) reads as `ended`.
+  the store's type index), so no projection or migration is needed; an event that cannot be read
+  is logged and skipped; a running draft whose session has ended (or is unknown) reads as
+  `ended`.
+
+### Confined runs (shared with the Orchestrator)
+
+`Confinement` on a `SessionRequest` marks a run PitCrew starts on its own behalf: the `pitcrew`
+commands its CLI may run without asking, the files in its folder it may write, and its longest
+running time. Hub-work only decides it; the runner link carries it out (the daemon's
+`crate::confined`: a fresh private folder, `PROMPT_FILE`, `CONFINED_BRIEF` on the command line,
+the CLI's confined shape, a session token). `Dispatcher` has `confined_folder` (the folder, for the
+session's record) and `finish_session` (its one thing is done). A later confined run names its own
+`Confinement`.
 
 ## Commands
 
@@ -702,12 +722,15 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   holds the generator and the oracle.
 - `tests/board.rs`: board drafts through the routes, with a recording dispatcher: the preview
   sends and stores nothing and keeps secrets in titles, branches, tool runs and files out of the
-  summary; a start needs the preview's digest and starts the CLI where the workstream is, with the
-  prompt it measured; only the drafting agent proposes, once, within the bounds, redacted; nothing
-  is created until the review, which creates the accepted tasks only (labelled `drafted`), links
-  free evidence sessions, and happens once; accepting none creates nothing; one draft at a time;
-  an ended session ends its draft; a failed start ends it; hidden sessions are neither sent nor
-  evidence.
+  summary, and names files relative to their session's folder; a start sends exactly the preview
+  the person saw while it is kept, and never a superseded one; it starts the CLI confined, in the
+  folder the dispatcher names, in the `default` mode, with the prompt it measured; only the
+  draft's own session token proposes (its agent's token, other sessions' and people are refused),
+  once, within the bounds, redacted, and its session is finished then; nothing is created until
+  the review, which creates the accepted tasks only (labelled `drafted`), links free evidence
+  sessions, and happens once; accepting none creates nothing; one draft at a time; an ended
+  session ends its draft; a failed start ends it; drafts left running end when the hub restarts;
+  an unreadable draft event is skipped; hidden sessions are neither sent nor evidence.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other
   routes and commands. `tests/task_shape.rs`: the `Task` shape pin.
 

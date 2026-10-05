@@ -654,12 +654,52 @@ The queue, per-agent concurrency, hand-off, and runners on other machines (over 
 link) are not part of this.
 
 **Board drafts** (api-v1.md, "Board drafts"; hub-work's `crate::board`) start their agent's CLI
-the same way: `RunnerLink::start_session` runs the draft's `StartSession` under the session the
-hub stored (state `starting`, the agent named), in the workstream's folder checked as above, and
-`AgentEnv` gives that CLI the agent's token file, so the agent answers with `pitcrew board submit`
-as itself. A refusal or a failure ends the session (and so the draft); the reconciliation looks
-after a draft's session as after any the hub stored ahead of the runner. `serve` mounts hub-work's
-`board_agent_routes` (the proposal) and `board_device_routes` (preview, start, list, review).
+as a **confined run**: `RunnerLink::start_session` runs the draft's `StartSession` under the
+session the hub stored (state `starting`, the agent named), confined as below. A refusal or a
+failure ends the session (and so the draft); the reconciliation looks after a draft's session as
+after any the hub stored ahead of the runner. `serve` mounts hub-work's `board_session_routes`
+(the proposal, with `RouterParts::session`) and `board_device_routes` (preview, start, list,
+review).
+
+### Confined runs and session tokens (shared plumbing)
+
+A run PitCrew starts **on its own behalf** (a board draft's now; the Orchestrator's later) is a
+`SessionRequest` with a `Confinement` (hub-work: the `pitcrew` commands it may run, the files in
+its folder it may write, its longest running time). `crate::confined` carries it out, the same
+for every such run and every CLI, whatever the agent's persona or the person's own settings for
+that CLI say; a later confined run only names its own `Confinement`:
+
+- **A fresh private folder** (`ConfinedRuns`): `scratch/<session>` in PitCrew's cache folder
+  (`~/.cache/pitcrew` on Linux, `~/Library/Caches/PitCrew` on macOS, `%LOCALAPPDATA%\PitCrew\cache`
+  on Windows; `XDG_CACHE_HOME` is honoured), never the state directory (refused if the two would
+  nest) nor the person's repository. The scratch folder is 0700 (repaired if it is open; an
+  owner-only ACL on Windows); each run's folder is made new for its start (an old one of that name
+  is removed), owner-only, holding only `prompt.md` (the prompt, 0600) and the CLI's settings
+  (Claude Code's `.claude/settings.json` from `claude_settings`, OpenCode's `opencode.json` from
+  `opencode_settings`; Codex reads none from an untrusted folder). At each start, whatever in the
+  scratch folder is not a running run's folder is removed (the CLIs read their folders' parents,
+  so an injected `CLAUDE.md` there would reach later runs); when the daemon starts, all of it is.
+  `Dispatcher::confined_folder` names the folder before the session is stored, so its `cwd` is
+  right from the start.
+- **Its launch**: the runner's `StartSession` with `confined` and `CONFINED_BRIEF`, one plain line
+  telling the CLI to read `prompt.md` (cmd-safe, so Windows `.cmd` shims pass, and nothing of the
+  prompt on `/proc/<pid>/cmdline`); the runner's `start_spec` gives each CLI its confined shape
+  (see the runner's README).
+- **A session token** (`TokenScope::Session`, `pcs_…`): bound to the session, acting as its agent
+  for the agent's owner, minted into an in-memory registry (`HubTokens` layers it over the token
+  registry for the API, so none outlives the daemon or reaches `tokens.json`), and written to
+  `sessions/<session>.token` in the state directory (0600). `AgentEnv` gives a confined run's CLI
+  that file in place of its agent's, and refuses any token to a board draft's session whose run is
+  gone (fail closed). The API reaches a session token only to routes mounted with
+  `RouterParts::session`; each checks the token is for its own session's resource.
+- **Its end** (`Ender`): `Dispatcher::finish_session` (a draft's proposal is in) revokes the token
+  at once and ends the CLI after `GRACE` (3 s; gracefully, else killed); a watch per run removes
+  its folder and token once its session has ended (looked at every 5 s), and ends it after its
+  `max_runtime` (30 minutes for a draft). At the daemon's start, drafts left running are ended
+  (`WorkService::end_running_drafts`), and their CLIs too once the runner is attached.
+
+The Orchestrator reuses all of it: its own `Confinement` (its read verbs as `commands`, no
+`writes`) and its own session routes.
 
 ## Routes
 
@@ -1050,11 +1090,15 @@ process the daemon starts carries the test's mark, and none is left at the end.
 `tests/board.rs` (Unix), a board draft end to end, with the same rig as `tests/dispatch.rs` and
 the `pitcrew` CLI built next to `pitcrewd` (skipped with a message when it or pitcrew-ptyd is not
 built, unless `CI` or `PITCREW_REQUIRE_PTYD=1`): a stand-in `claude` answers the draft as the
-prompt asks, through the real `pitcrew board submit` with the token file the daemon gave it; its
-proposal arrives and a second is refused (exit 4); the prompt is the one the preview measured, and
-names the draft and the workstream's session; no token is in its environment; no task exists
-until the person reviews it, and the review creates the accepted task only, labelled `drafted`,
-linking its evidence session.
+prompt asks, writing `proposal.json` and running the real `pitcrew board submit --file
+proposal.json` with the session token's file the daemon gave it. It was started confined (the
+three flags, one line on its command line), in a fresh 0700 folder outside the state directory and
+the workstream's folder holding only `prompt.md` (the prompt the preview measured, naming the
+draft and the workstream's session) and `.claude/settings.json`; no token is in its environment;
+its token's file is the session's, not the agent's; `pitcrew task list` with it is refused; its
+proposal arrives and a second is refused once its token is gone; its session ends soon after and
+its folder and token file go; no task exists until the person reviews it, and the review creates
+the accepted task only, labelled `drafted`, linking its evidence session.
 
 `tests/setup.rs`, the first run, fresh daemons with temporary homes (`--homes`, holding the
 Claude fixture's transcript):

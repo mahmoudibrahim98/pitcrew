@@ -22,15 +22,26 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
 - A WebSocket cannot set headers from a browser, so WebSocket routes take the token as a
   subprotocol: `Sec-WebSocket-Protocol: pitcrew.v1, pitcrew.bearer.<token>`. The server answers
   with `pitcrew.v1`.
-- Two scopes (`TokenScope`):
-  - `device`, a person's desktop: every route.
-  - `agent`, an agent or hook: only routes marked **agent** below.
+- Three scopes (`TokenScope`):
+  - `device` (`pcd_…`), a person's desktop: every route.
+  - `agent` (`pca_…`), an agent or hook: only routes marked **agent** below.
     - **Reads** on those routes see the whole workspace, so agents can coordinate.
     - **Writes** are limited to the agent's **own** tasks (it is the assignee, or holds the task's
       active dispatch) and its own sessions. A write on anything else is `403 forbidden`.
-  - The hub stamps `author` (the caller) and, for agents, `on_behalf_of` (the owner) from the
-    token, never from the body.
-- Mock tokens: `dev-device-token` (acts as `@sam`) and `dev-agent-token` (acts as `@writer`).
+  - `{ "session": SessionId }` (`pcs_…`), a **session token**: minted by the hub for one session
+    it starts on its own behalf (a confined run: a board draft's, see "Board drafts"), bound to
+    that session, and given to its CLI (`PITCREW_TOKEN_FILE`) in place of its agent's token. It
+    acts as the session's agent for the agent's owner, but reaches **only routes marked
+    session** below, and each of those only for its own session's resource; every other route
+    is `403 forbidden` (an agent route too). It lives in the daemon's memory only (never in the
+    token registry), and is revoked when its run has done its one thing, when its session ends,
+    when the run passes its time, and with the daemon. This is shared plumbing: a later confined
+    run (the Orchestrator's) gets its own session token the same way.
+  - The hub stamps `author` (the caller) and, for agents and session tokens, `on_behalf_of` (the
+    owner) from the token, never from the body.
+- Mock tokens: `dev-device-token` (acts as `@sam`) and `dev-agent-token` (acts as `@writer`). The
+  mock mints a session token per board draft, as the hub does, kept in memory (and written to
+  `<sessionTokenDir>/<session>.token` when started with that option, for the conformance suite).
 
 ## Errors
 
@@ -1145,9 +1156,10 @@ writes from the same files.
 ### Board drafts
 
 A person asks an agent they already use to draft a workstream's board from its history: open
-tasks, what is in progress, what looks done. The agent's CLI starts with a versioned prompt and a
-bounded, redacted summary of the workstream's sessions, and answers with a proposal through
-`pitcrew board submit`. **Nothing is created until the person reviews the proposal.** Types:
+tasks, what is in progress, what looks done. The agent's CLI starts **confined**, in a private
+folder of its own with a versioned prompt holding a bounded, redacted summary of the workstream's
+sessions, and answers with a proposal through `pitcrew board submit`, with a session token that
+can do nothing else. **Nothing is created until the person reviews the proposal.** Types:
 `crates/protocol/src/board.rs`.
 
 | Method and path | Body → response | Notes |
@@ -1156,31 +1168,38 @@ bounded, redacted summary of the workstream's sessions, and answers with a propo
 | `POST /v1/workstreams/{id}/board-drafts` | `StartDraft` → `BoardDraft` (202) | Starts the agent's CLI. Emits `session_discovered`, `board_draft_started`. |
 | `GET /v1/board-drafts?workstream=` | → `BoardDraft[]` | Newest first. |
 | `GET /v1/board-drafts/{id}` | → `BoardDraft` | |
-| `POST /v1/board-drafts/{id}/proposal` | `BoardProposal` → `BoardDraft` (201) | The drafting agent's answer. Emits `board_proposed`. **agent** |
+| `POST /v1/board-drafts/{id}/proposal` | `BoardProposal` → `BoardDraft` (201) | The drafting session's answer, with its session token. Emits `board_proposed`. **session** |
 | `POST /v1/board-drafts/{id}/review` | `DraftReview` → `DraftReviewed` | Creates the accepted tasks. Emits `task_created`s, `session_linked`s, `board_draft_reviewed`. |
 
-All but the proposal are for device tokens only (`403` for an agent). Ids in paths are bare ULIDs
-(the `wst_…` and `drf_…` forms are accepted too).
+All but the proposal are for device tokens only (`403` for an agent or a session token). Ids in
+paths are bare ULIDs (the `wst_…` and `drf_…` forms are accepted too).
 
 **The preview** (`DraftPreview`: `{ "workstream", "prompt", "cost": DraftCost, "summary",
 "digest" }`). `prompt` is the template's name and version (`draft-board/v1`), `summary` the text
 the agent would read, exactly, and `digest` the lowercase hex SHA-256 of the whole prompt. `404`
-for an unknown workstream.
+for an unknown workstream. Nothing is stored in the log; the hub keeps the workstream's latest
+preview's prompt in memory for 10 minutes, for its start.
 - **What the summary holds**: the workstream's tasks (key, status, title) and, for each of its
   sessions most recently active first: its id, CLI, state, the dates it ran, its branch and linked
   task, its title, its counts (turns, tool runs and failures, file edits), up to 5 files it edited
-  and up to 3 recap lines (the one-line summaries of its newest blocks of work). Only sessions the
+  and up to 3 recap lines (the one-line summaries of its newest blocks of work). Files are named
+  relative to the session's folder, else to one of the workstream's folders or its project's
+  root; any other absolute path keeps only its end (`…/<file>`, or its last two parts when it has
+  five or more, or `…`), and a path too long is cut at its start. Only sessions the
   session routes would list (the import choice applies), without sub-agents and without drafts'
   own sessions. **Never** a transcript, a prompt, a tool's output or a secret.
 - **Bounds**: 40 sessions, 60 tasks (at most 4 KiB of them), titles of 120 characters, recap lines
   of 200, file paths and branches of 100, names of 80, and at most 12 KiB in all: the least
   recently active sessions that do not fit are left out, and counted.
-- **Redaction**: every text is made one line (control and hidden characters dropped) and then has
-  private keys, tokens of known shapes (`sk-…`, `ghp_…`, `github_pat_…`, `xoxb-…`, `AKIA…`,
-  `pca_…`, JWTs and others), the values of secrets' names (`password=…`, `token: …`,
-  `Authorization: Bearer …`, `--password …`, `?access_token=…`), a URL's user and password, long
-  random-looking words, e-mail addresses (`[email]`) and home folders (`~`) replaced; `<` and `>`
-  are shown as `‹` and `›`. `cost.redacted` counts the replacements.
+- **Redaction**: every text is made one line (control and hidden characters dropped, never made
+  spaces) and then has private keys, tokens of known shapes (`sk-…`, `ghp_…`, `github_pat_…`,
+  `xoxb-…`, `AKIA…`, `pca_…`, `pcs_…`, JWTs and others, also behind or inside punctuation such as
+  `**ghp_…**` or `$sk-…`), the values of secrets' names (`password=…`, `token: …`,
+  `"password": "…"`, `password = …`, `Authorization: Bearer …`, `--password …`,
+  `?access_token=…`), a URL's user and password, long random-looking words, e-mail addresses
+  (`[email]`) and home folders (`~`, also `\\?\C:\Users\<name>` and `/mnt/c/Users/<name>`)
+  replaced, and other absolute paths cut to their end; `<` and `>` are shown as `‹` and `›`.
+  `cost.redacted` counts the replacements.
 - **`DraftCost`**: `{ "sessions", "sessions_left_out", "tasks", "summary_bytes", "prompt_bytes",
   "redacted", "estimate": { "input_tokens", "output_tokens" } }`. The estimate: the agent reads
   the prompt (a token for every 4 bytes, rounded up) plus 15,000 tokens for its CLI's own
@@ -1190,19 +1209,37 @@ for an unknown workstream.
 Refusals, with nothing recorded: `404` an unknown workstream (before the body); `400` a malformed
 body, an unknown agent, a person named as the agent, or no agent named when the caller has no back
 office (`@office`, the default); `403` an agent the caller does not own; `409` a `digest` that is
-not the prompt's now (the workstream changed since its preview: preview again), or a draft of the
-workstream that is running or waiting for review (one at a time); `503` when no session can start
-(as for a dispatch: no runner attached, no live machine). The engine defaults to the agent's
-persona's, else `claude`; the permission mode is the persona's, else the CLI's own.
-- The CLI runs where the workstream is: its first location, else its project's root, else the
-  hub's own machine in `~`.
+not the workstream's latest preview while it is kept (10 minutes) nor the prompt as it would be
+made now (the workstream changed since its preview: preview again), or a draft of the workstream
+that is running or waiting for review (one at a time); `503` when no session can start (no runner
+attached, the hub's own machine not live, or no scratch folder for confined runs). The engine
+defaults to the agent's persona's, else `claude`; the person's UI offers only the CLIs found on
+the hub's machine (`GET /v1/machines/{id}/session-options`). A start with the latest preview's
+digest sends exactly that preview's prompt.
+- **The CLI runs confined** (a confined run; the daemon's `crates/daemon/src/confined.rs`), whatever
+  the agent's persona's permission mode and the person's own settings for that CLI:
+  - on the hub's own machine, in a **fresh private folder** `scratch/<session>` in PitCrew's cache
+    folder (0700, an owner-only ACL on Windows), never the workstream's folder nor the state
+    directory, removed when its session ends;
+  - with its prompt in `prompt.md` there (0600) and one plain line on its command line
+    (`Read the file prompt.md in this folder and follow its instructions.`);
+  - in its CLI's confined shape: Claude Code `--permission-mode=default --setting-sources=project
+    --strict-mcp-config` with a project `.claude/settings.json` that pre-approves only `pitcrew
+    board submit` and writing `proposal.json`, and denies web fetch and search and the state
+    directory; Codex `--sandbox=read-only --ask-for-approval=on-request
+    --config=web_search=disabled` (its sandbox blocks the network, so the person approves the
+    submit in its terminal); OpenCode with a deny-all `opencode.json` but reading its folder and
+    `pitcrew board submit …` (refused on Windows);
+  - with a **session token** (see "Transport and auth") for the draft's session, never the
+    agent's token;
+  - for at most **30 minutes**: then its CLI is ended, and the draft with it (`ended`).
 - The hub stores the session first (`session_discovered`: state `starting`, the agent named,
-  linked to the workstream with `link_basis: manual`), then `board_draft_started` (the draft, its
-  workstream, agent, engine, session, the prompt's version and the `cost` the person confirmed;
-  never the summary), and starts the CLI under that session with the prompt as its first prompt,
-  and an **agent** token for that agent, as a dispatch's (see "Dispatch"). A start the runner
-  refuses or fails ends the session (`409`, `503` or `500`, as for a dispatch); the draft is then
-  `ended`.
+  linked to the workstream with `link_basis: manual`, its `cwd` the private folder), then
+  `board_draft_started` (the draft, its workstream, agent, engine, session, the prompt's version
+  and the `cost` the person confirmed; never the summary), and starts the CLI under that session.
+  A start the runner refuses or fails ends the session (`409`, `503` or `500`, as for a
+  dispatch); the draft is then `ended`. When the daemon starts, drafts left running are ended
+  (their session tokens were in the last daemon's memory).
 
 **`BoardDraft`**: `{ "id", "workstream", "agent", "engine", "session", "by", "prompt", "cost",
 "started", "state", "proposal"?: BoardProposal, "proposed"?, "reviewed"?, "accepted":
@@ -1212,21 +1249,23 @@ DraftedTask[], "rejected": u32[] }`. `state` is `running`, `proposed` (waiting f
 
 **The proposal** (`BoardProposal`: `{ "tasks": ProposedTask[], "note"?: String }`, where
 `ProposedTask` is `{ "title", "status", "description"?, "evidence": SessionId[] }`). Only the
-draft's own agent may send it: `404` for an unknown draft, then `403` for anyone else (a person
-included), both before the body is read. `400` for a body over 32 KiB or not a JSON object, more
+session token of the draft's own session may send it: `404` for an unknown draft, then `403` for
+anyone else (its agent's own token, another session's token and a person included), both before
+the body is read. `400` for a body over 32 KiB or not a JSON object, more
 than 50 tasks, a title that is empty or over 200 characters (trimmed), a status of `canceled`, a
 description or a note over 2,000 characters, more than 20 evidence sessions, or evidence that is
 not one of the workstream's sessions (as the preview would list them). `409` once the draft has a
 proposal, or has ended. Texts are trimmed and redacted as the summary's are; repeated evidence
 counts once. It appends `board_proposed` (`{ "draft", "workstream", "tasks", "note"? }`, authored by
-the agent for its owner) and nothing else.
+the agent for its owner) and nothing else. Then the session token is revoked (a second call is
+`401`), and the draft's CLI is ended a few seconds later.
 
 **The review** (`DraftReview`: `{ "accept": u32[] }`, indexes into the proposal's tasks; `[]`
 accepts none). `404` for an unknown draft (before the body); `400` for an index past the tasks, or
 given twice; `409` when the draft has no proposal yet, or was reviewed already. In one append:
-- `task_created` for each accepted item, in the proposal's order: the next key of the workstream's
-  project, in the workstream, at the proposed status, with the description, label `drafted`, no
-  assignee;
+- `task_created` for each accepted item, in the proposal's order, made by the same checks as
+  `POST /v1/tasks`: the next key of the workstream's project, in the workstream, at the proposed
+  status, with the description, label `drafted`, no assignee;
 - `session_linked` (`basis: manual`) for each evidence session of an accepted item that is still
   in the workstream and has no task yet (the first accepted item citing it wins);
 - `board_draft_reviewed` (`{ "draft", "workstream", "accepted": DraftedTask[], "rejected": u32[]
@@ -1235,8 +1274,11 @@ given twice; `409` when the draft has no proposal yet, or was reviewed already. 
 Rejected items create nothing. The answer is `DraftReviewed`: `{ "draft": BoardDraft, "tasks":
 Task[] }`.
 
-**The CLI**: `pitcrew board submit <draft>` reads the proposal's JSON on stdin, refuses one over
-32 KiB or that is not a JSON object before sending it, and posts it with the agent's token.
+**The CLI**: `pitcrew board submit <draft> [--file <path>]` reads the proposal's JSON from the
+file (the prompt asks for `--file proposal.json`, which works in every shell), or on stdin with
+`--file -` or no `--file`; refuses one over 32 KiB or that is not a JSON object, and a person's
+device token, before sending it; and posts it with the token it was given (the draft's session
+token), without asking whose it is (`GET /v1/me` is not a session route).
 
 ## Live updates: `GET /v1/stream?since=<rev>` (WebSocket, device tokens)
 
