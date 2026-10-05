@@ -304,3 +304,10 @@ Settings (`/w/$ws/settings`, sidebar and routing in `core.tsx`) offers Check now
 pre-release opt-in; browser mode explains that the desktop manages updates. Errors stay visible
 and retryable. See the desktop gateway contract and `tests/updates.test.tsx` for the IPC and
 consent checks. Tauri bindings remain dynamic imports outside the initial browser bundle.
+
+## File navigation
+
+The Files sidebar entry serves both layouts through the Projects feature. The palette’s
+Quick open command uses the active explorer, or goes to Files with a quick-open intent.
+The explorer owns Ctrl P / Cmd P while present; key-owning terminal surfaces retain it.
+Desktop folder reveal and editor launch remain deferred to a desktop-shell brief.

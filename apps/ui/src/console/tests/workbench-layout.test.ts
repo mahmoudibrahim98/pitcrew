@@ -36,6 +36,20 @@ import {
 } from '../workbench/layout.ts';
 import { createStore, loadLayout, saveLayout, STORAGE_PREFIX } from '../workbench/store.ts';
 
+it('retargets an existing file tab to a line, persists it and copies the target into a split', () => {
+  const ref = { kind: 'file' as const, workstream: 'W1', location: 0, path: 'sections/method.tex', line: 14 };
+  const opened = openTab(emptyLayout(), ref);
+  const next = openTab(opened, { ...ref, line: 27 });
+  expect(activeGroupOf(next).tabs).toHaveLength(1);
+  expect(currentTab(next)?.tab.ref).toEqual({ ...ref, line: 27 });
+  const restored = parseLayout(toStored(next));
+  expect(restored).toBeDefined();
+  if (restored) expect(currentTab(restored)?.tab.ref).toEqual({ ...ref, line: 27 });
+  const split = splitGroup(next, next.activeGroup, 'right')[0];
+  expect(groupsOf(split).map(group => group.tabs[0]?.ref)).toEqual([{ ...ref, line: 27 }, { ...ref, line: 27 }]);
+  expect(parseLayout(toStored(openTab(emptyLayout(), { ...ref, line: -1 })))).toBeUndefined();
+});
+
 const chat = (session: string): TabRef => ({ kind: 'session', session, view: 'chat' });
 const terminal = (session: string): TabRef => ({ kind: 'session', session, view: 'terminal' });
 const file = (path: string): TabRef => ({ kind: 'file', workstream: 'WST1', location: 0, path });

@@ -2,7 +2,7 @@
 // The route is `projects/$project/workstreams/$workstream`; the tab on screen is this component's
 // own state, not the URL.
 
-import { useBlocker, useParams } from '@tanstack/react-router';
+import { useBlocker, useParams, useRouter } from '@tanstack/react-router';
 import { ToggleGroup } from 'radix-ui';
 import { useState } from 'react';
 import { ReadScope } from './read-scope.tsx';
@@ -15,6 +15,10 @@ import { HEALTH, WORKSTREAM_STATUS } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { WorkstreamOverviewBody } from './overview.tsx';
 import { TasksList } from './tasks-list.tsx';
+import { FileExplorer } from './file-explorer.tsx';
+import { openTab, type TabRef } from '../console/workbench/layout.ts';
+import { workbenchStore } from '../console/workbench/store.ts';
+import { paths, useWorkspaceId } from '../shell/index.ts';
 import { FilesTab } from './files.tsx';
 import { WorkstreamLinks } from './integrations/workstream-links.tsx';
 import { ErrorNote, MaybeLink } from './ui.tsx';
@@ -43,6 +47,9 @@ function NotFound() {
 }
 
 export function WorkstreamPage() {
+  const router = useRouter();
+  const ws = useWorkspaceId();
+  const openFile = (ref: TabRef) => { workbenchStore(ws).update(l => openTab(l, ref)); void router.navigate({ href: paths.console(ws) }); };
   const { workstream: id }: { workstream?: string } = useParams({ strict: false });
   const [tab, setTab] = useState<Tab>('stands');
   const [filesDirty, setFilesDirty] = useState(false);
@@ -113,12 +120,17 @@ export function WorkstreamPage() {
 
       {workstream !== undefined && (
         <>
+          <div className="flex flex-col gap-4 lg:flex-row">
+          {tab !== 'files' && <div className="lg:w-64 lg:shrink-0"><FileExplorer key={workstream.id} workstream={workstream} openFile={openFile} /></div>}
+          <div className="min-w-0 flex-1">
           {tab === 'stands' && <WorkstreamOverviewBody workstream={workstream.id} />}
           {tab === 'board' && <Board workstream={workstream.id} />}
           {tab === 'tasks' && <TasksList workstream={workstream.id} />}
           {tab === 'agents' && <AgentsNow workstream={workstream.id} title="Agents" />}
           {tab === 'activity' && <ActivityFeed filters={{ workstream: workstream.id }} title="Activity" />}
-          {tab === 'files' && <FilesTab key={workstream.id} workstream={workstream} onDirty={setFilesDirty} onBusy={setFilesBusy} />}
+          {tab === 'files' && <FilesTab key={workstream.id} workstream={workstream} onDirty={setFilesDirty} onBusy={setFilesBusy} onOpen={openFile} />}
+          </div>
+          </div>
         </>
       )}
     </div>

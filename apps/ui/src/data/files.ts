@@ -1,7 +1,7 @@
 import type { Api } from './api.ts';
 
 export interface FileListing {
-  entries: { name: string; kind: 'file' | 'folder' | 'link'; size: number; modified_at: number | null }[];
+  entries: { name: string; kind: 'file' | 'folder' | 'link'; size: number; modified_at: number | null; ignored?: boolean }[];
   truncated: boolean;
 }
 

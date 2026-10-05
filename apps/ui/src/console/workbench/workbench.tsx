@@ -23,6 +23,9 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
+import { FileOpenContext } from '../file-links.tsx';
+import { FileExplorer } from '../../projects/file-explorer.tsx';
+import { useWorkstreamById } from '../data.ts';
 import { useSession } from '../../data/index.ts';
 import { Button, CloseIcon, FOCUS_RING, PanelRightIcon, ResizablePanel, SplitDownIcon, SplitRightIcon } from '../../design/index.ts';
 import { ariaShortcut } from '../../lib/platform.ts';
@@ -207,6 +210,9 @@ export function Workbench({ api, empty }: WorkbenchProps) {
   const groups = groupsOf(layout);
   const numbers = new Map(groups.map((g, i) => [g.id, i + 1]));
   const current = currentTab(layout);
+  const session = useSession(current?.tab.ref.kind === 'session' ? current.tab.ref.session : undefined).data;
+  const streamId = current?.tab.ref.kind === 'file' ? current.tab.ref.workstream : session?.workstream;
+  const stream = useWorkstreamById(streamId).data;
   useDrafts();
   const unsaved = dirtyTabs(ws).length > 0;
   useEffect(() => {
@@ -227,7 +233,9 @@ export function Workbench({ api, empty }: WorkbenchProps) {
   };
 
   return (
+    <FileOpenContext.Provider value={api.openFile}>
     <div data-workbench="" onKeyDown={onKeyDown} className="flex min-h-0 min-w-0 flex-1">
+      {stream && <div className="w-60 shrink-0 overflow-auto"><FileExplorer key={stream.id} workstream={stream} openFile={api.openFile} /></div>}
       {/* The panes are the landmarks ("Pane 1"…); this is only their frame. */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <NodeView api={api} node={layout.root} numbers={numbers} count={groups.length} empty={empty} />
@@ -247,6 +255,7 @@ export function Workbench({ api, empty }: WorkbenchProps) {
         </ResizablePanel>
       )}
     </div>
+    </FileOpenContext.Provider>
   );
 }
 
@@ -478,6 +487,7 @@ function GroupView({ group, api, numbers, count, empty }: NodeProps & { group: G
             workstream={tab.ref.workstream}
             location={tab.ref.location}
             path={tab.ref.path}
+            line={tab.ref.line}
           />
         )}
         {zone !== null && (

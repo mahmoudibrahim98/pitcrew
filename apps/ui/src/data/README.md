@@ -220,3 +220,10 @@ it (e2e suites included), must pass `{ tz: 0 }`** — it only has days for `tz=0
 splits `summary.text` into its receipted clauses and the plain joining text, converting the UTF-8
 byte spans correctly — never `summary.text.slice(span.range.start, span.range.end)`, which is
 wrong as soon as the text holds a character outside ASCII.
+
+## File listing hints
+
+`FileListing` accepts the additive `ignored` boolean (absent means false on an older
+hub). It is presentation data, not authorization. File reads and writes still use the
+workstream location index, relative paths, revisions and the existing transport.
+`useSession(undefined)` is idle, allowing the workbench’s file tabs to omit a session lookup.
