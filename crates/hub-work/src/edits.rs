@@ -181,7 +181,7 @@ fn checked_patch(conn: &Connection, task: &Task, patch: TaskPatch) -> Result<Tas
 }
 
 /// The fields of `wanted` whose values differ from the task's (lists compared in order).
-fn changed_fields(task: &Task, wanted: TaskPatch) -> TaskPatch {
+pub(crate) fn changed_fields(task: &Task, wanted: TaskPatch) -> TaskPatch {
     fn differs<T: PartialEq>(wanted: Option<T>, current: &T) -> Option<T> {
         wanted.filter(|w| w != current)
     }

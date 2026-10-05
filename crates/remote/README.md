@@ -46,7 +46,9 @@ on Unix; on Windows it is `USERPROFILE` (where Windows' own OpenSSH looks), else
   - **Stopping:** a cancel, a timeout or a dropped call stops ssh and everything it started
     (askpass, `ProxyJump` hops, `Match exec`): its process group on Unix, its **Job Object** on
     Windows (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the OS also ends it if PitCrew dies). The
-    Job Object needs four Win32 calls; `src/job.rs` is the crate's only unsafe code.
+    Job Object needs four Win32 calls; `src/job.rs` is the crate's only unsafe code. It is public
+    (`pitcrew_remote::job`, Windows only) so the daemon's machine check ends a timed-out version
+    command and what it started (`claude.cmd`'s `node.exe`) the same way.
   - **Errors:** ssh's own messages go to a log (`-E`, at `LogLevel=ERROR`) apart from the remote
     stderr. Exit 255 is an error only when that log shows ssh failing, and its kind comes only
     from ssh's own message formats, matched as whole lines. ssh logs server text without
@@ -94,6 +96,20 @@ on Unix; on Windows it is `USERPROFILE` (where Windows' own OpenSSH looks), else
   possibly networked.
 - `Ssh::run_with_input` streams bytes to the remote command's stdin while reading its output,
   with progress, under the same limits.
+- `Ssh::probe_and_check(host)` (`probe`, `check`) is the probe and the machine check before
+  PitCrew is there, **in one call** (`probe::CHECKED_SCRIPT`, within `probe::CHECKED_LIMITS`: the
+  probe's and the check's 256 KiB and two minutes): one login where ssh shares no connection
+  (Windows' OpenSSH has no ControlMaster), and one prompt on a host that asks for a password or a
+  one-time code. The check's lines (`check::check_lines!`, keys prefixed `check_`; `check::SCRIPT`
+  is them alone, between the check's own markers) run `command -v` and `--version` for `claude`,
+  `codex`, `opencode`, `git`, `gh`, `sbatch`, `squeue` and `scancel` (each under `timeout 10`
+  where there is one, with no input), `tmux -V` and `df -Pk "$HOME"`. It installs and writes
+  nothing (a test reads the
+  script for package managers, `sudo`, downloads and redirects, and another runs it with
+  tripwires on `PATH`). The report becomes API v1's `MachineCheck` rows (`ok` with a tool's first
+  line, `warn` when it failed or tmux is older than 3.2 or the home folder has under 5 GB free,
+  `missing` with `install_page`; SLURM only where `sbatch` is); `check::helper_row` adds the
+  helper's from what the probe found.
 
 ## The helper on a machine (`helper`)
 
@@ -183,6 +199,10 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
     killed, the next deploy sweeps it.
   - **Bounds:** `DeployOptions::timeout` per call (prompts excluded), `lock_wait`, and
     `stale_lock`, which must exceed both; `progress` reports bytes handed to ssh.
+  - **Steps,** for a live log: `DeployOptions::step` hears `DeployStep::Checking`, then
+    `AlreadyInstalled` (a verified copy was there: nothing is uploaded), or `Uploading`,
+    `Verifying` (every byte handed over: the machine checks the size, the sha256 and `--version`)
+    and `Installed`.
 - **Locks** are `mkdir` directories with an `owner` line: host, pid, call tag and time. A lock
   taken on this host (by its name; see `host` below) is stale when its process is gone (so a
   killed deploy does not block the next one for long) or when it is older than the limit by

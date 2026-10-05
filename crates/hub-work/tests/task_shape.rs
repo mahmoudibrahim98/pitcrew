@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 /// The version of `work.tasks`, and every field path of a fully populated `Task` at that version.
-const PINNED_VERSION: u32 = 3;
+const PINNED_VERSION: u32 = 4;
 const PINNED_SHAPE: &[&str] = &[
     "accept_auto",
     "assignee",

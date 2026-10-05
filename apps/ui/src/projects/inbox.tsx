@@ -1,7 +1,8 @@
 // The Inbox: open asks addressed to me, grouped by kind, each answerable in place. The question
 // card itself is stream M's (`src/console`): it also answers questions raised live in a
 // transcript, so the Inbox reuses it instead of keeping its own. Receipts and the task link are
-// the Inbox's own, shown alongside it (the console's card does not render them).
+// the Inbox's own, shown alongside it (the console's card does not render them). An approval for a
+// write to GitHub or Jira gets its own card (`writes/approval-card.tsx`): exactly what is sent.
 
 import { Suspense, useEffect, useId, useRef, useState } from 'react';
 import type { Ask, AskKind } from '../data/index.ts';
@@ -11,6 +12,8 @@ import { ASK_KIND, ASK_KINDS } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { Receipts } from './receipts.tsx';
 import { ErrorNote, MaybeLink } from './ui.tsx';
+import { hasNoWrite, useWriteOf } from './writes/api.ts';
+import { ApprovalCard } from './writes/approval-card.tsx';
 
 export function groupAsks(asks: readonly Ask[]): { kind: AskKind; asks: Ask[] }[] {
   return ASK_KINDS.map((kind) => ({
@@ -66,6 +69,31 @@ function AskCardFallback() {
   return <div aria-hidden className="h-20 animate-pulse rounded-lg border border-line bg-sunken" />;
 }
 
+/**
+ * An approval the hub raised for a write upstream shows exactly what will be sent; any other ask,
+ * an approval an agent raised itself included (it has no write: `404`), is the console's question
+ * card. When the write cannot be read for any other reason, the card shows why and offers no
+ * answer: the ask's own text is only a short preview of what would be sent.
+ */
+function AskBody({ ask }: { ask: Ask }) {
+  const write = useWriteOf(ask);
+  if (write.data !== undefined) return <ApprovalCard ask={ask} write={write.data} />;
+  if (ask.kind === 'approval' && write.error === null) return <AskCardFallback />;
+  if (ask.kind === 'approval' && write.error !== null && !hasNoWrite(write.error)) {
+    return (
+      <article aria-label={ask.title} className="flex flex-col gap-1 rounded-lg border border-line bg-card p-3">
+        <h3 className="text-sm font-semibold">{ask.title}</h3>
+        <ErrorNote error={write.error} what="read what this approval would send, so it cannot be answered here yet" />
+      </article>
+    );
+  }
+  return (
+    <Suspense fallback={<AskCardFallback />}>
+      <QuestionCard ask={ask} />
+    </Suspense>
+  );
+}
+
 function AskCard({ ask }: { ask: Ask }) {
   const names = useNames();
   const nav = useProjectsNav();
@@ -73,9 +101,7 @@ function AskCard({ ask }: { ask: Ask }) {
   const task = ask.task;
   return (
     <div data-ask={ask.id} className="flex flex-col gap-1.5">
-      <Suspense fallback={<AskCardFallback />}>
-        <QuestionCard ask={ask} />
-      </Suspense>
+      <AskBody ask={ask} />
       {(task !== undefined || ask.receipts.length > 0) && (
         <div className="flex flex-wrap items-center gap-2 px-1">
           {task !== undefined && (

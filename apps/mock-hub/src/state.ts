@@ -73,9 +73,11 @@ export interface Delays {
   end: number;
   /** A machine scan, from its first progress frame to its report (`scan.ts`). */
   scan: number;
+  /** A sign-in terminal, from its start to its login ending by itself (`machine-setup.ts`). */
+  signIn: number;
 }
 
-export const DEFAULT_DELAYS: Delays = { start: 1500, reply: 800, end: 300, scan: 1000 };
+export const DEFAULT_DELAYS: Delays = { start: 1500, reply: 800, end: 300, scan: 1000, signIn: 2000 };
 
 /** How many revisions one filtered `GET /v1/events` request examines at most. */
 export const DEFAULT_SCAN_WINDOW = 500;

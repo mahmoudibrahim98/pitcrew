@@ -5,9 +5,11 @@ import { DESKTOP_HUB, MOCK_DEVICE_TOKEN } from './fresh-hubs';
 
 // Connecting a remote machine, in a simulated desktop app (`fake-desktop.ts`: Tauri's internals and
 // the gateway, played in the page) whose remote is a fresh mock hub (`fresh.config.ts`). From "No
-// workspaces yet" through the connect wizard, SSH's host key and password answered in the app's
-// dialog, the fresh remote hub set up through its own transport, to its Home; then the switcher's
-// removal dialog. axe finds nothing on any new screen or dialog, light and dark.
+// workspaces yet" through the connect wizard (the machine check with the probe, the install's live
+// log), SSH's host key and password answered in the app's dialog, the fresh remote hub set up
+// through its own transport, a sign-in to an agent CLI there through the gateway's socket, to its
+// Home; then the switcher's removal dialog. axe finds nothing on any new screen or dialog, light and
+// dark.
 
 const AUTH = { Authorization: `Bearer ${MOCK_DEVICE_TOKEN}` };
 const SECRET = 'correct-horse-battery-staple';
@@ -59,6 +61,13 @@ test('connects a remote machine, answering SSH in the app, and sets its fresh hu
   await hostKey.getByRole('button', { name: 'Accept' }).click();
   await expect(heading(page, 'Checking hpc-login')).toBeVisible();
   await expect(page.getByTestId('probe')).toContainText('23.02.7, default partition gpu');
+  // The machine check with it: what is missing has its install page, to copy (no window opens).
+  const check = page.getByTestId('machine-check');
+  await expect(check.getByRole('listitem').filter({ hasText: 'Claude Code CLI' }).getByText('OK')).toBeVisible();
+  const codex = check.getByRole('listitem').filter({ hasText: 'Codex CLI' });
+  await codex.getByRole('button', { name: 'Install Codex CLI…' }).click();
+  await expect(codex.getByText('https://github.com/openai/codex#installing-and-running-codex-cli')).toBeVisible();
+  await expect(check.getByRole('listitem').filter({ hasText: 'PitCrew helper' }).getByText('Missing')).toBeVisible();
   await expectNoAxeViolations(page, 'probe');
   await page.getByRole('button', { name: 'Continue' }).click();
 
@@ -86,6 +95,10 @@ test('connects a remote machine, answering SSH in the app, and sets its fresh hu
   await expect(password.getByLabel('Password')).toHaveAttribute('type', 'password');
   await expect(password.getByLabel('Password')).toHaveAttribute('autocomplete', 'off');
   await expectNoAxeViolations(page, 'password dialog');
+  // Behind the dialog, the install's live log so far: a line for each step as it went.
+  const log = page.getByRole('log', { name: 'Install log', includeHidden: true });
+  await expect(log).toContainText('Copy pitcrewd 0.4.0 to ~/.pitcrew: checking for a copy already there');
+  await expect(log).toContainText('Copy pitcrewd 0.4.0 to ~/.pitcrew: 40% sent');
   await password.getByLabel('Password').fill(SECRET);
   await password.getByRole('button', { name: 'Send' }).click();
 
@@ -97,7 +110,20 @@ test('connects a remote machine, answering SSH in the app, and sets its fresh hu
   await page.getByLabel('Your name').fill('Sam Rivera');
   await page.getByRole('button', { name: 'Set up' }).click();
 
-  // 7. Done: open it.
+  // 7. Sign in: the remote hub's agent CLIs, each with its own login in a terminal there (the
+  // mock's canned one, through the gateway's socket).
+  await expect(heading(page, 'Sign in to your agents on hpc-login')).toBeVisible();
+  const claude = page.getByRole('listitem').filter({ hasText: 'Claude Code' });
+  await expect(claude.getByText('Not signed in')).toBeVisible();
+  await expect(page.getByRole('listitem').filter({ hasText: 'Codex' }).getByText('ChatGPT')).toBeVisible();
+  await expectNoAxeViolations(page, 'sign in');
+  await page.getByRole('button', { name: 'Sign in to Claude Code' }).click();
+  await expect(page.getByRole('region', { name: 'Claude Code sign-in' }).getByText('claude auth login', { exact: true })).toBeVisible();
+  await expect(claude.getByText('sam@example.com')).toBeVisible({ timeout: 15_000 });
+  expect((await recorded(page)).calls).toContain('gateway_socket_open');
+  await page.getByRole('button', { name: 'Continue' }).click();
+
+  // 8. Done: open it.
   await expect(heading(page, 'Connected')).toBeVisible();
   await expectNoAxeViolations(page, 'done');
   await page.getByRole('button', { name: 'Open hpc-login' }).click();

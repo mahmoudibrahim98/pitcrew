@@ -81,15 +81,17 @@ pub(crate) struct ListResult<Item> {
     pub blocked_link: Option<String>,
 }
 
-struct RawResponse {
-    status: u16,
-    body: Vec<u8>,
+pub(crate) struct RawResponse {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
     etag: Option<String>,
     last_modified: Option<String>,
     link: Option<String>,
-    ratelimit_remaining: Option<i64>,
-    ratelimit_reset: Option<i64>,
-    retry_after: Option<i64>,
+    pub(crate) ratelimit_remaining: Option<i64>,
+    pub(crate) ratelimit_reset: Option<i64>,
+    pub(crate) retry_after: Option<i64>,
+    /// A classic token's or OAuth app's scopes (`X-OAuth-Scopes`), for `crate::probe`.
+    pub(crate) oauth_scopes: Option<String>,
 }
 
 fn parse_int_header(response: &Response, name: &str) -> Option<i64> {
@@ -106,6 +108,7 @@ impl RawResponse {
             ratelimit_remaining: parse_int_header(&response, "x-ratelimit-remaining"),
             ratelimit_reset: parse_int_header(&response, "x-ratelimit-reset"),
             retry_after: parse_int_header(&response, "retry-after"),
+            oauth_scopes: response.header("x-oauth-scopes").map(str::to_string),
             body: response.body,
         }
     }
@@ -154,7 +157,7 @@ impl<'t, T: Transport> GithubClient<'t, T> {
         &self.api_base
     }
 
-    async fn get(
+    pub(crate) async fn get(
         &self,
         url: &str,
         etag: Option<&str>,
@@ -446,7 +449,7 @@ impl<'t, T: Transport> GithubClient<'t, T> {
 /// body: scanning the whole body would also match the string appearing incidentally elsewhere
 /// (a `documentation_url`, an issue title echoed back in a validation error, …), wrongly treating
 /// an unrelated error as a rate limit that will clear on its own.
-fn body_mentions_rate_limit(body: &[u8]) -> bool {
+pub(crate) fn body_mentions_rate_limit(body: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return false;
     };

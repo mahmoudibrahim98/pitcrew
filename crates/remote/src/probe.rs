@@ -14,7 +14,9 @@
 //! asks the scheduler, under `timeout 10` where there is `timeout`): see [`SlurmTools`].
 
 use crate::{Limits, Ssh, SshError};
+use pitcrew_protocol::machine_setup::MachineCheck;
 use pitcrew_protocol::model::{MachineInfo, Scheduler};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Bounds for [`Ssh::probe`]: 1 MiB of output, and 30 seconds not counting time spent on
@@ -24,30 +26,58 @@ pub const PROBE_LIMITS: Limits = Limits {
     timeout: Some(Duration::from_secs(30)),
 };
 
+/// The probe's lines, without markers.
+macro_rules! probe_lines {
+    () => {
+        concat!(
+            r#"printf 'os=%s\n' "$(uname -s 2>/dev/null)"; "#,
+            r#"printf 'arch=%s\n' "$(uname -m 2>/dev/null)"; "#,
+            r#"printf 'hostname=%s\n' "$(uname -n 2>/dev/null)"; "#,
+            r#"printf 'home=%s\n' "$HOME"; "#,
+            r#"printf 'shell=%s\n' "$SHELL"; "#,
+            r#"if command -v tmux >/dev/null 2>&1; then echo tmux_found=1; printf 'tmux=%s\n' "$(tmux -V 2>/dev/null)"; else echo tmux_found=0; fi; "#,
+            r#"for t in sbatch squeue scancel sacct srun; do if command -v "$t" >/dev/null 2>&1; then "#,
+            r#"printf '%s=1\n%s_version=%s\n' "$t" "$t" "$("$t" --version 2>/dev/null | head -n 1)"; "#,
+            r#"else printf '%s=0\n' "$t"; fi; done; "#,
+            r#"if command -v srun >/dev/null 2>&1 && srun --help 2>&1 | awk '/--overlap/ {f = 1} END {exit !f}'; "#,
+            r#"then echo srun_overlap=1; else echo srun_overlap=0; fi; "#,
+            r#"if command -v sinfo >/dev/null 2>&1; then to=; if command -v timeout >/dev/null 2>&1; then to='timeout 10'; fi; "#,
+            r#"printf 'partition=%s\n' "$($to sinfo -h -o %P 2>/dev/null | sed -n 's/\*$//p' | head -n 1)"; fi; "#,
+            // GNU stat, then GNU df, then the BSD/macOS route: the device from df, its type from mount.
+            r#"fs=$(stat -f -c %T "$HOME" 2>/dev/null); "#,
+            r#"if [ -z "$fs" ]; then fs=$(df -PT "$HOME" 2>/dev/null | awk 'NR==2 {print $2}'); fi; "#,
+            r#"if [ -z "$fs" ]; then dev=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $1}'); "#,
+            r#"fs=$(mount 2>/dev/null | awk -v d="$dev" '$1 == d' | sed -n 's/.*(\([^,)]*\).*/\1/p' | head -n 1); fi; "#,
+            r#"printf 'fs=%s\n' "$fs"; "#,
+        )
+    };
+}
+
 /// The probe script. It runs as `sh -c SCRIPT sh <tag>`.
 pub const SCRIPT: &str = concat!(
     r#"printf '@@pitcrew-probe-begin-%s\n' "$1"; "#,
-    r#"printf 'os=%s\n' "$(uname -s 2>/dev/null)"; "#,
-    r#"printf 'arch=%s\n' "$(uname -m 2>/dev/null)"; "#,
-    r#"printf 'hostname=%s\n' "$(uname -n 2>/dev/null)"; "#,
-    r#"printf 'home=%s\n' "$HOME"; "#,
-    r#"printf 'shell=%s\n' "$SHELL"; "#,
-    r#"if command -v tmux >/dev/null 2>&1; then echo tmux_found=1; printf 'tmux=%s\n' "$(tmux -V 2>/dev/null)"; else echo tmux_found=0; fi; "#,
-    r#"for t in sbatch squeue scancel sacct srun; do if command -v "$t" >/dev/null 2>&1; then "#,
-    r#"printf '%s=1\n%s_version=%s\n' "$t" "$t" "$("$t" --version 2>/dev/null | head -n 1)"; "#,
-    r#"else printf '%s=0\n' "$t"; fi; done; "#,
-    r#"if command -v srun >/dev/null 2>&1 && srun --help 2>&1 | awk '/--overlap/ {f = 1} END {exit !f}'; "#,
-    r#"then echo srun_overlap=1; else echo srun_overlap=0; fi; "#,
-    r#"if command -v sinfo >/dev/null 2>&1; then to=; if command -v timeout >/dev/null 2>&1; then to='timeout 10'; fi; "#,
-    r#"printf 'partition=%s\n' "$($to sinfo -h -o %P 2>/dev/null | sed -n 's/\*$//p' | head -n 1)"; fi; "#,
-    // GNU stat, then GNU df, then the BSD/macOS route: the device from df, its type from mount.
-    r#"fs=$(stat -f -c %T "$HOME" 2>/dev/null); "#,
-    r#"if [ -z "$fs" ]; then fs=$(df -PT "$HOME" 2>/dev/null | awk 'NR==2 {print $2}'); fi; "#,
-    r#"if [ -z "$fs" ]; then dev=$(df -P "$HOME" 2>/dev/null | awk 'NR==2 {print $1}'); "#,
-    r#"fs=$(mount 2>/dev/null | awk -v d="$dev" '$1 == d' | sed -n 's/.*(\([^,)]*\).*/\1/p' | head -n 1); fi; "#,
-    r#"printf 'fs=%s\n' "$fs"; "#,
+    probe_lines!(),
     r#"printf '@@pitcrew-probe-end-%s\n' "$1""#,
 );
+
+/// The probe script with the machine check's lines ([`crate::check`]) in the same report: one
+/// call, so one login where ssh shares no connection (Windows' OpenSSH has no ControlMaster), and
+/// a host that asks for a password or a one-time code asks once. It runs as
+/// `sh -c CHECKED_SCRIPT sh <tag>`.
+pub const CHECKED_SCRIPT: &str = concat!(
+    r#"printf '@@pitcrew-probe-begin-%s\n' "$1"; "#,
+    probe_lines!(),
+    crate::check::check_lines!(),
+    r#"printf '@@pitcrew-probe-end-%s\n' "$1""#,
+);
+
+/// Bounds for [`Ssh::probe_and_check`]: the probe's, and the check's 256 KiB and two minutes
+/// (eight tools, each at most ten seconds where `timeout` exists), not counting time spent on
+/// prompts.
+pub const CHECKED_LIMITS: Limits = Limits {
+    max_output: Some(1024 * 1024 + 256 * 1024),
+    timeout: Some(Duration::from_secs(30 + 120)),
+};
 
 /// What the probe found.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,10 +155,33 @@ impl Ssh {
     /// # Errors
     /// As [`Ssh::probe`].
     pub async fn probe_with(&self, host: &str, limits: Limits) -> Result<Probe, SshError> {
+        let (tag, stdout) = self.run_probe(host, SCRIPT, limits).await?;
+        safe_shell(parse(&stdout, &tag, host)?)
+    }
+
+    /// [`Ssh::probe`] and the machine check ([`crate::check`]) in **one** call
+    /// ([`CHECKED_SCRIPT`]), within [`CHECKED_LIMITS`]: the check's rows, without the helper's
+    /// ([`crate::check::helper_row`]).
+    ///
+    /// # Errors
+    /// As [`Ssh::probe`].
+    pub async fn probe_and_check(&self, host: &str) -> Result<(Probe, MachineCheck), SshError> {
+        let (tag, stdout) = self.run_probe(host, CHECKED_SCRIPT, CHECKED_LIMITS).await?;
+        let (probe, check) = parse_checked(&stdout, &tag, host)?;
+        Ok((safe_shell(probe)?, check))
+    }
+
+    /// Runs `script` on `host` with a fresh tag: the tag, and its output if it exited 0.
+    async fn run_probe(
+        &self,
+        host: &str,
+        script: &str,
+        limits: Limits,
+    ) -> Result<(String, String), SshError> {
         let tag = crate::askpass::random::<8>().map_err(SshError::Setup)?;
         let tag = crate::askpass::to_hex(&tag);
         let output = self
-            .run_limited(host, &["sh", "-c", SCRIPT, "sh", &tag], limits)
+            .run_limited(host, &["sh", "-c", script, "sh", &tag], limits)
             .await?;
         if !output.success() {
             return Err(SshError::UnexpectedOutput(format!(
@@ -137,12 +190,32 @@ impl Ssh {
                 crate::ssh::last_line(&String::from_utf8_lossy(&output.stderr))
             )));
         }
-        let probe = parse(&output.stdout_text(), &tag, host)?;
-        if let Some(shell) = probe.login_shell.as_deref().filter(|s| is_unsafe_shell(s)) {
-            return Err(SshError::UnsupportedShell(shell.to_owned()));
-        }
-        Ok(probe)
+        Ok((tag, output.stdout_text()))
     }
+}
+
+/// `probe`, unless its login shell is one PitCrew refuses.
+fn safe_shell(probe: Probe) -> Result<Probe, SshError> {
+    if let Some(shell) = probe.login_shell.as_deref().filter(|s| is_unsafe_shell(s)) {
+        return Err(SshError::UnsupportedShell(shell.to_owned()));
+    }
+    Ok(probe)
+}
+
+/// Parses [`CHECKED_SCRIPT`]'s output for the call tagged `tag`: the probe and the check's rows.
+///
+/// # Errors
+/// As [`parse`].
+pub fn parse_checked(
+    stdout: &str,
+    tag: &str,
+    fallback_hostname: &str,
+) -> Result<(Probe, MachineCheck), SshError> {
+    let values = crate::report::parse(stdout, "probe", tag).map_err(SshError::UnexpectedOutput)?;
+    Ok((
+        from_values(&values, fallback_hostname),
+        crate::check::rows(&values),
+    ))
 }
 
 /// Parses the script's output for the call tagged `tag`. Lines before the begin marker (login
@@ -153,6 +226,11 @@ impl Ssh {
 /// a newline in it, such as a strange `$HOME`, must not stand in for a later key).
 pub fn parse(stdout: &str, tag: &str, fallback_hostname: &str) -> Result<Probe, SshError> {
     let values = crate::report::parse(stdout, "probe", tag).map_err(SshError::UnexpectedOutput)?;
+    Ok(from_values(&values, fallback_hostname))
+}
+
+/// The probe in a report's values.
+fn from_values(values: &HashMap<&str, &str>, fallback_hostname: &str) -> Probe {
     let get = |key: &str| values.get(key).copied().filter(|v| !v.is_empty());
     let flag = |key: &str| get(key) == Some("1");
 
@@ -186,7 +264,7 @@ pub fn parse(stdout: &str, tag: &str, fallback_hostname: &str) -> Result<Probe, 
         scheduler: (has_sbatch && has_squeue).then_some(Scheduler::Slurm),
         home_on_network_fs: !home_fs.as_deref().is_some_and(is_local_fs),
     };
-    Ok(Probe {
+    Probe {
         info,
         home: get("home").map(str::to_owned),
         tmux_version: get("tmux")
@@ -197,7 +275,7 @@ pub fn parse(stdout: &str, tag: &str, fallback_hostname: &str) -> Result<Probe, 
         slurm,
         home_fs,
         login_shell: get("shell").map(str::to_owned),
-    })
+    }
 }
 
 fn normalize_os(uname: Option<&str>) -> String {
@@ -416,6 +494,74 @@ mod tests {
         // It travels on the command line: well within Windows' limit once wrapped.
         let wrapped = crate::quote::remote_command(&["sh", "-c", SCRIPT, "sh", TAG]).unwrap();
         assert!(wrapped.len() < 20_000, "{}", wrapped.len());
+    }
+
+    /// The probe with the check is one script and one report: the probe as [`SCRIPT`] reports
+    /// it, and the check's rows beside it (their keys never meet), here from this machine's `sh`
+    /// with stand-ins first on its `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn the_checked_probe_is_one_report() {
+        use pitcrew_protocol::machine_setup::{MachineCheckItem, MachineCheckStatus};
+        use std::os::unix::fs::PermissionsExt as _;
+        assert!(CHECKED_SCRIPT.starts_with(r#"printf '@@pitcrew-probe-begin-%s\n' "$1";"#));
+        assert!(CHECKED_SCRIPT.ends_with(r#"printf '@@pitcrew-probe-end-%s\n' "$1""#));
+        assert!(CHECKED_SCRIPT.contains(crate::check::check_lines!()));
+        let wrapped =
+            crate::quote::remote_command(&["sh", "-c", CHECKED_SCRIPT, "sh", TAG]).unwrap();
+        assert!(wrapped.len() < 20_000, "{}", wrapped.len());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for (name, body) in [
+            ("claude", "echo '2.1.3 (Claude Code)'"),
+            ("sbatch", "echo 'slurm 23.02.7'"),
+            ("squeue", "echo 'slurm 23.02.7'"),
+        ] {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut path = bin.as_os_str().to_owned();
+        path.push(":/usr/bin:/bin");
+        let run = |script: &str| {
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", script, "sh", TAG])
+                .env("PATH", &path)
+                .env("HOME", tmp.path())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let (probe, check) = parse_checked(&run(CHECKED_SCRIPT), TAG, "h").unwrap();
+        assert_eq!(
+            probe,
+            parse(&run(SCRIPT), TAG, "h").unwrap(),
+            "the same probe"
+        );
+        assert!(probe.has_sbatch && probe.has_squeue);
+        assert_eq!(probe.slurm.sbatch.as_deref(), Some("slurm 23.02.7"));
+        let row = |id| check.rows.iter().find(|r| r.id == id).unwrap();
+        assert_eq!(
+            row(MachineCheckItem::CliClaude).status,
+            MachineCheckStatus::Ok
+        );
+        assert_eq!(
+            row(MachineCheckItem::CliClaude).detail,
+            "2.1.3 (Claude Code)"
+        );
+        assert_eq!(
+            row(MachineCheckItem::CliCodex).status,
+            MachineCheckStatus::Missing
+        );
+        assert!(
+            row(MachineCheckItem::Slurm)
+                .detail
+                .contains("scancel is not on PATH"),
+            "{check:?}"
+        );
     }
 
     #[test]

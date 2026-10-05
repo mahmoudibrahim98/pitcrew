@@ -204,6 +204,7 @@ export const recapScopeMap: RecapScopeMap = {
   // not be cached yet).
   workstream_created: (d) => scope({ workstream: d.workstream.id, project: d.workstream.project }),
   workstream_changed: (d, cache) => scopeOfWorkstream(d.workstream, cache),
+  workstream_linked: (d, cache) => scopeOfWorkstream(d.workstream, cache),
 
   task_created: (d) => scope({ task: d.task.id, workstream: d.task.workstream, project: d.task.project }),
   task_moved: (d, cache) => scopeOfTask(d.task, cache),
@@ -253,6 +254,11 @@ export const recapScopeMap: RecapScopeMap = {
   safety_changed: () => 'excluded',
   brief_accepted: (d, cache) => (d.target.kind === 'project' ? scope({ project: d.target.id }) : scopeOfWorkstream(d.target.id, cache)),
   decision_recorded: (d, cache) => (d.workstream === undefined ? NONE_SCOPE : scopeOfWorkstream(d.workstream, cache)),
+  // Outward writes are about their task.
+  write_proposed: (d, cache) => (d.write.task === undefined ? NONE_SCOPE : scopeOfTask(d.write.task, cache)),
+  write_started: (d, cache) => (d.task === undefined ? NONE_SCOPE : scopeOfTask(d.task, cache)),
+  write_retry_requested: (d, cache) => (d.task === undefined ? NONE_SCOPE : scopeOfTask(d.task, cache)),
+  write_finished: (d, cache) => (d.task === undefined ? NONE_SCOPE : scopeOfTask(d.task, cache)),
 };
 
 /**

@@ -111,6 +111,8 @@ export function installFakeDesktop({ hubUrl, token, jobScript, initialWorkspace 
     record.adds.push(args.plan);
     const progress = channel(args.events);
     progress({ step: COPY, state: 'running' });
+    progress({ step: COPY, state: 'running', detail: 'checking for a copy already there' });
+    progress({ step: COPY, state: 'running', detail: 'uploading' });
     progress({ step: COPY, state: 'running', detail: '40% sent' });
     const reply = await ask({ id: 'pw-1', host: 'hpc-login', kind: 'password', text: "sam@hpc-login's password: " });
     if (typeof reply.answer !== 'string') {
@@ -118,7 +120,10 @@ export function installFakeDesktop({ hubUrl, token, jobScript, initialWorkspace 
       progress({ step: 'add', state: 'failed', detail: 'ssh: authentication cancelled' });
       return fail('unreachable', 'ssh: authentication cancelled');
     }
+    progress({ step: COPY, state: 'running', detail: 'verifying the sha256 and the version on the machine' });
+    progress({ step: COPY, state: 'running', detail: 'installed and verified' });
     progress({ step: COPY, state: 'done' });
+    progress({ step: SUBMIT, state: 'running', detail: 'submitting the job script shown' });
     progress({ step: SUBMIT, state: 'running', detail: 'job 4242 pending (Priority)' });
     progress({ step: SUBMIT, state: 'done', detail: 'Submitted batch job 4242' });
     const info = (await (await fetch(`${hubUrl}/v1/workspace`, { headers: { Authorization: `Bearer ${token}` } })).json()) as {
@@ -179,6 +184,20 @@ export function installFakeDesktop({ hubUrl, token, jobScript, initialWorkspace 
           arch: 'x86_64',
           slurm: { version: '23.02.7', defaultPartition: 'gpu', srunOverlap: true },
           tmux: { version: '3.4' },
+          // The machine check over the same connection (desktop-gateway.md, `RemoteProbe.check`).
+          check: {
+            rows: [
+              { id: 'cli_claude', status: 'ok', detail: '2.1.3 (Claude Code)', version: '2.1.3 (Claude Code)' },
+              { id: 'cli_codex', status: 'missing', detail: 'Codex (codex) is not on PATH.', fix: 'install_page' },
+              { id: 'cli_opencode', status: 'missing', detail: 'OpenCode (opencode) is not on PATH.', fix: 'install_page' },
+              { id: 'tmux', status: 'ok', detail: 'tmux 3.4', version: 'tmux 3.4' },
+              { id: 'git', status: 'ok', detail: 'git version 2.43.0', version: 'git version 2.43.0' },
+              { id: 'gh', status: 'missing', detail: 'Not found on PATH: only GitHub’s integration needs it.', fix: 'install_page' },
+              { id: 'disk', status: 'ok', detail: '812 GB free in the home folder' },
+              { id: 'slurm', status: 'ok', detail: 'slurm 23.02.7', version: 'slurm 23.02.7' },
+              { id: 'helper', status: 'missing', detail: 'Not installed: connecting installs it in ~/.pitcrew.', fix: 'install_helper' },
+            ],
+          },
         };
       }
       case 'gateway_remote_plan': {

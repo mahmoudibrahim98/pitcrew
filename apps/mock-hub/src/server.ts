@@ -16,6 +16,8 @@ import {
   terminalTarget,
   type TerminalTarget,
 } from './live.ts';
+import * as integrations from './integrations.ts';
+import { openSignInTerminal, signInTerminal } from './machine-setup.ts';
 import { loadRecaps } from './recaps.ts';
 import { MOCK_VERSION, authenticate, handleApi, type Reply } from './routes.ts';
 import {
@@ -26,6 +28,7 @@ import {
   loadFixture,
   type Delays,
 } from './state.ts';
+import type { MemberId } from './types.ts';
 import { ApiFailure, forbidden, invalid, notFound } from './validate.ts';
 import {
   acceptUpgrade,
@@ -60,6 +63,11 @@ export interface ServerOptions {
   fresh?: boolean;
   /** Receives one line per request. Silent by default. */
   log?: (line: string) => void;
+  /**
+   * The folder of recorded GitHub and Jira exchanges integrations read (`*.fixture`), instead of
+   * `fixtures/`. It is read again at each sync, so a test can change what "upstream" says.
+   */
+  integrationFixtures?: string;
 }
 
 export interface RunningServer {
@@ -81,6 +89,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     options.scanWindow ?? DEFAULT_SCAN_WINDOW,
     options.fresh === true ? undefined : loadRecaps(RECAPS),
   );
+  if (options.integrationFixtures !== undefined) integrations.useFixtures(hub, options.integrationFixtures);
   const log = options.log ?? ((): void => {});
   const sockets = new Set<WebSocketConnection>();
   const server = createServer((req, res) => {
@@ -355,7 +364,7 @@ function serveUpgrade(
     const conn =
       target.kind === 'stream'
         ? acceptStream(hub, req, socket, head, streamSince(query), caller.memberId)
-        : acceptTerminal(hub, req, socket, head, terminalTarget(hub, target.session, query));
+        : acceptTerminalOrSignIn(hub, req, socket, head, target.session, query, caller.memberId);
     log(`WS ${path} 101`);
     return conn;
   } catch (error) {
@@ -388,6 +397,25 @@ function acceptTerminal(
 ): WebSocketConnection {
   const conn = acceptUpgrade(req, socket, head, SUBPROTOCOL);
   openTerminal(hub, conn, target);
+  return conn;
+}
+
+/** A sign-in's terminal (machine-setup.ts), else a session's. */
+function acceptTerminalOrSignIn(
+  hub: Hub,
+  req: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  ref: string,
+  query: URLSearchParams,
+  member: MemberId,
+): WebSocketConnection {
+  const signIn = signInTerminal(hub, ref, member);
+  if (signIn === undefined) {
+    return acceptTerminal(hub, req, socket, head, terminalTarget(hub, ref, query));
+  }
+  const conn = acceptUpgrade(req, socket, head, SUBPROTOCOL);
+  openSignInTerminal(hub, conn, signIn);
   return conn;
 }
 

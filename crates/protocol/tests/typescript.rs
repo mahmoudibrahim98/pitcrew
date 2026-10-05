@@ -1,6 +1,9 @@
 //! Deterministic, explicit export; normal protocol tests never write bindings.
 #![cfg(feature = "ts")]
-use pitcrew_protocol::{api, events, ids, import, model, recap, runner, scan, transcript};
+use pitcrew_protocol::{
+    api, events, ids, import, integrations, machine_setup, model, recap, runner, scan, transcript,
+    writes,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{error::Error, fmt::Debug, fs, path::Path};
 use ts_rs::{Config, TS};
@@ -79,6 +82,7 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     ids::AskId::export_all(&config)?;
     ids::CommandId::export_all(&config)?;
     ids::DispatchId::export_all(&config)?;
+    ids::IntegrationId::export_all(&config)?;
     ids::EventId::export_all(&config)?;
     ids::MachineId::export_all(&config)?;
     ids::MemberId::export_all(&config)?;
@@ -93,6 +97,19 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     ids::TerminalId::export_all(&config)?;
     ids::WorkspaceId::export_all(&config)?;
     ids::WorkstreamId::export_all(&config)?;
+    integrations::CredentialInfo::export_all(&config)?;
+    integrations::CredentialSource::export_all(&config)?;
+    integrations::Integration::export_all(&config)?;
+    integrations::IntegrationCheck::export_all(&config)?;
+    integrations::IntegrationLink::export_all(&config)?;
+    integrations::IntegrationSettings::export_all(&config)?;
+    integrations::JiraDeployment::export_all(&config)?;
+    integrations::NewCredential::export_all(&config)?;
+    integrations::NewIntegration::export_all(&config)?;
+    integrations::ScopeCheck::export_all(&config)?;
+    integrations::SyncCounts::export_all(&config)?;
+    integrations::SyncProblem::export_all(&config)?;
+    integrations::SyncStatus::export_all(&config)?;
     model::Answer::export_all(&config)?;
     model::Ask::export_all(&config)?;
     model::AskKind::export_all(&config)?;
@@ -168,10 +185,24 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     scan::ScanReport::export_all(&config)?;
     scan::Suggestion::export_all(&config)?;
     scan::WorkstreamSuggestion::export_all(&config)?;
+    // Machine setup (api-v1.md, "Machine setup").
+    machine_setup::MachineCheck::export_all(&config)?;
+    machine_setup::AgentAccount::export_all(&config)?;
+    machine_setup::StartSignIn::export_all(&config)?;
+    machine_setup::SignIn::export_all(&config)?;
     transcript::PlanItem::export_all(&config)?;
     transcript::PlanStatus::export_all(&config)?;
     transcript::TranscriptItem::export_all(&config)?;
     transcript::TranscriptPage::export_all(&config)?;
+    writes::CloseReason::export_all(&config)?;
+    writes::IssueState::export_all(&config)?;
+    writes::NewWrite::export_all(&config)?;
+    writes::UpstreamWrite::export_all(&config)?;
+    writes::WriteFields::export_all(&config)?;
+    writes::WriteOperation::export_all(&config)?;
+    writes::WriteProposal::export_all(&config)?;
+    writes::WriteResult::export_all(&config)?;
+    writes::WriteState::export_all(&config)?;
 
     fs::write(
         bindings.join("TimestampMs.ts"),
@@ -315,6 +346,165 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
         runner::RunnerCommand::EndSession {
             session: "01J00000000000000000000000".parse()?,
             mode: runner::EndMode::Graceful,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "integration",
+        integrations::Integration {
+            id: "01J00000000000000000000000".parse()?,
+            name: "Demo repositories".into(),
+            settings: integrations::IntegrationSettings::Github {
+                repos: vec!["example-org/demo-repo".into()],
+                api_base: None,
+            },
+            credential: integrations::CredentialInfo {
+                source: integrations::CredentialSource::GhCli,
+                stored: false,
+            },
+            interval_minutes: 15,
+            added_by: "01J00000000000000000000000".parse()?,
+            added_at: 42,
+            status: integrations::SyncStatus {
+                running: false,
+                last_attempt_at: Some(40),
+                last_success_at: Some(41),
+                next_at: None,
+                rate_limited_until: None,
+                problems: vec![],
+                last_run: Some(integrations::SyncCounts::default()),
+            },
+            links: vec![integrations::IntegrationLink {
+                workstream: "01J00000000000000000000000".parse()?,
+                scope: model::ExternalRef {
+                    system: model::ExternalSystem::Github,
+                    key: "example-org/demo-repo#milestone:1".into(),
+                    url: Some("https://github.com/example-org/demo-repo/milestone/1".into()),
+                },
+                title: Some("v1 launch".into()),
+            }],
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "linked",
+        events::EventBody::WorkstreamLinked {
+            workstream: "01J00000000000000000000000".parse()?,
+            external: vec![],
+        },
+    )?;
+    let ask: ids::AskId = "01J00000000000000000000000".parse()?;
+    fixture(
+        &config,
+        &mut examples,
+        "write",
+        writes::UpstreamWrite {
+            proposal: writes::WriteProposal {
+                ask,
+                integration: "01J00000000000000000000000".parse()?,
+                system: model::ExternalSystem::Github,
+                scope: "example-org/demo-repo".into(),
+                target: Some(model::ExternalRef {
+                    system: model::ExternalSystem::Github,
+                    key: "example-org/demo-repo#1".into(),
+                    url: Some("https://github.com/example-org/demo-repo/issues/1".into()),
+                }),
+                task: Some(id),
+                operation: writes::WriteOperation::Close,
+                before: writes::WriteFields {
+                    state: Some(writes::IssueState::Open),
+                    ..writes::WriteFields::default()
+                },
+                after: writes::WriteFields {
+                    state: Some(writes::IssueState::Closed),
+                    close_reason: Some(writes::CloseReason::Completed),
+                    ..writes::WriteFields::default()
+                },
+                requested_by: "01J00000000000000000000000".parse()?,
+                cause: Some("01J00000000000000000000000".parse()?),
+            },
+            state: writes::WriteState::Sent,
+            attempts: 1,
+            proposed_at: 40,
+            answered_at: Some(41),
+            answered_by: Some("01J00000000000000000000000".parse()?),
+            finished_at: Some(42),
+            result: Some(writes::WriteResult::Sent {
+                created: None,
+                url: Some("https://github.com/example-org/demo-repo/issues/1".into()),
+            }),
+            retry_requested_by: None,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "machineCheck",
+        machine_setup::MachineCheck {
+            rows: vec![
+                machine_setup::MachineCheckRow {
+                    id: machine_setup::MachineCheckItem::CliClaude,
+                    status: machine_setup::MachineCheckStatus::Missing,
+                    detail: "Not on PATH.".into(),
+                    version: None,
+                    fix: Some(machine_setup::MachineCheckFix::InstallPage),
+                },
+                machine_setup::MachineCheckRow {
+                    id: machine_setup::MachineCheckItem::Tmux,
+                    status: machine_setup::MachineCheckStatus::Ok,
+                    detail: "tmux 3.4".into(),
+                    version: Some("tmux 3.4".into()),
+                    fix: None,
+                },
+            ],
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "writeRetryRequested",
+        events::EventBody::WriteRetryRequested {
+            ask,
+            task: Some(id),
+            by: "01J00000000000000000000000".parse()?,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "agentAccount",
+        machine_setup::AgentAccount {
+            engine: model::Engine::Codex,
+            installed: true,
+            signed_in: Some(true),
+            account: Some("ChatGPT".into()),
+            detail: None,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "writeFinished",
+        events::EventBody::WriteFinished {
+            ask,
+            task: Some(id),
+            result: writes::WriteResult::NotSent {
+                reason: "Not sent: Sam chose not to.".into(),
+            },
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "signIn",
+        machine_setup::SignIn {
+            engine: model::Engine::Claude,
+            terminal: "01J00000000000000000000000".parse()?,
+            command: vec!["claude".into(), "auth".into(), "login".into()],
+            running: true,
+            started: 42,
         },
     )?;
     // Request dimensions may be omitted even though Rust serializes their defaults.

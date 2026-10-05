@@ -16,6 +16,7 @@ import { useProjectsNav } from './nav.tsx';
 import { WorkstreamOverviewBody } from './overview.tsx';
 import { TasksList } from './tasks-list.tsx';
 import { FilesTab } from './files.tsx';
+import { WorkstreamLinks } from './integrations/workstream-links.tsx';
 import { ErrorNote, MaybeLink } from './ui.tsx';
 
 type Tab = 'stands' | 'board' | 'tasks' | 'agents' | 'activity' | 'files';
@@ -89,6 +90,7 @@ export function WorkstreamPage() {
             </>
           )}
         </div>
+        {workstream !== undefined && <WorkstreamLinks workstream={workstream} />}
         <ToggleGroup.Root
           type="single"
           value={tab}

@@ -218,6 +218,24 @@ pub struct Progress {
     pub total: u64,
 }
 
+/// Where a [`deploy`] has got to, for a live log (`DeployOptions::step`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeployStep {
+    /// Looking for a copy of this version already there, and verifying it (sha256 computed on
+    /// the machine, then `--version`).
+    Checking,
+    /// A copy was there and verified: nothing is uploaded.
+    AlreadyInstalled,
+    /// None was: the upload begins ([`Progress`] follows).
+    Uploading,
+    /// Every byte is sent: the machine checks the size, the sha256 and `--version`, then switches
+    /// `current` to it.
+    Verifying,
+    /// Uploaded, verified and switched to.
+    Installed,
+}
+
 /// Bounds and callbacks for [`deploy`].
 #[derive(Clone)]
 pub struct DeployOptions {
@@ -232,6 +250,8 @@ pub struct DeployOptions {
     pub stale_lock: Duration,
     /// Called as the upload goes.
     pub progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+    /// Called at each [`DeployStep`], in order.
+    pub step: Option<Arc<dyn Fn(DeployStep) + Send + Sync>>,
 }
 
 impl Default for DeployOptions {
@@ -241,6 +261,7 @@ impl Default for DeployOptions {
             lock_wait: Duration::from_secs(60),
             stale_lock: Duration::from_secs(30 * 60),
             progress: None,
+            step: None,
         }
     }
 }
@@ -252,6 +273,7 @@ impl fmt::Debug for DeployOptions {
             .field("lock_wait", &self.lock_wait)
             .field("stale_lock", &self.stale_lock)
             .field("progress", &self.progress.is_some())
+            .field("step", &self.step.is_some())
             .finish()
     }
 }
@@ -347,6 +369,11 @@ pub async fn deploy(
         });
     }
     options.check()?;
+    let step = |at: DeployStep| {
+        if let Some(step) = &options.step {
+            step(at);
+        }
+    };
     let args = vec![
         helper.version().to_owned(),
         helper.sha256().to_owned(),
@@ -355,6 +382,7 @@ pub async fn deploy(
         minutes(options.stale_lock).to_string(),
     ];
     let timeout = options.lock_wait.saturating_add(options.timeout);
+    step(DeployStep::Checking);
     let check = script::run(
         target,
         Call {
@@ -367,7 +395,11 @@ pub async fn deploy(
     )
     .await?;
     match check.get("state") {
-        Some("installed") => return deployed(target, helper, &check),
+        Some("installed") => {
+            let done = deployed(target, helper, &check)?;
+            step(DeployStep::AlreadyInstalled);
+            return Ok(done);
+        }
         Some("absent") => {}
         other => {
             return Err(HelperError::UnexpectedOutput(format!(
@@ -379,14 +411,22 @@ pub async fn deploy(
     let total = helper.len();
     let skip = u64::try_from(script::SCRIPT.len()).unwrap_or(u64::MAX);
     let progress = options.progress.clone();
+    let steps = options.step.clone();
+    let verifying = std::sync::atomic::AtomicBool::new(false);
     let on_sent = move |sent: u64| {
+        let sent = sent.saturating_sub(skip).min(total);
         if let Some(progress) = &progress {
-            progress(Progress {
-                sent: sent.saturating_sub(skip).min(total),
-                total,
-            });
+            progress(Progress { sent, total });
+        }
+        // Once, when the last byte is handed over: the machine checks it all from here.
+        if sent == total
+            && !verifying.swap(true, std::sync::atomic::Ordering::Relaxed)
+            && let Some(steps) = &steps
+        {
+            steps(DeployStep::Verifying);
         }
     };
+    step(DeployStep::Uploading);
     let install = script::run(
         target,
         Call {
@@ -398,7 +438,9 @@ pub async fn deploy(
         },
     )
     .await?;
-    deployed(target, helper, &install)
+    let done = deployed(target, helper, &install)?;
+    step(DeployStep::Installed);
+    Ok(done)
 }
 
 /// Checks a successful report against what was asked for.

@@ -80,7 +80,8 @@ interface GatewayResponse {
 - **Every daemon answer is a response,** whatever its status: a 404 or 409 comes back as
   `{status, body}` with the `ApiError` body, as over HTTP.
 - **The gateway checks:**
-  - `path` starts with `/v1/`;
+  - `path` starts with `/v1/`, and is not an integration's credential route (see "Integration
+    credentials");
   - it has no `..` segment, no `//`, no `\`, no `#` and no control characters;
   - its query, if any, is passed on as it is;
   - `body` is at most 1 MiB, and is sent with `Content-Type: application/json`.
@@ -97,6 +98,23 @@ interface GatewayError {
   message: string;
 }
 ```
+
+## Integration credentials
+
+`gateway_integration_credential({ workspace, integration, secret }) → GatewayResponse`
+
+- Hands a GitHub or Jira integration's secret to the workspace's daemon once, as
+  `PUT /v1/integrations/{integration}/credential` with body `{ "secret": … }` (api-v1.md,
+  "Integrations"), and resolves with the daemon's answer whatever its status (`204` when stored).
+  `integration` is an id (letters, digits, `_` and `-`, at most 64); anything else is `invalid`
+  before any connection is made.
+- **`gateway_request` refuses that route** (`invalid`), however its path is written (letter case,
+  percent-escapes): the webview's general channel never carries a secret, and no answer ever
+  holds one (the daemon never returns it).
+- The gateway holds the secret only while the request is sent, never logs it (the request is
+  logged like any other: workspace, method, route, status, time), and never stores it: the daemon
+  keeps it, privately, in its own state directory.
+- In a browser (development) the UI sends the same `PUT` itself; there is no gateway there.
 
 ## Sockets
 
@@ -185,8 +203,20 @@ interface RemoteProbe {
   helper?: { version: string; running: boolean };
   slurm?: { version: string; defaultPartition?: string; srunOverlap: boolean };
   tmux?: { version: string };              // offer the tmux launcher only from 3.2 on
+  check?: MachineCheck;                    // api-v1.md, "Machine setup"
 }
 ```
+
+`check` is the machine check, made **in the probe's own call** before PitCrew is installed there
+(`pitcrew_remote`'s `Ssh::probe_and_check`: one login, so a host that asks for a password or a
+one-time code asks once for both): the rows of API v1's `MachineCheck` for each agent CLI and its
+version, tmux, git, gh, the free space in the home folder and SLURM where `sbatch` is (never on
+WSL), then a `helper` row from what the probe found (`ok` running, `warn` installed but stopped,
+`missing`; the last two with the fix `install_helper`, which is the add itself). It runs only
+`command -v`, each tool's `--version` (under `timeout 10` where there is one) and `df`: nothing is
+installed or written. Since it is the probe's call, the gateway always answers it; `check` stays
+optional in the type. The UI reads it
+as it reads the hub's (a missing tool's fix is its install page, from the UI's own table).
 
 `gateway_remote_plan(req) → RemotePlan` says what adding would do, without doing it:
 
@@ -215,6 +245,14 @@ interface RemotePlan {
 Progress arrives on `events` as `{ step: string, state: 'running' | 'done' | 'failed', detail?:
 string }`, ending with one `done` or `failed` for the whole add. A plan is used once. Errors are
 `GatewayError`s; a refused plan or launch is `invalid`, and a lost connection is `unreachable`.
+
+The `running` messages' `detail` is the add's live log, one line each: for the helper's step,
+`checking for a copy already there`, then `already there, and verified (sha256 and version)`, or
+`uploading`, `N% sent` (every 10 %), `verifying the sha256 and the version on the machine` and
+`installed and verified`; for the launch, `starting it in the background` or `starting it in
+tmux` and then `it runs and listens` (or `it was already running`), or for SLURM `submitting the
+job script shown` and the job's state while it waits (`job 4242 pending (Priority)`). Onboarding
+shows them as lines, as they come.
 
 - **Pairing:** the gateway reads the remote hub's device token over the same SSH connection, from
   the file `pitcrewd token show-path` names, and keeps it in the OS keychain (`TokenStore`). The

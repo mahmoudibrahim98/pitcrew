@@ -70,6 +70,12 @@ export interface Transport {
    * query. A plain function: it may be passed around unbound.
    */
   openSocket(path: string): TransportSocket;
+  /**
+   * Hands an integration's secret to the daemon (`PUT /v1/integrations/{id}/credential`). In the
+   * desktop app this is the gateway's own command (`gateway_integration_credential`), never
+   * `request`, which refuses that route. Absent where `request` may carry it (a browser).
+   */
+  storeCredential?(integration: string, secret: string): Promise<TransportResponse>;
 }
 
 /** Inside the desktop app's webview (`docs/build/contracts/desktop-gateway.md`). */
