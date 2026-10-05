@@ -8,9 +8,8 @@ use crate::{
 use pitcrew_protocol::{
     api::Caller,
     events::EventBody,
-    ids::PersonaId,
-    model::{Member, MemberKind, PermissionMode, Persona},
-    settings::{SavePersona, SaveProfile},
+    model::{Member, MemberKind},
+    settings::SaveProfile,
 };
 
 impl WorkService {
@@ -122,51 +121,5 @@ impl WorkService {
         Ok(member)
     }
 
-    /// Edit an existing default-agent recipe for future sessions.
-    /// # Errors
-    /// Unknown recipe, unauthorized owner, invalid fields or database error.
-    pub fn save_default_persona(
-        &self,
-        caller: &Caller,
-        id: PersonaId,
-        input: SavePersona,
-    ) -> Result<Persona> {
-        self.require_owner(caller)?;
-        let _guard = self.lock();
-        let before = self
-            .read(|c| query::persona(c, &id))?
-            .ok_or_else(|| WorkError::not_found("Unknown default agent."))?;
-        let name = checked_text(&input.name, "name", 80)?;
-        for (value, max, field) in [
-            (&input.model, 200, "model"),
-            (&input.instructions, 32768, "instructions"),
-        ] {
-            if value
-                .as_ref()
-                .is_some_and(|s| s.chars().count() > max || s.contains('\0'))
-            {
-                return Err(WorkError::invalid(format!("Invalid {field}.")));
-            }
-        }
-        if input.permission_mode == PermissionMode::BypassPermissions {
-            return Err(WorkError::invalid("Bypass permissions is unavailable."));
-        }
-        let persona = Persona {
-            id,
-            name,
-            engine: input.engine,
-            model: input.model.filter(|s| !s.trim().is_empty()),
-            instructions: input.instructions.filter(|s| !s.trim().is_empty()),
-            permission_mode: input.permission_mode,
-        };
-        if persona != before {
-            self.append(&[self.by(
-                caller,
-                EventBody::PersonaSaved {
-                    persona: persona.clone(),
-                },
-            )])?;
-        }
-        Ok(persona)
-    }
+
 }

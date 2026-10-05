@@ -92,7 +92,7 @@ function AgentRecipe({ persona }: { persona: Persona }) {
     <Field label="Default agent name" name="name" value={persona.name} required />
     <label className="block">CLI<select name="engine" defaultValue={persona.engine} className={FIELD}><option value="claude">Claude Code</option><option value="codex">Codex</option><option value="opencode">OpenCode</option></select></label>
     <Field label="Model (blank uses the CLI default)" name="model" value={persona.model ?? ''} maxLength={200} />
-    <label className="block">Standing instructions<textarea name="instructions" className={FIELD} rows={4} maxLength={32768} defaultValue={persona.instructions ?? ''} /></label>
+    <label className="block">Standing instructions<textarea name="instructions" className={FIELD} rows={4} maxLength={32000} defaultValue={persona.instructions ?? ''} /></label>
     <PermissionSelect value={persona.permission_mode} />
   </Form>{action.feedback}</section>;
 }
@@ -102,12 +102,11 @@ function PermissionSelect({ value }: { value: string }) {
 function Agents({ api }: { api: OnboardingApi }) {
   const client = useApi(); const me = useMe(); const members = useMembers();
   const personas = useLiveQuery({ queryKey: keys.personas, queryFn: ({ signal }) => client.personas(signal) });
-  const owner = members.data?.find((m) => m.kind === 'human');
   return <><ConnectedMachines /><MachineCheck api={api} /><h3 className="font-semibold">CLI accounts on this workspace’s machine</h3><SignInPanel api={api} target={{ kind: 'local' }} />
     <h3 className="font-semibold">Default agents</h3><p>These recipes apply to new sessions. Existing sessions keep their current settings.</p>
     {personas.error && <><p role="alert">{message(personas.error)}</p><Button onClick={() => void personas.refetch()}>Retry default agents</Button></>}
     {personas.data?.length === 0 && <p>No default agents yet. Add an agent from + New.</p>}
-    {personas.data?.map((p) => me.data?.id === owner?.id ? <AgentRecipe key={p.id} persona={p} /> : <p key={p.id}>{p.name} ({p.engine}); only the owner can edit defaults.</p>)}
+    {personas.data?.map((p) => !members.data?.some((m) => m.persona === p.id && m.owner !== me.data?.id) ? <AgentRecipe key={p.id} persona={p} /> : <p key={p.id}>{p.name} ({p.engine}); only the owning person can edit defaults.</p>)}
   </>;
 }
 function Hooks({ api }: { api: OnboardingApi }) {

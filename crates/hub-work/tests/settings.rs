@@ -2,8 +2,8 @@ mod common;
 use common::*;
 use pitcrew_hub_work::projection::Directory;
 use pitcrew_protocol::{
-    api::ErrorCode,
-    settings::{SavePersona, SaveProfile},
+    api::{ErrorCode, PersonaEdit},
+    settings::SaveProfile,
 };
 use serde_json::json;
 
@@ -85,15 +85,15 @@ fn workspace_persistence_failure_keeps_the_live_name_and_recipes_replay() {
     );
     let old = work.personas().unwrap().remove(0);
     let input = || {
-        serde_json::from_value::<SavePersona>(json!({"name":"Updated recipe", "engine":"codex", "model":"synthetic-model", "instructions":"Synthetic instructions", "permission_mode":"plan"})).unwrap()
+        serde_json::from_value::<PersonaEdit>(json!({"name":"Updated recipe", "engine":"codex", "model":"synthetic-model", "instructions":"Synthetic instructions", "permission_mode":"plan"})).unwrap()
     };
     assert_eq!(
-        work.save_default_persona(&person(WRITER), old.id, input())
+        work.save_persona(&person(WRITER), Some(old.id), input())
             .unwrap_err()
             .code(),
         ErrorCode::Forbidden
     );
-    let saved = work.save_default_persona(&sam, old.id, input()).unwrap();
+    let saved = work.save_persona(&sam, Some(old.id), input()).unwrap();
     work.store().rebuild(Directory::NAME).unwrap();
     assert!(work.personas().unwrap().contains(&saved));
 }

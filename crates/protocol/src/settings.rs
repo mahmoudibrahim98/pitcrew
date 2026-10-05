@@ -1,5 +1,5 @@
 //! Strict requests for settings changed after setup.
-use crate::model::{Avatar, Engine, PermissionMode};
+use crate::model::Avatar;
 use serde::Deserialize;
 
 /// A machine's display name after setup.
@@ -22,18 +22,3 @@ pub struct SaveProfile {
     pub avatar: Avatar,
 }
 
-/// A full replacement of an existing agent recipe.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SavePersona {
-    /// Display name.
-    pub name: String,
-    /// CLI to run.
-    pub engine: Engine,
-    /// Model override, omitted for the CLI default.
-    pub model: Option<String>,
-    /// Standing instructions.
-    pub instructions: Option<String>,
-    /// New sessions' permission mode.
-    pub permission_mode: PermissionMode,
-}

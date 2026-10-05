@@ -427,6 +427,7 @@ function directoryText(value: string, field: string, max: number): string {
   return text;
 }
 const savePersona = (editing = false): Handler => (hub, ctx) => {
+  if (typeof ctx.body === 'object' && ctx.body !== null && Object.keys(ctx.body).some(k => !['name', 'engine', 'model', 'instructions', 'permission_mode'].includes(k))) throw invalid('Supply agent recipe fields only.');
   const previous = !editing ? undefined
     : found(hub.findPersona(ctx.param('id')), 'No such persona.');
   if (previous !== undefined && hub.members.some((m) => m.persona === previous.id && m.owner !== ctx.caller.memberId)) throw forbidden('A person may edit only personas whose members they own.');

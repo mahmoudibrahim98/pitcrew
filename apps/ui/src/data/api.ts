@@ -176,7 +176,7 @@ export function createApi(options: ApiOptions) {
     request,
     settings: (signal?: AbortSignal) => get<{ owner: string; data_folder: string; logs: string; daemon_version: string; protocol_version: number }>('/v1/settings', undefined, signal),
     saveProfile: (profile: { name: string; handle: string; avatar: { initials: string; colour: string } }) => request<Member>('PUT', '/v1/me/profile', { body: profile }),
-    savePersona: (persona: Persona) => { const { id: personaId, ...body } = persona; return request<Persona>('PUT', `/v1/personas/${id(personaId)}`, { body }); },
+    savePersona: (persona: Persona) => { const { id: personaId, ...fields } = persona; const body = { ...fields, model: fields.model?.trim() || undefined, instructions: fields.instructions || undefined }; return request<Persona>('PUT', `/v1/personas/${id(personaId)}`, { body }); },
     renameWorkspace: (name: string) => request<WorkspaceInfo['workspace']>('PUT', '/v1/settings/workspace', { body: { name } }),
     renameMachine: (machine: string, name: string) => request<Machine>('PUT', `/v1/machines/${id(machine)}`, { body: { name } }),
     me: (signal?: AbortSignal) => get<Member>('/v1/me', undefined, signal),

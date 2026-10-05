@@ -5,7 +5,8 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
 ## Settings after setup
 
 All writes below require a device token. Profile edits affect only the token's person;
-workspace and persona edits require the workspace's first person (the owner). Unknown ids are
+workspace and machine edits require the workspace's first person (the owner). Agent recipes
+use directory editing permissions: a person may edit recipes whose linked members they own. Unknown ids are
 `404`, another person editing owner settings is `403`, malformed or unknown fields are `400`,
 and a handle already held by another member is `409`. Names are trimmed, 1–80 Unicode code
 points without control characters; handles follow the setup rules and cannot be `@office`.
@@ -16,7 +17,7 @@ points without control characters; handles follow the setup rules and cannot be 
 - `PUT /v1/personas/{id}`: `{name, engine, model?, instructions?, permission_mode}` → `Persona`.
   Edits an existing default-agent recipe, appending `persona_saved`; new sessions use the new
   recipe, existing sessions keep theirs. Model is at most 200 code points, instructions at most
-  32,768, neither with NUL; bypass permissions remains refused by the runner.
+  32,000; model uses the directory rules (nonempty and no leading '-'); bypass permissions remains refused by the runner.
 - `GET /v1/settings`: owner id, read-only `data_folder`, `logs` description, `daemon_version`,
   and `protocol_version`. Owner-only: folder paths are never exposed to agents or other people.
 - `PUT /v1/settings/workspace`: `{name}` → `Workspace`. Owner-only. The daemon atomically saves

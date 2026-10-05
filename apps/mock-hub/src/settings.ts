@@ -1,5 +1,5 @@
 import type { Hub } from './state.ts';
-import type { Member, Persona } from './types.ts';
+import type { Member } from './types.ts';
 import { conflict, forbidden, invalid, isRecord, notFound } from './validate.ts';
 
 export function ownerOnly(hub: Hub, member: string) {
@@ -42,24 +42,6 @@ export function profile(hub: Hub, id: string, body: unknown): Member {
   if (JSON.stringify(member) !== JSON.stringify(next)) {
     Object.assign(member, next);
     hub.append(id, { type: 'member_added', data: { member: next } });
-  }
-  return next;
-}
-export function persona(hub: Hub, member: string, id: string, body: unknown): Persona {
-  ownerOnly(hub, member);
-  const current = hub.personas.find((p) => p.id === id);
-  if (!current) throw notFound('Unknown default agent.');
-  const input = object(body, ['name', 'engine', 'model', 'instructions', 'permission_mode']);
-  const display = name(input.name);
-  if (!['claude', 'codex', 'opencode'].includes(String(input.engine)) || !['default', 'plan', 'accept_edits'].includes(String(input.permission_mode))) throw invalid('Invalid agent defaults.');
-  for (const [field, max] of [['model', 200], ['instructions', 32768]] as const) {
-    const value = input[field];
-    if (value != null && (typeof value !== 'string' || [...value].length > max || value.includes('\0'))) throw invalid(`Invalid ${field}.`);
-  }
-  const next = { id, name: display, engine: input.engine, permission_mode: input.permission_mode, ...(typeof input.model === 'string' && input.model.trim() ? { model: input.model } : {}), ...(typeof input.instructions === 'string' && input.instructions.trim() ? { instructions: input.instructions } : {}) } as Persona;
-  if (JSON.stringify(current) !== JSON.stringify(next)) {
-    hub.personas[hub.personas.indexOf(current)] = next;
-    hub.append(member, { type: 'persona_saved', data: { persona: next } });
   }
   return next;
 }
