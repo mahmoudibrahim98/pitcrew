@@ -1,5 +1,6 @@
 // "+ New" → "Task": replaces the shell's placeholder. Minimal fields; the hub assigns the key.
 
+import { useRouter } from '@tanstack/react-router';
 import { useId, useState, type FormEvent } from 'react';
 import { Button, DialogFooter } from '../design/index.ts';
 import { useCreateTask, useMembers, useProjects, useWorkstreams } from './data.ts';
@@ -14,9 +15,11 @@ export function NewTaskDialog({ close, defaults = {} }: { close(): void; default
   const members = useMembers();
   const create = useCreateTask();
   const nav = useProjectsNav();
-  const context = window.location.pathname.match(/\/projects\/([^/]+)(?:\/workstreams\/([^/]+))?/);
-  const [project, setProject] = useState(defaults.project ?? context?.[1] ?? '');
-  const [workstream, setWorkstream] = useState(defaults.workstream ?? context?.[2] ?? '');
+  const router = useRouter({ warn: false });
+  const context = router?.state.matches.at(-1)?.params as { project?: string; workstream?: string } | undefined;
+  const fallback = window.location.pathname.match(/\/projects\/([^/]+)(?:\/workstreams\/([^/]+))?/);
+  const [project, setProject] = useState(defaults.project ?? context?.project ?? fallback?.[1] ?? '');
+  const [workstream, setWorkstream] = useState(defaults.workstream ?? context?.workstream ?? fallback?.[2] ?? '');
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [priority, setPriority] = useState<Priority>('none');
@@ -61,6 +64,7 @@ export function NewTaskDialog({ close, defaults = {} }: { close(): void; default
           <input
             id={id}
             required
+            data-create-focus
             autoFocus
             value={title}
             onChange={(e) => setTitle(e.target.value)}

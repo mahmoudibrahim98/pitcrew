@@ -4,7 +4,7 @@
 import { useParams } from '@tanstack/react-router';
 import { ToggleGroup } from 'radix-ui';
 import { useState } from 'react';
-import { StatusPill } from '../design/index.ts';
+import { Button, StatusPill } from '../design/index.ts';
 import { ActivityFeed } from './activity.tsx';
 import { Board } from './board.tsx';
 import { useProjects } from './data.ts';
@@ -12,6 +12,7 @@ import { PROJECT_STATUS, formatDay } from './format.ts';
 import { ProjectOverviewBody, WorkstreamsTable } from './overview.tsx';
 import { ErrorNote } from './ui.tsx';
 import { Timeline } from './timeline.tsx';
+import { useShell } from '../shell/store.ts';
 import { ReadScope } from './read-scope.tsx';
 
 type Tab = 'overview' | 'workstreams' | 'board' | 'timeline' | 'activity';
@@ -38,6 +39,7 @@ function NotFound() {
 
 export function ProjectPage() {
   const { project: id }: { project?: string } = useParams({ strict: false });
+  const setCreating = useShell((s) => s.setCreating);
   const [tab, setTab] = useState<Tab>('overview');
   const projects = useProjects();
   const project = projects.data?.find((p) => p.id === id);
@@ -61,6 +63,7 @@ export function ProjectPage() {
           {project !== undefined && (
             <StatusPill tone={PROJECT_STATUS[project.status].tone}>{PROJECT_STATUS[project.status].label}</StatusPill>
           )}
+          {project !== undefined && <Button onClick={(e) => setCreating('workstream', e.currentTarget)}>New workstream</Button>}
           {project?.due !== undefined && <span className="text-sm text-ink-2">Due {formatDay(project.due)}</span>}
         </div>
         <ToggleGroup.Root

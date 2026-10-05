@@ -2,7 +2,8 @@
 //! breaking change to the protocol. Bump `PROTOCOL_VERSION` and tell the affected streams.
 
 use pitcrew_protocol::api::{
-    HostInfo, HostRole, NewProject, NewTask, NewWorkstream, Setup, SetupPerson, StreamFrame,
+    HostInfo, HostRole, NewProject, NewTask, NewWorkstream, PersonaEdit, Setup, SetupPerson,
+    StreamFrame, TeamEdit,
 };
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{
@@ -583,6 +584,7 @@ fn new_project_round_trips_with_defaults() {
     assert_eq!(
         minimal,
         NewProject {
+            first_workstream: None,
             key: ProjectKey::new("PAP").unwrap(),
             name: "Paper".into(),
             lead: None,
@@ -648,4 +650,21 @@ fn setup_has_the_documented_shape() {
     );
     // Every field is required.
     assert!(serde_json::from_value::<Setup>(json!({"workspace_name": "Demo Lab"})).is_err());
+}
+
+#[test]
+fn directory_edit_bodies_preserve_existing_model_fields() {
+    let recipe: PersonaEdit =
+        serde_json::from_value(json!({"name":"Writer","engine":"codex"})).unwrap();
+    assert_eq!(recipe.permission_mode, PermissionMode::Default);
+    let every: PersonaEdit = round_trip(
+        &json!({"name":"Writer","engine":"codex","model":"demo-model","instructions":"Synthetic examples.","permission_mode":"plan"}),
+    );
+    assert_eq!(every.model.as_deref(), Some("demo-model"));
+    let lead = MemberId::new();
+    let team: TeamEdit = round_trip(&json!({"name":"Demo crew","lead":lead,"members":[lead]}));
+    assert_eq!(team.members, vec![lead]);
+    let atomic: NewProject =
+        round_trip(&json!({"key":"ATM","name":"Atomic","first_workstream":"First"}));
+    assert_eq!(atomic.first_workstream.as_deref(), Some("First"));
 }

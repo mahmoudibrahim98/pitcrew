@@ -29,9 +29,13 @@ use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::request::Parts;
 use axum::routing::{get, patch, post, put};
-use pitcrew_protocol::api::{Caller, NewProject, NewTask, NewWorkstream, Setup, SetupDone};
+use pitcrew_protocol::api::{
+    Caller, NewProject, NewTask, NewWorkstream, PersonaEdit, Setup, SetupDone, TeamEdit,
+};
 use pitcrew_protocol::events::{BriefTarget, Event};
-use pitcrew_protocol::ids::{AskId, MemberId, ProjectId, SessionId, WorkstreamId};
+use pitcrew_protocol::ids::{
+    AskId, MemberId, PersonaId, ProjectId, SessionId, TeamId, WorkstreamId,
+};
 use pitcrew_protocol::model::{
     Ask, Brief, Dispatch, Machine, Member, Persona, Project, Session, Subtask, Task, TaskPatch,
     TaskStatus, Team, Workstream,
@@ -76,8 +80,10 @@ where
         .route("/v1/me/cursors/{scope}", put(put_cursor))
         .route("/v1/setup", post(post_setup))
         .route("/v1/machines", get(list_machines))
-        .route("/v1/personas", get(list_personas))
-        .route("/v1/teams", get(list_teams))
+        .route("/v1/personas", get(list_personas).post(create_persona))
+        .route("/v1/personas/{id}", put(edit_persona))
+        .route("/v1/teams", get(list_teams).post(create_team))
+        .route("/v1/teams/{id}", put(edit_team))
         .route("/v1/projects", get(list_projects).post(create_project))
         .route("/v1/projects/{id}", get(get_project))
         .route(
@@ -707,6 +713,65 @@ async fn put_import(
     Ok(Json(pitcrew_protocol::import::ImportResult {
         imported: blocking(w, move |w| w.commit_import(filter)).await?,
     }))
+}
+
+async fn create_persona(
+    Work(w): Work,
+    Person(caller): Person,
+    Body(edit): Body<PersonaEdit>,
+) -> Created<Persona> {
+    Ok((
+        StatusCode::CREATED,
+        Json(blocking(w, move |w| w.save_persona(&caller, None, edit)).await?),
+    ))
+}
+async fn edit_persona(
+    Work(w): Work,
+    Person(caller): Person,
+    Segments(id): Segments<String>,
+    body: RawBody,
+) -> Reply<Persona> {
+    let id: PersonaId = path_id(&id, "persona")?;
+    exists(&w, move |w| {
+        w.personas()?
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| WorkError::not_found("No such persona."))
+    })
+    .await?;
+    let edit: PersonaEdit = json(body).await?;
+    Ok(Json(
+        blocking(w, move |w| w.save_persona(&caller, Some(id), edit)).await?,
+    ))
+}
+async fn create_team(
+    Work(w): Work,
+    Person(caller): Person,
+    Body(edit): Body<TeamEdit>,
+) -> Created<Team> {
+    Ok((
+        StatusCode::CREATED,
+        Json(blocking(w, move |w| w.save_team(&caller, None, edit)).await?),
+    ))
+}
+async fn edit_team(
+    Work(w): Work,
+    Person(caller): Person,
+    Segments(id): Segments<String>,
+    body: RawBody,
+) -> Reply<Team> {
+    let id: TeamId = path_id(&id, "team")?;
+    exists(&w, move |w| {
+        w.teams()?
+            .into_iter()
+            .find(|t| t.id == id)
+            .ok_or_else(|| WorkError::not_found("No such team."))
+    })
+    .await?;
+    let edit: TeamEdit = json(body).await?;
+    Ok(Json(
+        blocking(w, move |w| w.save_team(&caller, Some(id), edit)).await?,
+    ))
 }
 
 async fn get_safety(Work(w): Work, Person(_): Person) -> Reply<serde_json::Value> {
