@@ -1,5 +1,5 @@
 //! The integrations' routes (api-v1.md, "Integrations" and "Outward writes"). Device tokens only:
-//! the API layer's `device_only` refuses an agent before any of these runs. Bodies are at most
+//! the API layer's `device_only` refuses an agent or a reader before any of these runs. Bodies are at most
 //! 64 KiB, and a body that does not parse is `400` with a fixed message, never one that could
 //! echo a secret back.
 

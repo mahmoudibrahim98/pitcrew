@@ -681,8 +681,8 @@ agents, and sign in to each agent CLI with the CLI's own login. The types are in
 `crates/protocol/src/machine_setup.rs`.
 
 - **Who.** All five are for **the hub's owner only**: the member who set the hub up (its first
-  person, `POST /v1/setup`'s). An agent token gets `403`, and so does any other member's device
-  token, on every route and before anything else is looked at (the machine, the engine, the
+  person, `POST /v1/setup`'s). An agent or reader token gets `403`, and so does any other member's
+  device token, on every route and before anything else is looked at (the machine, the engine, the
   body): on a shared hub, another person cannot sign the owner's machine in to their own account,
   open the owner's sign-in, or read the owner's accounts. Before setup (no person yet) they are
   `409`.
@@ -785,7 +785,7 @@ A person connects GitHub repositories or Jira projects to the workspace, links w
 upstream scopes ("Linking a workstream upstream"), and the hub keeps tasks in step with upstream.
 **A sync only reads upstream**: no route here writes to GitHub or Jira, and every write goes
 through a person's approval first ("Outward writes", below). Every route is **device
-tokens only** (an agent token gets `403`, before anything else is checked). Types are in
+tokens only** (an agent or reader token gets `403`, before anything else is checked). Types are in
 `crates/protocol/src/integrations.rs`.
 
 | Method and path | Body → response | Notes |
@@ -915,8 +915,8 @@ PitCrew can change GitHub and Jira (create an issue from a task, comment, close 
 the title, description or labels, set a milestone or epic), but **nothing is sent upstream until a
 person approves it**. A hub change that implies a write raises an ask of kind `approval` that shows
 exactly what will be sent; the hub sends it only after the person answers **Send**, and records
-the result as an event. Every route here is **device tokens only** (an agent token gets `403`
-before anything else is checked). Types are in `crates/protocol/src/writes.rs`.
+the result as an event. Every route here is **device tokens only** (an agent or reader token gets
+`403` before anything else is checked). Types are in `crates/protocol/src/writes.rs`.
 
 | Method and path | Body → response | Notes |
 |---|---|---|

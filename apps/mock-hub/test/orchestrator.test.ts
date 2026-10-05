@@ -11,6 +11,8 @@ import { AGENT, DEVICE, ID, call, sleep, withServer } from './helpers.ts';
 
 const FAST = { delays: { start: 20, reply: 40 } };
 const READER = 'dev-reader-token';
+/** The demo's own machine ("This laptop"). */
+const LAPTOP = '01JB000000000000000MCH0001';
 const SECOND = 'dev-second-device-token';
 const OFFICE = '01JB000000000000000MEM0006';
 
@@ -152,7 +154,10 @@ describe('a reader token', () => {
         '/v1/asks', '/v1/briefs', '/v1/events?limit=5', '/v1/recaps/blocks?limit=5', `/v1/recaps/days?workstream=${ID.submission}`]) {
         assert.equal((await call(server, 'GET', path, { token: READER })).status, 200, path);
       }
-      for (const path of ['/v1/me/cursors', '/v1/safety', '/v1/import', '/v1/board-drafts', `/v1/sessions/${ID.ses1}/transcript`]) {
+      for (const path of ['/v1/me/cursors', '/v1/safety', '/v1/import', '/v1/board-drafts', `/v1/sessions/${ID.ses1}/transcript`,
+        // Integrations, outward writes and machine setup: device-only reads.
+        '/v1/integrations', '/v1/writes', `/v1/machines/${LAPTOP}/check`, `/v1/machines/${LAPTOP}/agents`,
+        `/v1/machines/${LAPTOP}/agents/claude/sign-in`]) {
         assert.equal((await call(server, 'GET', path, { token: READER })).status, 403, path);
       }
       for (const [method, path] of [
@@ -160,6 +165,7 @@ describe('a reader token', () => {
         ['POST', '/v1/asks'], ['POST', '/v1/asks/01JB000000000000000ASK0001/answer'], ['POST', '/v1/hooks/claude/Stop'],
         ['POST', '/v1/tasks'], ['PATCH', '/v1/tasks/PAP-1'], ['POST', '/v1/projects'], ['POST', '/v1/sessions'],
         ['POST', `/v1/sessions/${ID.ses1}/send`], ['PUT', '/v1/safety'], ['DELETE', '/v1/orchestrator/conversations'],
+        ['POST', '/v1/integrations'], ['POST', '/v1/writes'], ['POST', `/v1/machines/${LAPTOP}/agents/claude/sign-in`],
       ] as const) {
         const res = await call<{ code: string }>(server, method, path, { token: READER, json: {} });
         assert.equal(res.status, 403, `${method} ${path}`);

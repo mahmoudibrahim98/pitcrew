@@ -446,6 +446,12 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
         &format!("/v1/workstreams/{}/files?loc=0&path=", id::SUBMISSION),
         &format!("/v1/workstreams/{}/board-draft", id::SUBMISSION),
         "/v1/stream",
+        // Integrations, outward writes and machine setup: device-only reads.
+        "/v1/integrations",
+        "/v1/writes",
+        &format!("/v1/machines/{}/check", id::LAPTOP),
+        &format!("/v1/machines/{}/agents", id::LAPTOP),
+        &format!("/v1/machines/{}/agents/claude/sign-in", id::LAPTOP),
     ] {
         let reply = daemon.get(path, Some(&reader));
         assert_eq!(reply.status, 403, "GET {path}: {}", reply.body);

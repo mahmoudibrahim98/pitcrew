@@ -944,6 +944,11 @@ async fn a_reader_reads_and_changes_nothing() {
         .expect_err("a reader moves nothing");
     assert_eq!(refused.code(), pitcrew_protocol::api::ErrorCode::Forbidden);
     assert!(work.check_task_write(&me, &task).is_err());
+    // An outward write's retry too, before it looks the write up.
+    let refused = work
+        .request_retry(&me, &pitcrew_protocol::ids::AskId::new())
+        .expect_err("a reader retries no write");
+    assert_eq!(refused.code(), pitcrew_protocol::api::ErrorCode::Forbidden);
     // An agent may not make the reads marked **read**.
     expect(&common::get(&app, agent(WRITER), "/v1/sessions").await, 403);
 }

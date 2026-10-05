@@ -64,7 +64,20 @@ test('a reader token reads the routes marked read or agent, and is refused every
   for (const [method, path] of writes) {
     await expect(403, method, path, {}, reader);
   }
-  for (const path of ['/v1/me/cursors', '/v1/safety', '/v1/import', '/v1/orchestrator', '/v1/board-drafts']) {
+  const machine = (await expect(200, 'GET', '/v1/machines', undefined, person))[0].id;
+  for (const path of [
+    '/v1/me/cursors',
+    '/v1/safety',
+    '/v1/import',
+    '/v1/orchestrator',
+    '/v1/board-drafts',
+    // Integrations, outward writes and machine setup: device-only reads.
+    '/v1/integrations',
+    '/v1/writes',
+    `/v1/machines/${machine}/check`,
+    `/v1/machines/${machine}/agents`,
+    `/v1/machines/${machine}/agents/claude/sign-in`,
+  ]) {
     await expect(403, 'GET', path, undefined, reader);
   }
   const me = await expect(200, 'GET', '/v1/me', undefined, reader, schemas.member);

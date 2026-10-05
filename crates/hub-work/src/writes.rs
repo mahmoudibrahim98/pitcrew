@@ -179,8 +179,9 @@ impl WorkService {
     ///
     /// # Errors
     ///
-    /// As [`WorkService::check_retry`]; database errors.
+    /// As [`WorkService::check_retry`] (and `forbidden` for a reader token); database errors.
     pub fn request_retry(&self, caller: &Caller, ask: &AskId) -> Result<UpstreamWrite> {
+        crate::commands::require_writer(caller)?;
         let _guard = self.lock();
         let found = self.check_retry(caller, ask)?;
         if found.retry_requested_by.is_some() {

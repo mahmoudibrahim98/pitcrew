@@ -1,7 +1,7 @@
 //! Machine setup (api-v1.md, "Machine setup"): onboarding's machine steps on the hub's own
-//! machine. Device routes (`RouterParts::device`): an agent token gets `403`, and so does the
-//! device token of any member but the one who set the hub up (its first person, the workspace's
-//! owner), on every route: another person on a shared hub cannot sign the owner's machine in to
+//! machine. Device routes (`RouterParts::device`): an agent or reader token gets `403`, and so
+//! does the device token of any member but the one who set the hub up (its first person, the
+//! workspace's owner), on every route: another person on a shared hub cannot sign the owner's machine in to
 //! their own account, open the owner's sign-in, or read the owner's accounts.
 //!
 //! | Route | What |
