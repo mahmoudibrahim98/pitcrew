@@ -33,7 +33,8 @@ it('keeps a recorded model and account a re-statement leaves out, as the hub doe
     parent: '01JB000000000000000SES0003', recorded: { model: 'model-a', account: '~/.claude' } };
   qc.setQueryData(keys.sessions.detail(session.id), session);
   qc.setQueryData(keys.sessions.list(), [session]);
-  const { recorded: _, ...restated } = session;
+  const restated: Session = { ...session };
+  delete restated.recorded;
   applyPatches(qc, [{ body: { type: 'session_discovered', data: { session: { ...restated, state: 'idle' } } } }]);
   expect(qc.getQueryData<Session>(keys.sessions.detail(session.id))).toEqual({ ...session, state: 'idle' });
   applyPatches(qc, [{ body: { type: 'session_discovered', data: { session: { ...restated, recorded: { model: 'model-b' } } } } }]);

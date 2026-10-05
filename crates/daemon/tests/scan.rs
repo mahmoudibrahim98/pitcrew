@@ -596,7 +596,22 @@ fn a_fresh_hub_scans_its_machine_once_set_up() {
     assert_eq!(report["counts"]["sessions"], 3, "{report:#}");
     assert_eq!(report["suggestions"].as_array().unwrap().len(), 3);
     let owner = setup.json()["me"]["id"].as_str().unwrap().to_owned();
-    let members = daemon.get("/v1/members", Some(&device)).json();
+    // The back office adds `@office` once setup is done, alongside the scan: the members are
+    // compared once it has, so only what a scan adds can differ.
+    let deadline = Instant::now() + WAIT;
+    let members = loop {
+        let members = daemon.get("/v1/members", Some(&device)).json();
+        if members
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["handle"] == "@office")
+        {
+            break members;
+        }
+        assert!(Instant::now() < deadline, "no @office: {members:#}");
+        std::thread::sleep(Duration::from_millis(25));
+    };
     let personas = daemon.get("/v1/personas", Some(&device)).json();
     for engine in ["claude", "codex", "opencode"] {
         let matching: Vec<_> = members
