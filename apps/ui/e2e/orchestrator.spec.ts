@@ -1,5 +1,6 @@
 // The Orchestrator panel in a browser, against the hub this run talks to: a question answered with
-// links that open their routes in the app, Esc stopping an answer, and clearing the history.
+// links that open their routes in the app, Esc stopping an answer, and clearing the history. It
+// runs after the other specs (playwright.config.ts, `projects`): its sessions stay in the hub.
 import { expect, test, type Page } from '@playwright/test';
 import { expectNoAxeViolations } from './axe';
 import { HUB_AUTH, HUB_URL } from './helpers';

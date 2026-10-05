@@ -25,6 +25,12 @@ export default defineConfig({
     trace: 'retain-on-failure',
     ...(channel === undefined ? {} : { channel }),
   },
+  // The Orchestrator's spec runs after the rest: every question it asks leaves an `Orchestrator`
+  // session in the shared hub, linked to nothing, which other specs would see in the console.
+  projects: [
+    { name: 'demo', testIgnore: /orchestrator\.spec\.ts$/ },
+    { name: 'orchestrator', testMatch: /orchestrator\.spec\.ts$/, dependencies: ['demo'] },
+  ],
   webServer: [
     ...(EXTERNAL_HUB_URL === undefined
       ? [
