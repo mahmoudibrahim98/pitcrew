@@ -8,3 +8,7 @@ creation. File limits are shared constants. `ErrorCode` adds `too_large` (413) a
 Run `cargo test -p pitcrew-protocol --features ts` to regenerate `packages/protocol-ts` explicitly.
 
 Session import types live in `import`: inclusion rules, the durable choice, and dry-run/commit counts. Regenerate the TypeScript exports with `cargo test -p pitcrew-protocol --features ts`.
+
+FileEntry’s additive `ignored` boolean defaults to false when deserializing an older
+listing and is generated in protocol-ts. It describes location-local ignore rules
+for presentation only; the Files API’s access rules and wire paths are unchanged.

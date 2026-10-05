@@ -26,6 +26,10 @@ test('files: local tree, revisions, binary, bounds, device-only and remote refus
   assert.equal(listing.truncated, false);
   assert.deepEqual(listing.entries.map(e => e.name), [...listing.entries.map(e => e.name)].sort());
   assert.ok(listing.entries.some(e => e.name === 'src' && e.kind === 'folder'));
+  assert.ok(listing.entries.some(e => e.name === '.git' && e.kind === 'file'));
+  assert.equal(listing.entries.find(e => e.name === 'debug.log').ignored, true);
+  assert.equal(listing.entries.find(e => e.name === 'src').ignored, false);
+  assert.equal((await request(url('debug.log'))).result.content, 'synthetic ignored file');
   const { result: initial } = await request(url('src/hello.txt'));
   assert.equal(initial.content, 'hello\n'); assert.equal(initial.encoding, 'utf8'); assert.equal(initial.size, 6);
   assert.match(initial.revision, /^[0-9a-f]{64}$/);

@@ -73,7 +73,17 @@ dots or spaces that Windows normalises. Writes reject every `.git` component
 (case-insensitively on Windows), including a final file named `.git`.
 
 List entries have a UTF-8 name, `kind` of `file`, `folder` or `link`, byte `size`,
-and UTC millisecond `modified_at` (null if unavailable). Non-UTF-8 names and special
+and UTC millisecond `modified_at` (null if unavailable). Access rules are unchanged
+by ignore rules: listings additionally report `ignored` (boolean,
+default false for older servers). This is a presentation hint from bounded, checked
+`.gitignore` reads within the location root and its ancestors down to the listed
+directory; it never changes read/write authorization. No global Git config or ignore
+file outside the root is read. Malformed, unavailable, non-text or oversized ignore
+files are skipped. At most 64 ignore files, 256 KiB of rules total and 4,096 rules
+are considered. The explorer hides dot names and ignored entries by default, with
+a show-hidden toggle. Recursive quick open uses the same lists, never follows links,
+and stops at 128 directories or 5,000 examined entries, reporting incomplete results.
+Non-UTF-8 names and special
 files are omitted. Return at most 5,000 entries sorted by name in UTF-8 byte order;
 `truncated` indicates that the complete directory could not be returned. Symbolic
 links, junctions and all reparse points may be listed as links but never followed.

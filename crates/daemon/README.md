@@ -1318,3 +1318,7 @@ skipped engines. No-change previews cannot set the wizard's installed flag.
 Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
+
+The files route passes through additive location-local `ignored` listing hints from
+the runner. Its HTTP tests cover the worktree `.git` file, ignored logs and unchanged
+access rules alongside the existing T80 refusals.

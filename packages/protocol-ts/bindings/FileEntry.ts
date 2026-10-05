@@ -20,4 +20,8 @@ size: number,
 /**
  * UTC milliseconds, if available.
  */
-modified_at: number | null, };
+modified_at: number | null, 
+/**
+ * Presentation hint from location-local .gitignore rules, never an access rule.
+ */
+ignored: boolean, };

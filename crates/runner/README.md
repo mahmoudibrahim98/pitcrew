@@ -368,3 +368,13 @@ now), and an optional field says what caused a state change, e.g. on `session_st
 delivered the events, and the cause is better recorded as what it is. A also cannot cover the
 remote runner, which is where hooks from many agents on a cluster will come from. Until B lands,
 hook-caused state stays authored as the session's person.
+
+### Ignore hints
+
+Listings now include `ignored`, derived from `.gitignore` files within the root down
+to the listed folder. The pinned `ignore` 0.4.25 matcher (MIT or Unlicense) parses rules;
+Files::read supplies bytes through the existing no-follow and identity checks. No
+global Git config, parent outside the root, or Git subprocess is used. At most 64
+ignore files, 256 KiB total rules and 4,096 lines are parsed. Bad, unreadable, binary
+and oversized rule files are skipped. Ignored parents cannot be re-included by a
+child’s rules. The hint never prevents an explicit read or write.

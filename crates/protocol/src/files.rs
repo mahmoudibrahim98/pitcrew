@@ -20,6 +20,9 @@ pub struct FileEntry {
     pub size: u64,
     /// UTC milliseconds, if available.
     pub modified_at: Option<i64>,
+    /// Presentation hint from location-local .gitignore rules, never an access rule.
+    #[serde(default)]
+    pub ignored: bool,
 }
 /// Supported entry types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
