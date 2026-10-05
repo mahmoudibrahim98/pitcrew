@@ -1,5 +1,20 @@
 # console (stream M)
 
+## Files everywhere prerequisite
+
+Brief `0-files-everywhere` requires desktop "Reveal in folder" and "Open in editor"
+through an allow-listed opener. The desktop currently has no such command:
+`apps/desktop/src-tauri/src/app.rs` registers the gateway and updater commands,
+and `apps/desktop/src-tauri/capabilities/main.json` explicitly grants no opener,
+shell or filesystem access. The browser's external-link handler is not a file opener.
+
+Completing that requirement needs a desktop command with checked, workstream-scoped
+file targets, its capability, platform implementation and tests, and a gateway
+contract. These are substantive changes outside this brief's paths. The assignment
+therefore stops before implementation under its scope rule; the desktop prerequisite
+must be assigned or the brief's scope expanded before continuing. No file explorer,
+quick open or transcript-to-file behavior is added by this documentation.
+
 The Agent console. See `docs/build/streams/M.md`. `index.ts` registers it with the shell (`feature`)
 and exports its components. The app imports `index.ts` at start, so it stays small: the page and
 every component are lazy chunks (render the components inside a `<Suspense>`).
