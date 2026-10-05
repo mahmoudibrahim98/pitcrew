@@ -318,7 +318,9 @@ fn direct(tx: &Transaction<'_>, body: &EventBody) -> Result<About, BoxError> {
             about.workstream = workstream.as_ref().map(IdText::text);
         }
         EventBody::WriteProposed { write } => about.task = write.task.as_ref().map(IdText::text),
-        EventBody::WriteStarted { task, .. } | EventBody::WriteFinished { task, .. } => {
+        EventBody::WriteStarted { task, .. }
+        | EventBody::WriteRetryRequested { task, .. }
+        | EventBody::WriteFinished { task, .. } => {
             about.task = task.as_ref().map(IdText::text);
         }
         // Machines, members, personas and teams belong to the workspace, not to any work.

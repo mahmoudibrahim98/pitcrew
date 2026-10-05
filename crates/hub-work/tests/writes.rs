@@ -5,7 +5,8 @@
 //!   never again once sent;
 //! - a denial can only be recorded as "not sent";
 //! - an approval ask an agent raises itself has no write, so nothing can ever start from it;
-//! - a retry is a failed write's only way back, and only for whoever may answer its ask;
+//! - a retry is a failed write's only way back, and only for whoever may answer its ask: the
+//!   request is in the log, and each request starts one attempt;
 //! - an issue created from a task gives the task its source.
 
 mod common;
@@ -248,8 +249,30 @@ fn a_write_starts_only_once_a_person_answers_send_and_never_twice() {
         work.check_retry(&agent(WRITER), &ask).unwrap_err().code(),
         ErrorCode::Forbidden
     );
+    // A failed write starts again only once a person asked for it, and that is in the log.
+    assert!(refused(commands.start_write(&ask).unwrap()).contains("no one asked"));
+    assert_eq!(
+        work.request_retry(&agent(WRITER), &ask).unwrap_err().code(),
+        ErrorCode::Forbidden
+    );
+    let rev = work.store().latest_rev().unwrap();
+    let asked = work.request_retry(&person(SAM), &ask).unwrap();
+    assert_eq!(asked.retry_requested_by, Some(member(SAM)));
+    // A second request while one waits appends nothing.
+    work.request_retry(&person(SAM), &ask).unwrap();
+    let logged = work.store().since(rev, 10).unwrap();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(logged[0].event.author, member(SAM));
+    assert!(matches!(
+        &logged[0].event.body,
+        EventBody::WriteRetryRequested { ask: a, task: Some(t), by } if *a == ask && *t == id && *by == member(SAM)
+    ));
     let again = changed(commands.start_write(&ask).unwrap());
     assert_eq!(again.attempts, 2);
+    assert_eq!(
+        again.retry_requested_by, None,
+        "the attempt used the request"
+    );
     let sent = changed(
         commands
             .finish_write(

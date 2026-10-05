@@ -7,10 +7,12 @@
 //!
 //! - [`SyncCommands::propose_write`] raises the approval ask and appends `write_proposed` in one
 //!   append, so a write and its ask exist together or not at all; one cause proposes once;
-//! - [`SyncCommands::start_write`] appends `write_started` only for a write whose ask the sync
-//!   raised, answered with "Send" by a person ([`APPROVAL_OPTIONS`]), or for a failed write a
-//!   person retries; every other state is refused, so a write is never started twice at once,
-//!   nor at all without that answer;
+//! - [`WorkService::request_retry`] appends `write_retry_requested`, by the person who asks to send
+//!   a failed write again (one who may answer its ask);
+//! - [`SyncCommands::start_write`] appends `write_started` only for a write whose ask this sync's
+//!   member raised, answered with "Send" by a person ([`APPROVAL_OPTIONS`]), or for a failed write
+//!   with a person's retry request no attempt has used yet; every other state is refused, so a
+//!   write is never started twice at once, nor at all without that answer or request;
 //! - [`SyncCommands::finish_write`] appends `write_finished`: `sent` or `failed` only after a
 //!   start, `not_sent` only for a write never started since its last failure.
 
@@ -39,8 +41,8 @@ pub struct WriteFilter {
     pub states: Vec<WriteState>,
 }
 
-const COLS: &str =
-    "proposal, state, attempts, proposed_at, answered_at, answered_by, finished_at, result";
+const COLS: &str = "proposal, state, attempts, proposed_at, answered_at, answered_by, finished_at, \
+     result, retry_requested_by";
 
 fn conversion(idx: usize, e: impl std::error::Error + Send + Sync + 'static) -> sql::Error {
     sql::Error::FromSqlConversionFailure(idx, sql::types::Type::Text, Box::new(e))
@@ -55,6 +57,7 @@ fn write_row(r: &Row<'_>) -> sql::Result<UpstreamWrite> {
     let state: String = r.get(1)?;
     let answered_by: Option<String> = r.get(5)?;
     let result: Option<String> = r.get(7)?;
+    let retry_requested_by: Option<String> = r.get(8)?;
     Ok(UpstreamWrite {
         proposal: json(0, &proposal)?,
         state: serde_json::from_value(serde_json::Value::String(state))
@@ -67,6 +70,9 @@ fn write_row(r: &Row<'_>) -> sql::Result<UpstreamWrite> {
             .transpose()?,
         finished_at: r.get(6)?,
         result: result.map(|text| json(7, &text)).transpose()?,
+        retry_requested_by: retry_requested_by
+            .map(|id| id.parse::<MemberId>().map_err(|e| conversion(8, e)))
+            .transpose()?,
     })
 }
 
@@ -127,6 +133,18 @@ fn proposed_for(conn: &Connection, cause: &EventId) -> Result<bool> {
         .is_some())
 }
 
+/// Why a failed write may not start again, if it may not: a person must have asked since its
+/// last attempt.
+fn retry_refusal(c: &Connection, by: Option<&MemberId>) -> Result<Option<String>> {
+    let Some(by) = by else {
+        return Ok(Some(
+            "This write failed, and no one asked to send it again since.".into(),
+        ));
+    };
+    let person = query::member(c, by)?.is_some_and(|m| m.kind == MemberKind::Human);
+    Ok((!person).then(|| "Its retry was not asked for by a person.".into()))
+}
+
 fn no_write(ask: &AskId) -> WorkError {
     WorkError::not_found(format!("No write {ask}."))
 }
@@ -152,6 +170,31 @@ impl WorkService {
     /// `not_found`; database errors.
     pub fn write(&self, ask: &AskId) -> Result<UpstreamWrite> {
         self.read(|c| write(c, ask))?.ok_or_else(|| no_write(ask))
+    }
+
+    /// `POST /v1/writes/{id}/retry`: records that `caller` asks to send the failed write `ask`
+    /// again (`write_retry_requested`, authored by the caller). A request already waiting is
+    /// kept, and nothing more is appended. The sync sends it on its next pass
+    /// ([`SyncCommands::start_write`] uses the request).
+    ///
+    /// # Errors
+    ///
+    /// As [`WorkService::check_retry`]; database errors.
+    pub fn request_retry(&self, caller: &Caller, ask: &AskId) -> Result<UpstreamWrite> {
+        let _guard = self.lock();
+        let found = self.check_retry(caller, ask)?;
+        if found.retry_requested_by.is_some() {
+            return Ok(found);
+        }
+        self.append(&[self.by(
+            caller,
+            EventBody::WriteRetryRequested {
+                ask: *ask,
+                task: found.proposal.task,
+                by: caller.member,
+            },
+        )])?;
+        self.write(ask)
     }
 
     /// The write `ask`, when `caller` may retry it (`POST /v1/writes/{id}/retry`): a person who
@@ -254,9 +297,10 @@ impl SyncCommands<'_> {
         self.work().write(&id).map(Some)
     }
 
-    /// Starts sending the write `ask` (`write_started`): only when its ask is the sync's own
+    /// Starts sending the write `ask` (`write_started`): only when its ask is this sync's own
     /// approval ask, answered "Send" by a person, and it was never started; or when its last
-    /// attempt failed (a retry). Refused otherwise, with nothing appended.
+    /// attempt failed and a person asked to retry it since (`write_retry_requested`, used by this
+    /// start). Refused otherwise, with nothing appended.
     ///
     /// # Errors
     ///
@@ -267,7 +311,7 @@ impl SyncCommands<'_> {
             let found = write(c, ask)?.ok_or_else(|| no_write(ask))?;
             let refusal = match found.state {
                 WriteState::Approved => self.approval_refusal(c, ask)?,
-                WriteState::Failed => None,
+                WriteState::Failed => retry_refusal(c, found.retry_requested_by.as_ref())?,
                 other => Some(format!(
                     "This write is {}; only an approved or failed write is sent.",
                     state_name(other)

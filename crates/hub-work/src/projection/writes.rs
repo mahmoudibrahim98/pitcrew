@@ -3,7 +3,9 @@
 //!
 //! - `write_proposed` adds it, `pending`;
 //! - `ask_answered` on its ask makes it `approved` (the first option, "Send") or `denied`, once;
-//! - `write_started` makes an `approved` or `failed` write `sending`, one attempt more;
+//! - `write_retry_requested` records who asked to send a `failed` write again;
+//! - `write_started` makes an `approved` write, or a `failed` one with a retry asked for,
+//!   `sending`, one attempt more, and uses that retry request;
 //! - `write_finished` records its result: `sent`, `failed` or `not_sent`. A `sent` or `not_sent`
 //!   write never changes again.
 //!
@@ -65,11 +67,22 @@ impl Projection for Writes {
                 )?;
                 Ok(())
             }
+            EventBody::WriteRetryRequested { ask, by, .. } => {
+                exec(
+                    tx,
+                    "UPDATE work_writes SET retry_requested_by = ?2
+                     WHERE ask = ?1 AND state = ?3 AND retry_requested_by IS NULL",
+                    params![ask.text(), by.text(), enum_text(&WriteState::Failed)?],
+                )?;
+                Ok(())
+            }
             EventBody::WriteStarted { ask, .. } => {
                 exec(
                     tx,
-                    "UPDATE work_writes SET state = ?2, attempts = attempts + 1
-                     WHERE ask = ?1 AND state IN (?3, ?4)",
+                    "UPDATE work_writes SET state = ?2, attempts = attempts + 1,
+                       retry_requested_by = NULL
+                     WHERE ask = ?1
+                       AND (state = ?3 OR (state = ?4 AND retry_requested_by IS NOT NULL))",
                     params![
                         ask.text(),
                         enum_text(&WriteState::Sending)?,

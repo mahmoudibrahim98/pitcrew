@@ -374,8 +374,9 @@ fn workload(work: &WorkService) {
     writes(work, task.id);
 }
 
-/// Outward writes (`work.writes`): one approved, failed, retried and sent (an issue created from
-/// the task, which gives the task its source), one denied, and a stale start that changes nothing.
+/// Outward writes (`work.writes`): one approved, failed, retried at a person's request and sent
+/// (an issue created from the task, which gives the task its source), one denied, one failed with
+/// a retry asked for and not yet sent, and a stale start that changes nothing.
 fn writes(work: &WorkService, task: TaskId) {
     use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
     use pitcrew_protocol::writes::{WriteFields, WriteOperation, WriteProposal, WriteResult};
@@ -430,6 +431,7 @@ fn writes(work: &WorkService, task: TaskId) {
             },
         )
         .expect("fail");
+    work.request_retry(&sam, &ask).expect("ask to retry");
     commands.start_write(&ask).expect("retry");
     commands
         .finish_write(
@@ -487,6 +489,43 @@ fn writes(work: &WorkService, task: TaskId) {
             },
         )
         .expect("not sent");
+    let waiting = commands
+        .propose_write(
+            member(SAM),
+            proposal(
+                WriteOperation::Comment,
+                WriteFields {
+                    comment: Some("Try again.".into()),
+                    ..WriteFields::default()
+                },
+            ),
+            "GitHub: comment",
+            "Try again.",
+        )
+        .expect("propose")
+        .expect("proposed")
+        .proposal
+        .ask;
+    work.answer_ask(
+        &sam,
+        &waiting,
+        AnswerAsk {
+            option: Some(0),
+            text: None,
+        },
+    )
+    .expect("approve");
+    commands.start_write(&waiting).expect("start");
+    commands
+        .finish_write(
+            &waiting,
+            WriteResult::Failed {
+                message: "Bad gateway".into(),
+                status: Some(502),
+            },
+        )
+        .expect("fail");
+    work.request_retry(&sam, &waiting).expect("ask to retry");
 }
 
 /// Task edits, new projects and workstreams, and brief proposals.

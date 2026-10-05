@@ -390,6 +390,8 @@ fn other_bodies() -> Vec<EventBody> {
             "requested_by": demo.members[0].id}}}),
         json!({"type": "write_started", "data": {"ask": demo.asks[1].id,
             "task": demo.tasks[4].id, "attempt": 1}}),
+        json!({"type": "write_retry_requested", "data": {"ask": demo.asks[1].id,
+            "task": demo.tasks[4].id, "by": demo.members[0].id}}),
         json!({"type": "write_finished", "data": {"ask": demo.asks[1].id,
             "task": demo.tasks[4].id, "result": {"outcome": "failed", "message": "Not Found",
             "status": 404}}}),
