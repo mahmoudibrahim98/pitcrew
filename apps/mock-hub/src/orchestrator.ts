@@ -8,13 +8,18 @@
 // follower would see it. Its references and suggestions are found and checked as the hub does
 // (`crates/office/src/orchestrator.rs`, `crates/hub-work/src/orchestrator.rs`, ported).
 //
-// Engines: Claude Code and Codex are "installed", OpenCode is not, so the panel's states show.
-// The mock answers within its reply delay, so its answers are never `timed_out` or `too_long`.
+// Engines: the hub offers Claude Code and OpenCode (it runs each question confined, and Codex's
+// read-only sandbox keeps `pitcrew` from the hub, so Codex is refused). The mock calls Claude Code
+// "installed" and OpenCode not, so the panel's states show. It answers within its reply delay, so
+// its answers are never `timed_out` or `too_long`.
+//
+// As the hub does, it keeps every Orchestrator session it started for a person, cleared or not:
+// such a session's transcript and terminal are its asker's alone (`askerOf`).
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HIDDEN, redactLine } from './board.ts';
+import { HIDDEN, mintSessionToken, redactLine, revokeSessionTokens } from './board.ts';
 import { includesSession } from './import.ts';
 import { announceSession, createSession, endSession, interrupt, setSessionState } from './simulate.ts';
 import type { Hub } from './state.ts';
@@ -50,6 +55,8 @@ const MAX_SUGGESTIONS = 10;
 const MAX_CONTEXT_BYTES = 6 * 1024;
 const TITLE = 'Orchestrator';
 const OFFICE_HANDLE = '@office';
+/** The engines the hub offers, in its order (on Windows the hub offers Claude Code only). */
+export const OFFERED: readonly Engine[] = ['claude', 'opencode'];
 /** Which CLIs the mock calls installed. */
 export const INSTALLED: Record<Engine, boolean> = { claude: true, codex: true, opencode: false };
 const ENGINE_NAME: Record<Engine, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode' };
@@ -58,6 +65,8 @@ interface Person {
   engine?: Engine;
   /** Oldest first. */
   conversations: Conversation[];
+  /** Every Orchestrator session started for them, kept when they clear. */
+  sessions: string[];
 }
 
 const PEOPLE = new WeakMap<Hub, Map<MemberId, Person>>();
@@ -75,7 +84,7 @@ function personOf(hub: Hub, member: MemberId): Person {
   const people = peopleOf(hub);
   let person = people.get(member);
   if (person === undefined) {
-    person = { conversations: [] };
+    person = { conversations: [], sessions: [] };
     people.set(member, person);
   }
   return person;
@@ -119,11 +128,27 @@ function view(hub: Hub, conversation: Conversation): Conversation {
 export function orchestratorOf(hub: Hub, member: MemberId): Orchestrator {
   const person = peopleOf(hub).get(member);
   return {
-    engines: ENGINES.map((engine) => ({ engine, installed: INSTALLED[engine] })),
+    engines: OFFERED.map((engine) => ({ engine, installed: INSTALLED[engine] })),
     ...(person?.engine === undefined ? {} : { engine: person.engine }),
     limits: LIMITS,
     conversations: [...(person?.conversations ?? [])].reverse().map((c) => view(hub, c)),
   };
+}
+
+/** The person who asked Orchestrator session `session`, if it is one (cleared or not). */
+export function askerOf(hub: Hub, session: string): MemberId | undefined {
+  for (const [member, person] of peopleOf(hub)) {
+    if (person.sessions.includes(session)) return member;
+  }
+  return undefined;
+}
+
+/** Why `engine` cannot answer the Orchestrator, if it cannot. */
+function notOffered(engine: Engine): string | undefined {
+  if (OFFERED.includes(engine)) return undefined;
+  return engine === 'codex'
+    ? 'Codex cannot answer the Orchestrator: its read-only sandbox keeps `pitcrew` from reaching the hub, so each read would wait for your approval in its terminal. Use Claude Code or OpenCode.'
+    : `${ENGINE_NAME[engine]} cannot answer the Orchestrator.`;
 }
 
 /** One of `member`'s conversations, as the routes answer it. */
@@ -216,7 +241,8 @@ export function ask(hub: Hub, caller: MemberId, body: unknown): Conversation {
   if (existing !== undefined && existing.turns.length >= LIMITS.turns) {
     throw conflict(`A conversation holds at most ${LIMITS.turns} questions: start a new one.`);
   }
-  const engine = existing?.engine ?? (engineAsked as Engine | undefined) ?? person.engine ?? 'claude';
+  const remembered = person.engine !== undefined && OFFERED.includes(person.engine) ? person.engine : undefined;
+  const engine = existing?.engine ?? (engineAsked as Engine | undefined) ?? remembered ?? 'claude';
   const running = live(hub, existing?.session);
   const now = Date.now();
   let session: Session;
@@ -225,6 +251,10 @@ export function ask(hub: Hub, caller: MemberId, body: unknown): Conversation {
     appendRecord(hub.transcripts.get(session.id) ?? [], [userPrompt(now, typed(text))]);
     setSessionState(hub, session, 'working', 'Thinking');
   } else {
+    const refused = notOffered(engine);
+    if (refused !== undefined) {
+      throw invalid(refused);
+    }
     const machine = hub.machines.find((m) => m.kind === 'local');
     if (machine === undefined || machine.liveness !== 'live') {
       throw unavailable('This hub has no live machine of its own, so the Orchestrator cannot start.');
@@ -234,13 +264,17 @@ export function ask(hub: Hub, caller: MemberId, body: unknown): Conversation {
     }
     for (const other of person.conversations) {
       const old = live(hub, other.session);
-      if (old !== undefined) endSession(hub, old, 'kill');
+      if (old !== undefined) {
+        revokeSessionTokens(hub, old.id);
+        endSession(hub, old, 'kill');
+      }
     }
     const me = hub.findMember(caller);
     session = createSession(hub, {
       engine,
       machine: machine.id,
-      cwd: `/state/scratch/orchestrator-${caller}`,
+      // Its own fresh folder in the cache folder, as the hub's confined runs have.
+      cwd: '/cache/pitcrew/scratch',
       title: TITLE,
       agent: agent.id,
       brief: render({
@@ -252,6 +286,10 @@ export function ask(hub: Hub, caller: MemberId, body: unknown): Conversation {
         question: text,
       }),
     });
+    session.cwd = `/cache/pitcrew/scratch/${session.id}`;
+    person.sessions.push(session.id);
+    // Its CLI's token, as the hub mints it: a reader token for this session alone.
+    mintSessionToken(hub, agent.id, session.id, 'reader');
     announceSession(hub, session);
   }
   let conversation = existing;
@@ -377,7 +415,10 @@ export function clear(hub: Hub, member: MemberId): void {
   const person = personOf(hub, member);
   for (const conversation of person.conversations) {
     const session = live(hub, conversation.session);
-    if (session !== undefined) endSession(hub, session, 'kill');
+    if (session !== undefined) {
+      revokeSessionTokens(hub, session.id);
+      endSession(hub, session, 'kill');
+    }
   }
   person.conversations = [];
 }

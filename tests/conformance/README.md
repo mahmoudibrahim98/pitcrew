@@ -123,10 +123,14 @@ scope in "Transport and auth"). With `PITCREW_CONFORMANCE_READER`, a reader toke
 before startup, for `@office` on behalf of the person): it is `403` on **every write route the
 contract names** (read from `api-v1.md` itself), on the device-only reads and on a WebSocket
 upgrade, and reads the routes marked **read** or **agent**. Then the Orchestrator: people only;
-the engines and limits; what a question must be; a question starts a session titled
-`Orchestrator` as the person's agent; one answer at a time; another person sees none of it;
-cancel; clear forgets and ends the session. On the daemon the CLI is the stand-in `claude`, which
-never answers, so the suite cancels; the mock answers after its reply delay.
+the engines (Codex not offered) and limits; what a question must be (`codex` is `400`); a
+question starts a session titled `Orchestrator` as the person's agent, in a folder of its own
+(`…/scratch/<session>`); its CLI's token, handed to the suite through
+`PITCREW_CONFORMANCE_SESSION_TOKENS` as a draft's is, is a reader token of its own that reads and
+writes nothing; its transcript is `403` to another person; one answer at a time; another person
+sees none of it; cancel; clear forgets and ends the session, revokes its token at once (`401`),
+and leaves the transcript its asker's alone. On the daemon the CLI is the stand-in `claude`,
+which never answers, so the suite cancels; the mock answers after its reply delay.
 
 Hook-install conformance writes agent configurations. It is disabled unless
 `PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed

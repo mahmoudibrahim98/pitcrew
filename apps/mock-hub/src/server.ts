@@ -19,7 +19,7 @@ import {
 import * as integrations from './integrations.ts';
 import { openSignInTerminal, signInTerminal } from './machine-setup.ts';
 import { loadRecaps } from './recaps.ts';
-import { MOCK_VERSION, authenticate, handleApi, type Reply } from './routes.ts';
+import { MOCK_VERSION, askerOnly, authenticate, handleApi, type Reply } from './routes.ts';
 import {
   DEFAULT_DELAYS,
   DEFAULT_SCAN_WINDOW,
@@ -419,6 +419,8 @@ function acceptTerminalOrSignIn(
 ): WebSocketConnection {
   const signIn = signInTerminal(hub, ref, member);
   if (signIn === undefined) {
+    const found = hub.findSession(ref);
+    if (found !== undefined) askerOnly(hub, found.id, member);
     return acceptTerminal(hub, req, socket, head, terminalTarget(hub, ref, query));
   }
   const conn = acceptUpgrade(req, socket, head, SUBPROTOCOL);

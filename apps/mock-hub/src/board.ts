@@ -95,9 +95,16 @@ function draftsOf(hub: Hub): BoardDraft[] {
 // ─── Session tokens (api-v1.md, "Tokens") ──────────────────────────────────────────────────────
 
 /** Each hub's session tokens: the agent each acts as, and the session it is bound to. */
-const SESSION_TOKENS = new WeakMap<Hub, Map<string, { member: string; session: string }>>();
+/** A confined run's own token: a draft's session token, or an Orchestrator session's reader token. */
+export interface RunGrant {
+  member: string;
+  session: string;
+  scope: 'session' | 'reader';
+}
 
-function sessionTokensOf(hub: Hub): Map<string, { member: string; session: string }> {
+const SESSION_TOKENS = new WeakMap<Hub, Map<string, RunGrant>>();
+
+function sessionTokensOf(hub: Hub): Map<string, RunGrant> {
   let tokens = SESSION_TOKENS.get(hub);
   if (tokens === undefined) {
     tokens = new Map();
@@ -106,8 +113,8 @@ function sessionTokensOf(hub: Hub): Map<string, { member: string; session: strin
   return tokens;
 }
 
-/** What a session token may act as, while its session runs; `undefined` for any other text. */
-export function sessionTokenGrant(hub: Hub, token: string): { member: string; session: string } | undefined {
+/** What a run's token may act as, while its session runs; `undefined` for any other text. */
+export function sessionTokenGrant(hub: Hub, token: string): RunGrant | undefined {
   const grant = sessionTokensOf(hub).get(token);
   if (grant === undefined) return undefined;
   if (hub.findSession(grant.session)?.state !== 'ended') return grant;
@@ -115,15 +122,19 @@ export function sessionTokenGrant(hub: Hub, token: string): { member: string; se
   return undefined;
 }
 
-function mintSessionToken(hub: Hub, member: string, session: string): void {
-  const token = `pcs_${randomBytes(32).toString('base64url')}`;
-  sessionTokensOf(hub).set(token, { member, session });
+/**
+ * Mints a confined run's own token for `session`, as `member`: a session token (`pcs_…`), or a
+ * reader token (`pcr_…`, the Orchestrator's). Kept in memory, revoked when the session ends.
+ */
+export function mintSessionToken(hub: Hub, member: string, session: string, scope: RunGrant['scope'] = 'session'): void {
+  const token = `${scope === 'reader' ? 'pcr' : 'pcs'}_${randomBytes(32).toString('base64url')}`;
+  sessionTokensOf(hub).set(token, { member, session, scope });
   if (hub.sessionTokenDir !== undefined) {
     writeFileSync(join(hub.sessionTokenDir, `${session}.token`), token, { mode: 0o600 });
   }
 }
 
-function revokeSessionTokens(hub: Hub, session: string): void {
+export function revokeSessionTokens(hub: Hub, session: string): void {
   const tokens = sessionTokensOf(hub);
   for (const [token, grant] of tokens) if (grant.session === session) tokens.delete(token);
   if (hub.sessionTokenDir !== undefined) rmSync(join(hub.sessionTokenDir, `${session}.token`), { force: true });

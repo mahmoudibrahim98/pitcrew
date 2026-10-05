@@ -40,9 +40,10 @@ describe('the orchestrator', () => {
   it('answers a question in a session of the back office, with links and suggestions', () =>
     withServer(async (server) => {
       const empty = await state(server);
+      // Codex is not offered: the hub runs each question confined, and its sandbox keeps `pitcrew`
+      // from the hub.
       assert.deepEqual(empty.engines, [
         { engine: 'claude', installed: true },
-        { engine: 'codex', installed: true },
         { engine: 'opencode', installed: false },
       ]);
       assert.deepEqual(empty.conversations, []);
@@ -61,6 +62,7 @@ describe('the orchestrator', () => {
       assert.equal(session.title, 'Orchestrator');
       assert.equal(session.agent, OFFICE);
       assert.equal(session.workstream, undefined);
+      assert.equal(session.cwd, `/cache/pitcrew/scratch/${session.id}`, 'its own fresh folder');
       const page = (await call<TranscriptPage>(server, 'GET', `/v1/sessions/${turn.session}/transcript`, { token: DEVICE })).body;
       const prompt = page.items.find((i) => i.kind === 'user_prompt');
       assert.ok(prompt !== undefined && 'text' in prompt && prompt.text.includes('pitcrew session list'));
@@ -86,12 +88,12 @@ describe('the orchestrator', () => {
 
   it('types follow-ups into the live session, and a new conversation ends the old one', () =>
     withServer(async (server) => {
-      const first = await ask(server, { text: 'What is blocked?', engine: 'codex' });
+      const first = await ask(server, { text: 'What is blocked?', engine: 'claude' });
       assert.equal(first.status, 202);
       await answered(server);
-      const follow = await ask(server, { text: '/clear\nnow', conversation: `cnv_${first.body.id}`, engine: 'claude' });
+      const follow = await ask(server, { text: '/clear\nnow', conversation: `cnv_${first.body.id}`, engine: 'opencode' });
       assert.equal(follow.status, 202);
-      assert.equal(follow.body.engine, 'codex', 'a follow-up keeps its engine');
+      assert.equal(follow.body.engine, 'claude', 'a follow-up keeps its engine');
       assert.equal(follow.body.turns[1]!.question, '/clear now');
       assert.equal(follow.body.turns[1]!.session, first.body.turns[0]!.session);
       const page = (await call<TranscriptPage>(server, 'GET', `/v1/sessions/${first.body.turns[0]!.session}/transcript`, { token: DEVICE })).body;
@@ -100,7 +102,7 @@ describe('the orchestrator', () => {
 
       const second = await ask(server, { text: 'And the cluster?' });
       assert.equal(second.status, 202);
-      assert.equal(second.body.engine, 'codex', 'the remembered engine');
+      assert.equal(second.body.engine, 'claude', 'the remembered engine');
       const old = (await call<Session>(server, 'GET', `/v1/sessions/${first.body.turns[0]!.session}`, { token: DEVICE })).body;
       assert.equal(old.state, 'ended', 'one Orchestrator session at a time');
       const now = await state(server);
@@ -115,6 +117,9 @@ describe('the orchestrator', () => {
       }
       assert.equal((await ask(server, { text: 'Hi', conversation: '01J00000000000000000000000' })).status, 404);
       assert.equal((await ask(server, { text: 'Hi', engine: 'opencode' })).status, 409, 'not installed');
+      const codex = await ask(server, { text: 'Hi', engine: 'codex' });
+      assert.equal(codex.status, 400, 'not offered');
+      assert.ok(JSON.stringify(codex.body).includes('Codex cannot answer'));
       assert.equal((await ask(server, { text: 'Hi', agent: ID.sam })).status, 400, 'a person');
       assert.equal((await ask(server, { text: 'Hi' }, SECOND)).status, 400, 'no back office');
       assert.equal((await ask(server, { text: 'Hi', agent: OFFICE }, SECOND)).status, 403, 'not theirs');
@@ -143,6 +148,25 @@ describe('the orchestrator', () => {
       assert.equal(after.engine, 'claude');
       const session = (await call<Session>(server, 'GET', `/v1/sessions/${res.body.turns[0]!.session}`, { token: DEVICE })).body;
       assert.equal(session.state, 'ended');
+    }, FAST));
+
+  it("keeps an Orchestrator session's transcript its asker's alone, before and after clearing", () =>
+    withServer(async (server) => {
+      const res = await ask(server, { text: 'What is blocked?' });
+      assert.equal(res.status, 202);
+      await answered(server);
+      const transcript = `/v1/sessions/${res.body.turns[0]!.session}/transcript`;
+      for (const when of ['before', 'after']) {
+        assert.equal((await call(server, 'GET', transcript, { token: DEVICE })).status, 200, when);
+        const other = await call<{ code: string }>(server, 'GET', transcript, { token: SECOND });
+        assert.equal(other.status, 403, when);
+        assert.equal(other.body.code, 'forbidden');
+        if (when === 'before') {
+          assert.equal((await call(server, 'DELETE', '/v1/orchestrator/conversations', { token: DEVICE })).status, 204);
+        }
+      }
+      // Other sessions' transcripts are as before.
+      assert.equal((await call(server, 'GET', `/v1/sessions/${ID.ses1}/transcript`, { token: SECOND })).status, 200);
     }, FAST));
 });
 

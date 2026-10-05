@@ -3,6 +3,7 @@
 // CLI (a stand-in on the daemon, which never answers; the mock answers after its reply delay).
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { list, schemas } from './schema.mjs';
@@ -12,10 +13,24 @@ const person = process.env.PITCREW_CONFORMANCE_PERSON;
 const agent = process.env.PITCREW_CONFORMANCE_AGENT;
 const reader = process.env.PITCREW_CONFORMANCE_READER;
 const second = process.env.PITCREW_CONFORMANCE_SECOND_PERSON;
-assert.ok(base && person && agent && reader && second, 'Set PITCREW_CONFORMANCE_URL, _PERSON, _AGENT, _READER and _SECOND_PERSON');
+const runTokens = process.env.PITCREW_CONFORMANCE_SESSION_TOKENS;
+assert.ok(
+  base && person && agent && reader && second && runTokens,
+  'Set PITCREW_CONFORMANCE_URL, _PERSON, _AGENT, _READER, _SECOND_PERSON and _SESSION_TOKENS',
+);
 assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(new URL(base).hostname));
 const missing = '01J00000000000000000000000';
 const codes = { 400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict' };
+
+/** The token an Orchestrator session's CLI was given, as the target hands it to the suite. Never printed. */
+async function runToken(session) {
+  for (let i = 0; i < 300; i += 1) {
+    const token = await readFile(join(runTokens, `${session}.token`), 'utf8').catch(() => undefined);
+    if (token !== undefined && token.trim() !== '') return token.trim();
+    await new Promise((done) => setTimeout(done, 50));
+  }
+  throw new Error("The Orchestrator session's token never reached the suite.");
+}
 
 async function call(method, path, body, token = person, headers = {}) {
   const response = await fetch(base + path, {
@@ -127,14 +142,26 @@ test('the orchestrator: a person\'s own conversations, one answer at a time, can
     await expect(403, 'DELETE', '/v1/orchestrator/conversations', undefined, token);
   }
   const before = await expect(200, 'GET', '/v1/orchestrator', undefined, person, schemas.orchestrator);
-  assert.deepEqual(before.engines.map((e) => e.engine), ['claude', 'codex', 'opencode']);
+  // Codex is not offered (its read-only sandbox keeps `pitcrew` from the hub); nor is OpenCode on
+  // a Windows hub.
+  const engines = before.engines.map((e) => e.engine);
+  assert.equal(engines[0], 'claude');
+  assert.ok(!engines.includes('codex'), engines.join());
+  assert.ok(engines.every((e) => ['claude', 'opencode'].includes(e)), engines.join());
   assert.equal(before.limits.question_chars, 4000);
   assert.equal(before.limits.answer_bytes, 16384);
   assert.equal(before.limits.answer_seconds, 300);
   assert.ok(before.engines[0].installed, 'Claude Code (a stand-in on the daemon) is installed');
 
   // What a question must be.
-  for (const body of [{ text: ' \u0007 ' }, { text: 'x'.repeat(4001) }, {}, [1], { text: 'Synthetic?', engine: 'gpt' }]) {
+  for (const body of [
+    { text: ' \u0007 ' },
+    { text: 'x'.repeat(4001) },
+    {},
+    [1],
+    { text: 'Synthetic?', engine: 'gpt' },
+    { text: 'Synthetic?', engine: 'codex' },
+  ]) {
     await expect(400, 'POST', '/v1/orchestrator/questions', body);
   }
   await expect(404, 'POST', '/v1/orchestrator/questions', { text: 'Synthetic?', conversation: missing });
@@ -154,6 +181,21 @@ test('the orchestrator: a person\'s own conversations, one answer at a time, can
   assert.equal(session.title, 'Orchestrator');
   assert.equal(session.agent, asked.agent);
   assert.equal(session.workstream, undefined);
+  assert.match(session.cwd, new RegExp(`[\\\\/]scratch[\\\\/]${session.id}$`), 'its own fresh folder');
+
+  // Its CLI's token: a reader token minted for this session alone, which only reads.
+  const own = await runToken(turn.session);
+  assert.ok(own.startsWith('pcr_'), 'a reader token');
+  assert.notEqual(own, reader);
+  await expect(200, 'GET', '/v1/sessions', undefined, own, list(schemas.session));
+  await expect(403, 'POST', '/v1/tasks', {}, own);
+  await expect(403, 'GET', '/v1/orchestrator', undefined, own);
+
+  // Its transcript is its asker's alone.
+  const transcript = `/v1/sessions/${turn.session}/transcript`;
+  await expect(200, 'GET', transcript, undefined, person);
+  await expect(403, 'GET', transcript, undefined, second);
+
   const now = await expect(200, 'GET', '/v1/orchestrator', undefined, person, schemas.orchestrator);
   assert.equal(now.engine, 'claude');
   assert.equal(now.conversations[0].id, asked.id);
@@ -186,6 +228,11 @@ test('the orchestrator: a person\'s own conversations, one answer at a time, can
   const after = await expect(200, 'GET', '/v1/orchestrator', undefined, person, schemas.orchestrator);
   assert.deepEqual(after.conversations, []);
   assert.equal(after.engine, 'claude');
+  // Its token stopped at once; its transcript stays its asker's alone.
+  const revoked = await call('GET', '/v1/me', undefined, own);
+  assert.equal(revoked.status, 401);
+  await expect(200, 'GET', transcript, undefined, person);
+  await expect(403, 'GET', transcript, undefined, second);
   const deadline = Date.now() + 15000;
   for (;;) {
     const state = (await expect(200, 'GET', `/v1/sessions/${turn.session}`, undefined, person)).state;

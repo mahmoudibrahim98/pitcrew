@@ -104,8 +104,13 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   from the workspace (the most recently active sessions, their tasks, a recap) with suggestion
   lines; references and suggestions are found and resolved as the hub does. Follow-ups type into
   the live session (one line, `Q: ` before what would be a CLI command); a new conversation ends
-  the old session; one answer at a time; cancel and clear as the contract says. Claude Code and
-  Codex read as installed, OpenCode not. It never times out or cuts an answer.
+  the old session; one answer at a time; cancel and clear as the contract says. As the hub's, each
+  session has its own folder (`/cache/pitcrew/scratch/<session>`) and a reader token minted for it
+  alone (`pcr_…`, in memory, written to `<sessionTokenDir>/<session>.token` as a draft's is),
+  revoked when the session ends, at a new conversation and at a clear; its transcript and terminal
+  are its asker's alone (`askerOf`, cleared or not). Claude Code and OpenCode are offered (Claude
+  Code reads as installed, OpenCode not); Codex is refused (`400`). It never times out or cuts an
+  answer.
 - **Board drafts** (`src/board.ts`, api-v1.md "Board drafts"): the preview builds the summary as
   the hub does (the hub's own template from `crates/office/prompts/`, the same bounds, and the
   redaction and path rules ported), from the workstream's sessions and the recaps fixture, and

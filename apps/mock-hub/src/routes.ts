@@ -95,6 +95,7 @@ import {
   ask as askOrchestrator,
   cancel as cancelAnswer,
   clear as clearConversations,
+  askerOf,
   orchestratorOf,
 } from './orchestrator.ts';
 import * as integrations from './integrations.ts';
@@ -135,9 +136,12 @@ export function authenticate(hub: Hub, token: string | undefined): Caller {
   }
   const grant = TOKENS.get(token);
   if (grant === undefined) {
-    const session = sessionTokenGrant(hub, token);
-    if (session === undefined) throw new ApiFailure('unauthorized', 'Unknown token.');
-    return { memberId: session.member, member: hub.findMember(session.member), scope: 'session', session: session.session };
+    const run = sessionTokenGrant(hub, token);
+    if (run === undefined) throw new ApiFailure('unauthorized', 'Unknown token.');
+    if (run.scope === 'reader') {
+      return { memberId: run.member, member: hub.findMember(run.member), scope: 'reader' };
+    }
+    return { memberId: run.member, member: hub.findMember(run.member), scope: 'session', session: run.session };
   }
   return { memberId: grant.member, member: hub.findMember(grant.member), scope: grant.scope };
 }
@@ -1098,10 +1102,19 @@ const listSessions: Handler = (hub, ctx) => {
 
 const getTranscript: Handler = (hub, ctx) => {
   const session = sessionAt(hub, ctx.param('id'));
+  askerOnly(hub, session.id, ctx.caller.memberId);
   const before = queryInt(ctx.query, 'before', 0);
   const limit = queryLimit(ctx.query, 200, 1000);
   return ok(transcriptPage(hub.transcripts.get(session.id) ?? [], before, limit));
 };
+
+/** An Orchestrator session's transcript and terminal are its asker's alone (orchestrator.ts). */
+export function askerOnly(hub: Hub, session: string, member: string): void {
+  const asker = askerOf(hub, session);
+  if (asker !== undefined && asker !== member) {
+    throw forbidden("An Orchestrator session's transcript and terminal are only for the person who asked.");
+  }
+}
 
 const sessionOptions: Handler = (hub, ctx) => {
   const machine = hub.findMachine(ctx.param('id'));
