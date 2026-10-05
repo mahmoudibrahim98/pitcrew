@@ -1,53 +1,57 @@
-# Brief L · Shell polish and the data layer for the new contract
+# Brief L · Shell and onboarding polish
 
-- **Stream:** L · UI foundation. **Branch:** `s/L/shell-polish`. **Paths:** stream L's
-  (`apps/ui/*`, `src/design`, `src/shell`, `src/data`, `src/lib`, `tests`, `e2e`).
-- **First read:** [README.md](README.md), [L-shell.md](L-shell.md) (merged), and
-  `docs/build/contracts/api-v1.md`. The task-editing contract change is now merged, adding
-  `PATCH /v1/tasks`, `POST /v1/projects`, `POST /v1/workstreams` and `Brief.proposal`.
+- **Stream:** L · Shell (and O · Onboarding's UI).
+  **Branch:** `integrator/shell-polish`.
+  **Paths:** `apps/ui/src/shell/**`, `apps/ui/src/design/**`, `apps/ui/src/onboarding/**`,
+  `apps/ui/src/console/**` (workbench layout only), `apps/ui/src/index.css`,
+  `apps/desktop/src-tauri/**` (only the splash or window background), and the READMEs of what you
+  touch.
+- **First read:**
+  - [README.md](README.md) and the root `AGENTS.md` (or `CLAUDE.md`);
+  - the gr8r Studio reference's shell (sidebar, header, palette, empty states);
+  - `apps/ui/src/shell/README.md`.
+- **Suggested agent:** an Opus-class agent with a strong design sense.
 
-## Why
+## Goal
 
-Streams M (console), N (projects) and O (onboarding) wired their features into the shell and
-found gaps in it. One of them is an accessibility bug.
+The audit's polish list for the parts every screen shares, and for the first five minutes.
 
 ## What to build
 
-1. **Focus rings** (accessibility bug). Buttons that combine `outline-none` with
-   `focus-visible:outline-2` show no ring in Tailwind v4, because the computed `outline-style`
-   is `none`. Seen at `src/shell/sidebar.tsx:52` and `:166`, `top-bar.tsx:44`, and
-   `orchestrator.tsx:29`.
-   - Fix it everywhere in L's paths, for example with `focus-visible:outline-solid`, or one
-     shared focus utility in `src/design`.
-   - Add an e2e check that tabbing to these controls shows a visible outline.
-2. **`CreateEntry` with a reason:** an optional `disabled?: string` that shows the "+ New" item
-   disabled, with its reason as an accessible description. Stream M wants a "Session" item that
-   is disabled until starting a session works. Update the shell README and the registry tests.
-3. **Breadcrumb:** at a 700 px window the top bar's breadcrumb truncates to "Agent …". Make it
-   degrade gracefully, e.g. collapse the middle segments first, with the full path in a tooltip
-   or accessible label.
-4. **TypeScript coverage for feature e2e configs:** `tsconfig.node.json` doesn't reach
-   `src/**/e2e/**`, so stream O needed `/// <reference types="node" />` in its Playwright config.
-   Include `src/**/e2e/**` in `tsconfig.node.json`, keep it out of `tsconfig.app.json`, and
-   remove O's reference line. That file is in `src/onboarding/e2e/`; touch only that one line.
-5. **The data layer for the merged contract** (`src/data`):
-   - types: `TaskPatch`, `NewProject`, `NewWorkstream`, `BriefProposal`, `Brief.proposal`, and
-     `BriefAccepted`'s `next` and `receipts`;
-   - typed calls: `patchTask`, `createProject`, `createWorkstream`.
-   - Writes never touch the cache directly; the events they cause invalidate it. Check that
-     `project_created`, `workstream_created` and `task_updated` invalidate the right keys.
-   - Test each call against the mock hub, including one 400 and the 409 cycle case for
-     `blocked_by`.
-6. **Optional, if small:** `NavEntry.to` accepting search params, so a filtered console view
-   can be a sidebar entry. Skip it if it means redesigning the nav model, and say so.
+1. **Shell.**
+   - Real icons for every nav entry: Projects, Members and Calendar show the letters "P", "M" and
+     "C" today.
+   - Engine logos on agents.
+   - A loading splash instead of a blank white window.
+   - Designed empty states with the action that fills them.
+   - Unfinished menu items ("Hand off · Soon") hidden.
+   - A plain-words pass on the copy ("back office" becomes what it does).
+2. **Palette.**
+   - Create commands (New task, session, project, workstream, agent).
+   - Actions on the open item (move, assign, dispatch, link).
+   - Recent items.
+   - Keyboard hints.
+3. **Workbench.**
+   - Minimum pane widths: a split that can't fit stacks or refuses.
+   - The filter column collapses by default under a width.
+   - Tab strips don't show scrollbars.
+4. **Onboarding.**
+   - **Welcome:** what PitCrew does, in one line and one picture.
+   - **Workspace:** the machine name defaults to the computer's name; placeholders don't look like
+     values.
+   - **Create:** each suggestion's folder, merging two suggestions, correct plurals.
+   - **Import:** the filter ticks the scanned folders instead of typing them, says "OpenCode", and
+     offers "skip sub-agents".
+   - **Hooks:** a plain summary per agent ("Adds 5 hooks to Claude Code: session start, …") with
+     each file's diff folded.
+   - **Safety:** plain words, and no layout jump.
+   - **Done:** next steps (start a session, create a task, invite someone).
+5. **Tests:** the shell's keyboard paths, the palette, and onboarding end to end on the real hub
+   and the mock; axe in both themes.
 
 ## Acceptance
 
-- Typecheck, lint, the tests, the build and `size` pass.
-- The shell e2e passes, with axe clean in both themes and layouts, including the new focus check.
-- No feature folder changed apart from the one reference line in item 4.
-
-## Out of scope
-
-Routes outside `/w/$ws`. The hub always has exactly one workspace, created when `pitcrewd`
-first starts, so onboarding runs inside it.
+- No screen shows a letter where an icon belongs, a blank window while loading, an unexplained
+  term, or an unfinished feature.
+- `npm test`, the UI's checks, desktop shell checks if touched, and the guards pass. Every CI job
+  passes on the pull request.
