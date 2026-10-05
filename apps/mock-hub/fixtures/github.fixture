@@ -72,3 +72,51 @@ Accept: application/vnd.github+json
 HTTP/1.1 422
 
 {"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","message":"Synthetic refusal"}]}
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/issues/1 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+
+{"number":1,"title":"Fix flaky login test","body":"Login fails one run in ten on CI.","state":"open","labels":[{"name":"bug"},{"name":"tests"}],"milestone":{"number":1,"title":"v1 launch","state":"open"},"updated_at":"2026-01-02T09:00:00Z","created_at":"2026-01-01T09:00:00Z","html_url":"https://github.com/example-org/demo-repo/issues/1"}
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/issues/8 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+
+{"number":8,"title":"Synthetic new issue","body":"","state":"open","labels":[{"name":"docs"}],"milestone":{"number":2,"title":"v0 cleanup","state":"closed"},"updated_at":"2099-01-01T00:00:00Z","created_at":"2099-01-01T00:00:00Z","html_url":"https://github.com/example-org/demo-repo/issues/8"}
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/issues?state=all&sort=created&direction=desc&per_page=100 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+
+[{"number":8,"title":"Synthetic new issue","body":"Written in PitCrew.","state":"open","labels":[{"name":"docs"}],"updated_at":"2099-01-01T00:00:00Z","created_at":"2099-01-01T00:00:00Z","html_url":"https://github.com/example-org/demo-repo/issues/8"}]
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/issues/8/comments?per_page=100 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+
+[]
+
+### pitcrew-github-fixture ###
+POST https://api.github.com/repos/example-org/demo-repo/issues/1/labels HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+
+[{"name":"bug"},{"name":"tests"},{"name":"docs"}]
+
+### pitcrew-github-fixture ###
+DELETE https://api.github.com/repos/example-org/demo-repo/issues/1/labels/tests HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+
+[{"name":"bug"}]

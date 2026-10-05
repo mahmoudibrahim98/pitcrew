@@ -56,3 +56,11 @@ Accept: application/json
 HTTP/1.1 201
 
 {"id":"10008","key":"DEMO-8","self":"https://jira.example.com/rest/api/3/issue/10008"}
+
+### pitcrew-github-fixture ###
+GET https://jira.example.com/rest/api/3/issue/DEMO-6?fields=summary%2Cdescription%2Cstatus%2Clabels%2Cparent%2Cissuetype%2Cupdated HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 200
+
+{"id":"10006","key":"DEMO-6","fields":{"summary":"Send invoices by e-mail","description":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"Monthly, as a PDF."}]}]},"status":{"statusCategory":{"key":"new"}},"labels":["billing"],"parent":{"key":"DEMO-5"},"issuetype":{"name":"Story"},"updated":"2026-01-02T09:05:00.000+0000"}}

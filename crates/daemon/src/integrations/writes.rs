@@ -3,29 +3,36 @@
 //! Three parts, all run by the integrations' loop, one at a time with the syncs:
 //!
 //! - **The planner** ([`Integrations::plan_writes`]) reads the event log from where it stopped
-//!   (`integrations.json`'s `writes_rev`; the log's end the first time). A `task_moved` across the
-//!   open/closed line, or a `task_updated` of a field upstream owns (the crates' ownership tables,
-//!   [`pitcrew_sync_github::outward`]), on a task that mirrors an issue an integration syncs, and
-//!   authored by anyone but a sync (any integration's own member), becomes a proposal: an approval
-//!   ask from that integration's member and `write_proposed` (`SyncCommands::propose_write`, once
-//!   per cause). `before` is upstream's value as the last
-//!   sync read it; nothing is proposed when upstream already has the value.
+//!   (`integrations.json`'s `writes_rev`; the log's end the first time, and again when the saved
+//!   revision is beyond the log). A `task_moved` across the open/closed line, or a `task_updated`
+//!   of a field upstream owns (the crates' ownership tables, [`pitcrew_sync_github::outward`]),
+//!   on a task that mirrors an issue an integration syncs, and authored by anyone but a sync (any
+//!   integration's own member), becomes a proposal: an approval ask from that integration's
+//!   member and `write_proposed` (`SyncCommands::propose_write`, once per cause). `before` is
+//!   upstream's value as the last sync read it; nothing is proposed when upstream already has the
+//!   value. Only what the hub holds exactly is sent back: a title or description the last read
+//!   held lossily (hidden characters stripped, cut, Jira rich text) is left out, and labels go as
+//!   the labels added and removed, never the whole list.
 //! - **Requests** ([`Integrations::request_write`]): a person asks to create an issue from a task,
 //!   or to comment on its issue. Also only a proposal.
 //! - **The executor** ([`Integrations::settle_writes`]) acts on answered approvals. A denied write
-//!   is recorded as not sent. An approved one (or a failed one a person retries) is checked
-//!   against the task as it is now, started (`write_started`, which hub-work allows only for the
-//!   approval ask of the integration's own member, answered "Send" by a person), sent once with the
-//!   integration's
-//!   credential, and finished (`write_finished`). A write still `sending` when a pass begins was
-//!   cut off (the hub stopped): it is finished as failed and never sent again by itself.
+//!   is recorded as not sent. An approved one (or a failed one with a person's retry request) is
+//!   checked against the task as it is now; an edit, close or reopen is then checked against the
+//!   issue as upstream has it now (one read): what upstream already holds is not sent, and a field
+//!   upstream changed since `before` means nothing is sent. A retried create or comment first
+//!   looks upstream for the earlier attempt. Then it is started (`write_started`, which hub-work
+//!   allows only for the approval ask of the integration's own member, answered "Send" by a
+//!   person, or for a person's retry request), sent once with the integration's credential, and
+//!   finished (`write_finished`). A result the store cannot record is kept in memory and recorded
+//!   first at the next pass; a write still `sending` after that was cut off (the hub stopped): it
+//!   is finished as failed and never sent again by itself.
 //!
 //! Nothing here logs a credential, a request or an answer body.
 
 use super::saved::{Files, Record};
-use super::{Integrations, Refusal, github_host, lock};
+use super::{Integrations, Refusal, github_host, lock, utc_rfc3339};
 use pitcrew_hub_work::links::{LinkScope, scope_of};
-use pitcrew_hub_work::{SyncOutcome, TaskRef, WorkService, WriteFilter};
+use pitcrew_hub_work::{SyncOutcome, TaskRef, WorkService, WriteFilter, fit_labels, fit_title};
 use pitcrew_protocol::api::{Caller, ErrorCode};
 use pitcrew_protocol::events::EventBody;
 use pitcrew_protocol::ids::{AskId, EventId, IntegrationId, MemberId};
@@ -44,7 +51,10 @@ const PAGE: usize = 500;
 /// How much of a long text an approval ask's body shows (the write itself holds all of it).
 const SHOWN_CHARS: usize = 200;
 /// The message for a write cut off while it was being sent.
-const CUT_OFF: &str = "The hub stopped while sending; check upstream before you retry.";
+const CUT_OFF: &str =
+    "The hub stopped while sending; a retry first looks upstream for this attempt.";
+/// How long before a write's approval its earlier attempt is looked for upstream (clock skew).
+const EARLIER_MARGIN_MS: i64 = 10 * 60 * 1000;
 
 fn tracker(system: ExternalSystem) -> &'static str {
     if system == ExternalSystem::Jira {
@@ -70,7 +80,9 @@ fn container_of(system: ExternalSystem, key: &str) -> Option<&str> {
     }
 }
 
-/// The integration that syncs `container` of `system`, and that container as it spells it.
+/// The integration that syncs `container` of `system`, and that container as it spells it. A
+/// repository or Jira project is synced by one integration at most, on any host (`add` refuses a
+/// second), so the container alone names it.
 fn record_for<'a>(
     records: &'a [Record],
     system: ExternalSystem,
@@ -103,6 +115,16 @@ struct Seen {
     /// Its milestone (as a link key) or epic.
     parent: Option<String>,
     open: bool,
+    /// Whether the hub holds `title` exactly as upstream has it (nothing stripped, cut or
+    /// trimmed), so sending the hub's title back loses nothing.
+    title_exact: bool,
+    /// Whether `body` is upstream's whole body or description.
+    body_exact: bool,
+}
+
+/// Whether the hub's own copy of `title` (`fit_title`) is `title` itself.
+fn hub_holds_title(title: &str) -> bool {
+    fit_title(title, title) == title
 }
 
 /// The sync states, read once per pass.
@@ -130,6 +152,8 @@ impl States {
                         .milestone_number()
                         .map(|n| format!("{container}#milestone:{n}")),
                     open: issue.open(),
+                    title_exact: issue.title_lossless() && hub_holds_title(issue.title()),
+                    body_exact: issue.body_lossless(),
                 })
             }
             IntegrationSettings::Jira { .. } => {
@@ -144,6 +168,8 @@ impl States {
                     labels: issue.labels().to_vec(),
                     parent: issue.epic_key().map(str::to_owned),
                     open: issue.category() != pitcrew_sync_jira::StatusCategory::Done,
+                    title_exact: issue.title_lossless() && hub_holds_title(issue.title()),
+                    body_exact: issue.body_lossless(),
                 })
             }
         }
@@ -190,24 +216,36 @@ fn parent_of(fields: &WriteFields) -> Option<&String> {
     fields.milestone.as_ref().or(fields.epic.as_ref())
 }
 
-fn sorted(labels: &[String]) -> Vec<String> {
-    let mut out = labels.to_vec();
-    out.sort();
-    out
-}
-
 fn capped(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-/// A proposal ready for `propose_write`: its ask's addressee, the write, and the ask's text.
+/// A proposal ready for `propose_write`: its ask's addressee, the write, and the fields left out
+/// because the hub does not hold upstream's copy exactly.
 struct Draft {
     to: MemberId,
     write: WriteProposal,
+    left_out: Vec<&'static str>,
+}
+
+/// The labels `labels` (the task's, after a person's change) adds to and removes from upstream's
+/// `seen` labels as the hub holds them (`fit_labels`: at most 32, each cut). Labels upstream has
+/// that the hub does not hold are in neither list, so they are never touched.
+fn label_change(seen: &[String], labels: &[String]) -> (Vec<String>, Vec<String>) {
+    let held = fit_labels(seen);
+    let mut add: Vec<String> = Vec::new();
+    for label in labels {
+        if !held.contains(label) && !add.contains(label) {
+            add.push(label.clone());
+        }
+    }
+    let remove = held.into_iter().filter(|l| !labels.contains(l)).collect();
+    (add, remove)
 }
 
 /// What a change to `task` implies upstream, if anything. `event` is the change; `seen` the
-/// issue as the last sync read it.
+/// issue as the last sync read it. An `update` needs `seen`: it is checked against upstream's
+/// values as read, sends only what the hub holds exactly, and labels as a change.
 #[allow(clippy::too_many_arguments)]
 fn plan_change(
     body: &EventBody,
@@ -223,6 +261,7 @@ fn plan_change(
     let system = system_of(&record.settings);
     let mut before = WriteFields::default();
     let mut after = WriteFields::default();
+    let mut left_out = Vec::new();
     let operation = match body {
         EventBody::TaskMoved { from, to, .. } => {
             if closed(*from) == closed(*to)
@@ -256,39 +295,57 @@ fn plan_change(
             }
         }
         EventBody::TaskUpdated { patch, .. } => {
+            let Some(seen) = seen else {
+                tracing::info!(task = %task.key, "no sync has read this task's issue yet; nothing is proposed");
+                return None;
+            };
             let sends = |field| outward(ISSUE_FIELD_OWNERSHIP, field) == Outward::AskToSend;
             if let Some(title) = &patch.title
                 && sends("title")
-                && seen.is_none_or(|s| s.title != *title)
+                && seen.title != *title
             {
-                after.title = Some(title.clone());
-                before.title = seen.map(|s| s.title.clone());
+                if seen.title_exact {
+                    after.title = Some(title.clone());
+                    before.title = Some(seen.title.clone());
+                } else {
+                    left_out.push("title");
+                }
             }
             if let Some(description) = &patch.description
                 && sends("body")
-                && seen.is_none_or(|s| s.body != *description)
+                && seen.body != *description
             {
-                after.body = Some(capped(description, MAX_BODY_CHARS));
-                before.body = seen.map(|s| s.body.clone());
+                if seen.body_exact {
+                    after.body = Some(capped(description, MAX_BODY_CHARS));
+                    before.body = Some(seen.body.clone());
+                } else {
+                    left_out.push("body");
+                }
             }
             if let Some(labels) = &patch.labels
                 && sends("labels")
-                && seen.is_none_or(|s| sorted(&s.labels) != sorted(labels))
             {
-                after.labels = Some(labels.clone());
-                before.labels = seen.map(|s| s.labels.clone());
+                let (add, remove) = label_change(&seen.labels, labels);
+                if !add.is_empty() || !remove.is_empty() {
+                    after.add_labels = (!add.is_empty()).then_some(add);
+                    after.remove_labels = (!remove.is_empty()).then_some(remove);
+                    before.labels = Some(seen.labels.clone());
+                }
             }
             if let Some(Some(moved_to)) = &patch.workstream
                 && sends("milestone")
                 && writes_parent(&record.settings)
                 && let Some(workstream) = workstreams.iter().find(|w| w.id == *moved_to)
                 && let Some(parent) = parent_in(workstream, system, scope)
-                && seen.is_none_or(|s| s.parent.as_ref() != Some(&parent))
+                && seen.parent.as_ref() != Some(&parent)
             {
                 set_parent(&mut after, system, Some(parent));
-                set_parent(&mut before, system, seen.and_then(|s| s.parent.clone()));
+                set_parent(&mut before, system, seen.parent.clone());
             }
             if after.is_empty() {
+                if !left_out.is_empty() {
+                    tracing::info!(task = %task.key, fields = ?left_out, "upstream's copy is not held exactly; nothing is proposed");
+                }
                 return None;
             }
             WriteOperation::Update
@@ -310,6 +367,7 @@ fn plan_change(
             requested_by: author,
             cause: Some(cause),
         },
+        left_out,
     })
 }
 
@@ -371,6 +429,20 @@ fn field_lines(before: &WriteFields, after: &WriteFields, diff: bool) -> Vec<Str
             change,
         );
     }
+    if after.add_labels.is_some() || after.remove_labels.is_some() {
+        let added = after.add_labels.iter().flatten().map(|l| format!("+ {l}"));
+        let removed = after
+            .remove_labels
+            .iter()
+            .flatten()
+            .map(|l| format!("− {l}"));
+        line(
+            "labels",
+            before.labels.as_ref().map(labels),
+            added.chain(removed).collect::<Vec<_>>().join(", "),
+            change,
+        );
+    }
     if let Some(a) = &after.milestone {
         line("milestone", before.milestone.clone(), a.clone(), change);
     }
@@ -396,8 +468,14 @@ fn field_lines(before: &WriteFields, after: &WriteFields, diff: bool) -> Vec<Str
     out
 }
 
-/// The approval ask's title and body for `write`.
-fn ask_text(write: &WriteProposal, task_key: &str, why: &str) -> (String, String) {
+/// The approval ask's title and body for `write`. `left_out` names the fields a person changed
+/// that are not sent, because the hub does not hold upstream's copy exactly.
+fn ask_text(
+    write: &WriteProposal,
+    task_key: &str,
+    why: &str,
+    left_out: &[&str],
+) -> (String, String) {
     let tracker = tracker(write.system);
     let target = write
         .target
@@ -417,14 +495,13 @@ fn ask_text(write: &WriteProposal, task_key: &str, why: &str) -> (String, String
                 .after
                 .names()
                 .iter()
-                .map(
-                    |n| if *n == "body" && write.system == ExternalSystem::Jira {
-                        "description"
-                    } else {
-                        n
+                .map(|n| field_name(n, write.system))
+                .fold(Vec::new(), |mut names, n| {
+                    if !names.contains(&n) {
+                        names.push(n);
                     }
-                )
-                .collect::<Vec<_>>()
+                    names
+                })
                 .join(", ")
         ),
         WriteOperation::Close => format!("{tracker}: close {target}"),
@@ -439,6 +516,17 @@ fn ask_text(write: &WriteProposal, task_key: &str, why: &str) -> (String, String
         body.push_str(&line);
         body.push('\n');
     }
+    if !left_out.is_empty() {
+        let names: Vec<&str> = left_out
+            .iter()
+            .map(|n| field_name(n, write.system))
+            .collect();
+        body.push_str(&format!(
+            "\nNot sent: the {}. {tracker}'s copy holds formatting or characters PitCrew does not \
+             keep, and sending PitCrew's would replace them; change it in {tracker}.\n",
+            names.join(" and the ")
+        ));
+    }
     body.push('\n');
     body.push_str(why);
     if let Some(url) = write.target.as_ref().and_then(|t| t.url.as_deref()) {
@@ -446,6 +534,16 @@ fn ask_text(write: &WriteProposal, task_key: &str, why: &str) -> (String, String
         body.push_str(url);
     }
     (title, body)
+}
+
+/// A field's name as the tracker calls it.
+fn field_name(field: &str, system: ExternalSystem) -> &str {
+    match (field, system) {
+        ("body", ExternalSystem::Jira) => "description",
+        ("title", ExternalSystem::Jira) => "summary",
+        ("add_labels" | "remove_labels", _) => "labels",
+        _ => field,
+    }
 }
 
 /// Why a change implied it, for the ask's body.
@@ -485,10 +583,9 @@ impl Integrations {
             }
         }
         let files = self.files.clone();
-        let planned = tokio::task::spawn_blocking(move || {
-            plan_from(&work, &files, &records, &members, from)
-        })
-        .await;
+        let planned =
+            tokio::task::spawn_blocking(move || plan_from(&work, &files, &records, &members, from))
+                .await;
         let to = match planned {
             Ok(Ok(to)) => to,
             Ok(Err(e)) => {
@@ -506,15 +603,23 @@ impl Integrations {
         }
     }
 
-    /// Acts on answered approvals and asked-for retries (see the [module docs](self)).
+    /// Acts on answered approvals and asked-for retries (see the [module docs](self)). Results
+    /// the store could not record before come first, so a write already sent is never swept as
+    /// cut off.
     pub(super) async fn settle_writes(&self) {
         let Ok(work) = self.work() else { return };
+        let unfinished: Vec<(AskId, (MemberId, WriteResult))> =
+            lock(&self.unfinished).drain().collect();
+        for (ask, (member, result)) in unfinished {
+            self.finish(&work, member, ask, result).await;
+        }
         let filter = WriteFilter {
             task: None,
             states: vec![
                 WriteState::Approved,
                 WriteState::Denied,
                 WriteState::Sending,
+                WriteState::Failed,
             ],
         };
         let waiting = {
@@ -529,6 +634,10 @@ impl Integrations {
             }
         };
         for write in waiting {
+            if lock(&self.unfinished).contains_key(&write.proposal.ask) {
+                // Its result is still waiting to be recorded: neither cut off nor sent again.
+                continue;
+            }
             let Some(member) = self.proposer(&work, &write).await else {
                 continue;
             };
@@ -567,20 +676,11 @@ impl Integrations {
                     )
                     .await;
                 }
-                WriteState::Approved => self.send_write(&work, write).await,
+                WriteState::Approved => self.send_write(&work, member, write).await,
+                WriteState::Failed if write.retry_requested_by.is_some() => {
+                    self.send_write(&work, member, write).await;
+                }
                 _ => {}
-            }
-        }
-        let retries: Vec<AskId> = lock(&self.retries).drain().collect();
-        for ask in retries {
-            let found = {
-                let work = Arc::clone(&work);
-                tokio::task::spawn_blocking(move || work.write(&ask)).await
-            };
-            if let Ok(Ok(write)) = found
-                && write.state == WriteState::Failed
-            {
-                self.send_write(&work, write).await;
             }
         }
     }
@@ -600,6 +700,8 @@ impl Integrations {
             .map(|a| a.from)
     }
 
+    /// Records what came of `ask`. When the store cannot (a busy database, say), the result is
+    /// kept in memory and recorded first at the next pass.
     async fn finish(
         &self,
         work: &Arc<WorkService>,
@@ -607,11 +709,27 @@ impl Integrations {
         ask: AskId,
         result: WriteResult,
     ) {
-        let work = Arc::clone(work);
-        let done = tokio::task::spawn_blocking(move || {
-            work.sync_commands(member)?.finish_write(&ask, result)
-        })
-        .await;
+        #[cfg(test)]
+        if self
+            .fail_finishes
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            lock(&self.unfinished).insert(ask, (member, result));
+            return;
+        }
+        let done = {
+            let work = Arc::clone(work);
+            let result = result.clone();
+            tokio::task::spawn_blocking(move || {
+                work.sync_commands(member)?.finish_write(&ask, result)
+            })
+            .await
+        };
         match done {
             Ok(Ok(SyncOutcome::Changed(w))) => {
                 tracing::info!(write = %ask, state = ?w.state, attempts = w.attempts, "outward write finished");
@@ -621,19 +739,40 @@ impl Integrations {
             }
             Ok(Ok(SyncOutcome::Unchanged)) => {}
             Ok(Err(e)) => {
-                tracing::warn!(write = %ask, error = %e, "cannot finish an outward write")
+                tracing::warn!(write = %ask, error = %e, "cannot record an outward write's result yet; keeping it");
+                lock(&self.unfinished).insert(ask, (member, result));
             }
-            Err(_) => {}
+            Err(_) => {
+                lock(&self.unfinished).insert(ask, (member, result));
+            }
         }
     }
 
-    /// Sends one approved (or retried) write: checks it, starts it, sends it once, finishes it.
-    /// It starts only as its integration's own sync member, so hub-work refuses an approval ask
-    /// any other member raised.
-    async fn send_write(&self, work: &Arc<WorkService>, write: UpstreamWrite) {
-        let Some(member) = self.proposer(work, &write).await else {
-            return;
+    /// Starts `ask` (`write_started`); whether it started.
+    async fn start(&self, work: &Arc<WorkService>, member: MemberId, ask: AskId) -> bool {
+        let started = {
+            let work = Arc::clone(work);
+            tokio::task::spawn_blocking(move || work.sync_commands(member)?.start_write(&ask)).await
         };
+        match started {
+            Ok(Ok(SyncOutcome::Changed(_))) => true,
+            Ok(Ok(SyncOutcome::Refused(reason))) => {
+                tracing::warn!(write = %ask, %reason, "an outward write was not started");
+                false
+            }
+            Ok(Ok(SyncOutcome::Unchanged)) | Err(_) => false,
+            Ok(Err(e)) => {
+                tracing::warn!(write = %ask, error = %e, "cannot start an outward write");
+                false
+            }
+        }
+    }
+
+    /// Sends one approved (or retried) write: checks it against the task, then against upstream
+    /// as it is now, starts it, sends what is left once, and finishes it. It starts only as its
+    /// integration's own sync member (`member`), so hub-work refuses an approval ask any other
+    /// member raised.
+    async fn send_write(&self, work: &Arc<WorkService>, member: MemberId, write: UpstreamWrite) {
         let ask = write.proposal.ask;
         let record = self.record(&write.proposal.integration).ok();
         let stale = {
@@ -651,45 +790,102 @@ impl Integrations {
                 .await;
             return;
         };
-        let started = {
-            let work = Arc::clone(work);
-            tokio::task::spawn_blocking(move || work.sync_commands(member)?.start_write(&ask)).await
+        let (tracker, step) = match self.tracker(&record).await {
+            Ok(tracker) => {
+                let step = self.check_upstream(&tracker, &write).await;
+                (Some(tracker), step)
+            }
+            Err(message) => (None, Step::Finish(failed(message, None))),
         };
-        match started {
-            Ok(Ok(SyncOutcome::Changed(_))) => {}
-            Ok(Ok(SyncOutcome::Refused(reason))) => {
-                tracing::warn!(write = %ask, %reason, "an outward write was not started");
-                return;
-            }
-            Ok(Ok(SyncOutcome::Unchanged)) => return,
-            Ok(Err(e)) => {
-                tracing::warn!(write = %ask, error = %e, "cannot start an outward write");
-                return;
-            }
-            Err(_) => return,
+        if let Step::NotSent(reason) = step {
+            // Nothing was started, and nothing is sent.
+            self.finish(work, member, ask, WriteResult::NotSent { reason })
+                .await;
+            return;
         }
-        let result = self.deliver(&record, &write.proposal).await;
+        if !self.start(work, member, ask).await {
+            return;
+        }
+        let result = match (step, tracker) {
+            (Step::Send(fields), Some(tracker)) => tracker.deliver(&write.proposal, &fields).await,
+            (Step::Finish(result), _) => result,
+            (Step::Send(_) | Step::NotSent(_), _) => failed("Nothing could be sent.".into(), None),
+        };
         self.finish(work, member, ask, result).await;
     }
 
-    /// Sends `write` once through the integration and says what came of it.
-    async fn deliver(&self, record: &Record, write: &WriteProposal) -> WriteResult {
-        let failed = |message: String| WriteResult::Failed {
-            message,
-            status: None,
-        };
-        let secret = match self.credential(record).await {
-            Ok(secret) => secret,
-            Err(problem) => return failed(problem.message),
-        };
-        let upstream = match self.upstream() {
-            Ok(upstream) => upstream.clone(),
-            Err(problem) => return failed(problem.message),
-        };
-        match &record.settings {
-            IntegrationSettings::Github { api_base, .. } => {
-                deliver_github(&upstream, api_base.clone(), &secret, write).await
+    /// What is left to send of `write`, given upstream as it is now: an edit, close or reopen is
+    /// checked against the issue (one read; see [`reconcile`]); a retried create or comment first
+    /// looks for its earlier attempt.
+    async fn check_upstream(&self, tracker: &Tracker, write: &UpstreamWrite) -> Step<WriteFields> {
+        let proposal = &write.proposal;
+        match proposal.operation {
+            WriteOperation::CreateIssue | WriteOperation::Comment if write.attempts > 0 => {
+                let since = write
+                    .answered_at
+                    .unwrap_or(write.proposed_at)
+                    .saturating_sub(EARLIER_MARGIN_MS)
+                    / 1000;
+                match tracker.find_earlier(proposal, since).await {
+                    Ok(Some(found)) => Step::Finish(found),
+                    Ok(None) => Step::Send(proposal.after.clone()),
+                    Err(e) => Step::Finish(failed(
+                        format!(
+                            "Could not look upstream for the earlier attempt, so nothing was \
+                             sent: {}",
+                            e.0
+                        ),
+                        e.1,
+                    )),
+                }
             }
+            WriteOperation::CreateIssue | WriteOperation::Comment => {
+                Step::Send(proposal.after.clone())
+            }
+            WriteOperation::Update | WriteOperation::Close | WriteOperation::Reopen => {
+                let key = proposal
+                    .target
+                    .as_ref()
+                    .map_or_else(|| "The issue".to_owned(), |t| t.key.clone());
+                match tracker.read(proposal).await {
+                    Err(e) => Step::Finish(failed(
+                        format!(
+                            "Could not read {key} before sending, so nothing was sent: {}",
+                            e.0
+                        ),
+                        e.1,
+                    )),
+                    Ok(now) => match reconcile(proposal, &now) {
+                        Err(fields) => Step::NotSent(format!(
+                            "Not sent: {key} changed upstream since this was proposed ({}). The \
+                             next sync brings that change into PitCrew.",
+                            fields.join(", ")
+                        )),
+                        Ok(rest) if rest.is_empty() => Step::Finish(WriteResult::Sent {
+                            created: None,
+                            url: now
+                                .url
+                                .or_else(|| proposal.target.as_ref().and_then(|t| t.url.clone())),
+                        }),
+                        Ok(rest) => Step::Send(rest),
+                    },
+                }
+            }
+        }
+    }
+
+    /// How to reach `record`'s tracker: its transport and credential.
+    async fn tracker(&self, record: &Record) -> Result<Tracker, String> {
+        let secret = self.credential(record).await.map_err(|p| p.message)?;
+        let upstream = self.upstream().map_err(|p| p.message)?.clone();
+        match &record.settings {
+            IntegrationSettings::Github { api_base, .. } => Ok(Tracker::Github {
+                upstream,
+                config: pitcrew_sync_github::write::WriteConfig {
+                    api_base: api_base.clone(),
+                    token: pitcrew_sync_github::AuthToken::new(secret.expose()),
+                },
+            }),
             IntegrationSettings::Jira {
                 deployment,
                 site,
@@ -703,22 +899,26 @@ impl Integrations {
                             email: email.clone(),
                             api_token: secret.expose().to_owned(),
                         },
-                        None => return failed("The integration's settings are incomplete.".into()),
+                        None => return Err("The integration's settings are incomplete.".into()),
                     },
                     JiraDeployment::DataCenter => pitcrew_sync_jira::JiraAuth::Bearer {
                         token: secret.expose().to_owned(),
                     },
                 };
-                let config = pitcrew_sync_jira::write::WriteConfig {
-                    site: site.clone(),
-                    flavor: match deployment {
-                        JiraDeployment::Cloud => pitcrew_sync_jira::write::Flavor::Cloud,
-                        JiraDeployment::DataCenter => pitcrew_sync_jira::write::Flavor::DataCenter,
+                Ok(Tracker::Jira {
+                    upstream,
+                    config: pitcrew_sync_jira::write::WriteConfig {
+                        site: site.clone(),
+                        flavor: match deployment {
+                            JiraDeployment::Cloud => pitcrew_sync_jira::write::Flavor::Cloud,
+                            JiraDeployment::DataCenter => {
+                                pitcrew_sync_jira::write::Flavor::DataCenter
+                            }
+                        },
+                        auth,
+                        epic_link_field: epic_link_field.clone(),
                     },
-                    auth,
-                    epic_link_field: epic_link_field.clone(),
-                };
-                deliver_jira(&upstream, &config, write).await
+                })
             }
         }
     }
@@ -871,6 +1071,7 @@ impl Integrations {
                 &write,
                 &task.key.to_string(),
                 &format!("Asked for by {handle}."),
+                &[],
             );
             work.sync_commands(member)?
                 .propose_write(record.added_by, write, &title, &body)?
@@ -880,19 +1081,18 @@ impl Integrations {
         .map_err(|_| Refusal::internal("Proposing the write"))?
     }
 
-    /// `POST /v1/writes/{id}/retry`: checks the caller may retry it, then sends it again on the
-    /// loop's next pass.
+    /// `POST /v1/writes/{id}/retry`: records the caller's request to send it again
+    /// (`write_retry_requested`), which the loop's next pass uses.
     ///
     /// # Errors
     ///
-    /// `not_found`, `forbidden` or `conflict`, as [`WorkService::check_retry`].
+    /// `not_found`, `forbidden` or `conflict`, as [`WorkService::request_retry`].
     pub async fn retry_write(&self, caller: &Caller, ask: AskId) -> Result<UpstreamWrite, Refusal> {
         let work = self.work()?;
         let caller = *caller;
-        let write = tokio::task::spawn_blocking(move || work.check_retry(&caller, &ask))
+        let write = tokio::task::spawn_blocking(move || work.request_retry(&caller, &ask))
             .await
             .map_err(|_| Refusal::internal("Retrying the write"))??;
-        lock(&self.retries).insert(ask);
         self.wake.notify_one();
         Ok(write)
     }
@@ -935,9 +1135,19 @@ fn plan_from(
     from: Option<u64>,
 ) -> pitcrew_hub_work::Result<u64> {
     let latest = work.store().latest_rev()?;
-    let Some(from) = from else {
+    let Some(mut from) = from else {
         return Ok(latest);
     };
+    if from > latest {
+        // A store restored from an older copy, or another one: planning from beyond its end would
+        // never read anything again.
+        tracing::warn!(
+            saved = from,
+            latest,
+            "the outward-write planner's place is beyond the event log; planning from its end"
+        );
+        from = latest;
+    }
     if records.is_empty() {
         return Ok(latest);
     }
@@ -986,7 +1196,8 @@ fn plan_from(
                 .member(&event.author)
                 .map_or_else(|_| "someone".to_owned(), |m| m.handle);
             let why = because(&event.body, &handle, &task);
-            let (title, body) = ask_text(&draft.write, &task.key.to_string(), &why);
+            let (title, body) =
+                ask_text(&draft.write, &task.key.to_string(), &why, &draft.left_out);
             let Some(member) = members.get(&record.id) else {
                 continue;
             };
@@ -1038,12 +1249,28 @@ fn stale_reason(work: &WorkService, write: &WriteProposal, has_record: bool) -> 
                 ));
             }
             let after = &write.after;
+            if after.labels.is_some() {
+                // Proposed before labels were sent as a change: never sent as a whole list.
+                return Some(format!(
+                    "{} was proposed in an older form; nothing was sent.",
+                    task.key
+                ));
+            }
             if after.title.as_ref().is_some_and(|t| *t != task.title)
                 || after
                     .body
                     .as_ref()
                     .is_some_and(|b| *b != capped(&task.description, MAX_BODY_CHARS))
-                || after.labels.as_ref().is_some_and(|l| *l != task.labels)
+                || after
+                    .add_labels
+                    .iter()
+                    .flatten()
+                    .any(|l| !task.labels.contains(l))
+                || after
+                    .remove_labels
+                    .iter()
+                    .flatten()
+                    .any(|l| task.labels.contains(l))
             {
                 return changed();
             }
@@ -1066,118 +1293,331 @@ fn failed(message: String, status: Option<u16>) -> WriteResult {
     WriteResult::Failed { message, status }
 }
 
-async fn deliver_github(
-    upstream: &super::http::Upstream,
-    api_base: Option<String>,
-    secret: &super::secret::Secret,
-    write: &WriteProposal,
-) -> WriteResult {
-    use pitcrew_sync_github::write::{IssueEdit, IssueWrite, StateChange};
-    let Ok(repo) = pitcrew_sync_github::RepoRef::new(write.scope.clone()) else {
-        return failed("The repository's name is malformed.".into(), None);
-    };
-    let number = || -> Option<u64> {
-        write
-            .target
-            .as_ref()
-            .and_then(|t| t.key.rsplit_once('#'))
-            .and_then(|(_, n)| n.parse().ok())
-    };
-    let milestone = || -> Option<u64> {
-        write
-            .after
-            .milestone
-            .as_ref()
-            .and_then(|m| m.rsplit_once("#milestone:"))
-            .and_then(|(_, n)| n.parse().ok())
-    };
-    let after = &write.after;
-    let request = match write.operation {
-        WriteOperation::CreateIssue => IssueWrite::Create {
-            repo: repo.clone(),
-            title: after.title.clone().unwrap_or_default(),
-            body: after.body.clone().unwrap_or_default(),
-            labels: after.labels.clone().unwrap_or_default(),
-            milestone: milestone(),
-        },
-        operation => {
-            let Some(number) = number() else {
-                return failed("The issue's number is malformed.".into(), None);
-            };
-            match operation {
-                WriteOperation::Comment => IssueWrite::Comment {
-                    repo: repo.clone(),
-                    number,
-                    body: after.comment.clone().unwrap_or_default(),
-                },
-                WriteOperation::Close | WriteOperation::Reopen => IssueWrite::Edit {
-                    repo: repo.clone(),
-                    number,
-                    edit: IssueEdit {
-                        state: Some(if operation == WriteOperation::Reopen {
-                            StateChange::Reopen
-                        } else {
-                            StateChange::Close(match after.close_reason {
-                                Some(CloseReason::NotPlanned) => {
-                                    pitcrew_sync_github::CloseReason::NotPlanned
-                                }
-                                _ => pitcrew_sync_github::CloseReason::Completed,
-                            })
-                        }),
-                        ..IssueEdit::default()
-                    },
-                },
-                _ => IssueWrite::Edit {
-                    repo: repo.clone(),
-                    number,
-                    edit: IssueEdit {
-                        title: after.title.clone(),
-                        body: after.body.clone(),
-                        labels: after.labels.clone(),
-                        milestone: milestone(),
-                        state: None,
-                    },
-                },
+/// What to do with a write after checking it against upstream.
+#[derive(Debug)]
+enum Step<T> {
+    /// Send this.
+    Send(T),
+    /// Start it, and record this without sending anything (found upstream already, or upstream
+    /// could not be read).
+    Finish(WriteResult),
+    /// Record it as not sent, without starting it.
+    NotSent(String),
+}
+
+/// A crate's error, as a message and upstream's status.
+type Problem = (String, Option<u16>);
+
+/// An issue as upstream has it now, from either tracker: raw text (Jira's description as the
+/// sync reads it), labels as upstream spells them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Now {
+    title: String,
+    body: String,
+    /// Whether `body` is upstream's whole body or description.
+    body_exact: bool,
+    labels: Vec<String>,
+    /// Its milestone (as a link key) or epic.
+    parent: Option<String>,
+    open: bool,
+    url: Option<String>,
+}
+
+/// What is left of `write` to send, given upstream `now`, field by field:
+/// - a field upstream already holds as `after` is dropped;
+/// - a field still as `before` is kept;
+/// - any other value (upstream changed it since it was read, or its description now has
+///   formatting) is a conflict: `Err` names those fields, and nothing is sent;
+/// - labels: an added label upstream has, or a removed one it no longer has, is dropped; a label to
+///   remove is named as upstream spells it;
+/// - a close or reopen upstream already made is dropped.
+///
+/// `Ok` with nothing left means upstream already has it all.
+fn reconcile(write: &WriteProposal, now: &Now) -> Result<WriteFields, Vec<&'static str>> {
+    let (after, before) = (&write.after, &write.before);
+    let jira = write.system == ExternalSystem::Jira;
+    let mut rest = WriteFields::default();
+    let mut changed = Vec::new();
+    if let Some(title) = &after.title
+        && now.title != *title
+    {
+        if before.title.as_deref() == Some(now.title.as_str()) {
+            rest.title = Some(title.clone());
+        } else {
+            changed.push(if jira { "summary" } else { "title" });
+        }
+    }
+    if let Some(body) = &after.body
+        && now.body != *body
+    {
+        if now.body_exact && before.body.as_deref() == Some(now.body.as_str()) {
+            rest.body = Some(body.clone());
+        } else {
+            changed.push(if jira { "description" } else { "body" });
+        }
+    }
+    if let Some(parent) = parent_of(after)
+        && now.parent.as_ref() != Some(parent)
+    {
+        if now.parent.as_ref() == parent_of(before) {
+            set_parent(&mut rest, write.system, Some(parent.clone()));
+        } else {
+            changed.push(if jira { "epic" } else { "milestone" });
+        }
+    }
+    if let Some(state) = after.state
+        && now.open != (state == IssueState::Open)
+    {
+        rest.state = Some(state);
+        rest.close_reason = after.close_reason;
+    }
+    // Upstream's labels as the hub holds them (`fit_labels`), so they compare with the change.
+    let held = |raw: &String| fit_labels(std::slice::from_ref(raw)).pop();
+    if let Some(add) = &after.add_labels {
+        let missing: Vec<String> = add
+            .iter()
+            .filter(|l| !now.labels.iter().any(|r| held(r).as_ref() == Some(*l)))
+            .cloned()
+            .collect();
+        rest.add_labels = (!missing.is_empty()).then_some(missing);
+    }
+    if let Some(remove) = &after.remove_labels {
+        let present: Vec<String> = now
+            .labels
+            .iter()
+            .filter(|r| held(r).is_some_and(|h| remove.contains(&h)))
+            .cloned()
+            .collect();
+        rest.remove_labels = (!present.is_empty()).then_some(present);
+    }
+    if changed.is_empty() {
+        Ok(rest)
+    } else {
+        Err(changed)
+    }
+}
+
+/// An integration's tracker, ready for one write: its transport and credential.
+enum Tracker {
+    Github {
+        upstream: super::http::Upstream,
+        config: pitcrew_sync_github::write::WriteConfig,
+    },
+    Jira {
+        upstream: super::http::Upstream,
+        config: pitcrew_sync_jira::write::WriteConfig,
+    },
+}
+
+fn github_problem(e: &pitcrew_sync_github::write::WriteError) -> Problem {
+    (e.to_string(), e.status())
+}
+
+fn jira_problem(e: &pitcrew_sync_jira::write::WriteError) -> Problem {
+    (e.to_string(), e.status())
+}
+
+/// The repository and issue number of a GitHub write.
+fn github_issue(write: &WriteProposal) -> Result<(pitcrew_sync_github::RepoRef, u64), Problem> {
+    let repo = pitcrew_sync_github::RepoRef::new(write.scope.clone())
+        .map_err(|_| ("The repository's name is malformed.".to_owned(), None))?;
+    let number = write
+        .target
+        .as_ref()
+        .and_then(|t| t.key.rsplit_once('#'))
+        .and_then(|(_, n)| n.parse().ok())
+        .ok_or_else(|| ("The issue's number is malformed.".to_owned(), None))?;
+    Ok((repo, number))
+}
+
+fn milestone_number(fields: &WriteFields) -> Option<u64> {
+    fields
+        .milestone
+        .as_ref()
+        .and_then(|m| m.rsplit_once("#milestone:"))
+        .and_then(|(_, n)| n.parse().ok())
+}
+
+impl Tracker {
+    /// The issue `write` changes, as upstream has it now.
+    async fn read(&self, write: &WriteProposal) -> Result<Now, Problem> {
+        match self {
+            Self::Github { upstream, config } => {
+                let (repo, number) = github_issue(write)?;
+                let issue = pitcrew_sync_github::write::read_issue(upstream, config, &repo, number)
+                    .await
+                    .map_err(|e| github_problem(&e))?;
+                Ok(Now {
+                    title: issue.title,
+                    body: issue.body,
+                    body_exact: true,
+                    labels: issue.labels,
+                    parent: issue
+                        .milestone
+                        .map(|n| format!("{}#milestone:{n}", write.scope)),
+                    open: issue.open,
+                    url: issue.url,
+                })
+            }
+            Self::Jira { upstream, config } => {
+                let key = write
+                    .target
+                    .as_ref()
+                    .map(|t| t.key.clone())
+                    .unwrap_or_default();
+                let issue = pitcrew_sync_jira::write::read_issue(upstream, config, &key)
+                    .await
+                    .map_err(|e| jira_problem(&e))?;
+                Ok(Now {
+                    title: issue.summary,
+                    body: issue.description,
+                    body_exact: issue.description_lossless,
+                    labels: issue.labels,
+                    parent: issue.epic,
+                    open: issue.category != pitcrew_sync_jira::StatusCategory::Done,
+                    url: Some(format!(
+                        "{}/browse/{key}",
+                        config.site.trim_end_matches('/')
+                    )),
+                })
             }
         }
-    };
-    let config = pitcrew_sync_github::write::WriteConfig {
-        api_base: api_base.clone(),
-        token: pitcrew_sync_github::AuthToken::new(secret.expose()),
-    };
-    match pitcrew_sync_github::write::send(upstream, &config, &request).await {
-        Ok(written) => {
-            let created = written.number.map(|n| ExternalRef {
-                system: ExternalSystem::Github,
-                key: format!("{}#{n}", repo.as_str()),
-                url: written.url.clone().or_else(|| {
-                    (github_host(api_base.as_deref()) == "github.com")
-                        .then(|| format!("https://github.com/{}/issues/{n}", repo.as_str()))
-                }),
-            });
-            let url = written
-                .url
-                .or_else(|| created.as_ref().and_then(|c| c.url.clone()));
-            WriteResult::Sent { created, url }
-        }
-        Err(e) => {
-            let status = e.status();
-            let mut message = e.to_string();
-            if matches!(e, pitcrew_sync_github::write::WriteError::Malformed(_)) {
-                message.push_str("; check upstream before you retry.");
+    }
+
+    /// An earlier attempt at `write` (a create or a comment) made since `since_unix`, as the
+    /// result it would have had.
+    async fn find_earlier(
+        &self,
+        write: &WriteProposal,
+        since_unix: i64,
+    ) -> Result<Option<WriteResult>, Problem> {
+        match self {
+            Self::Github { upstream, config } => {
+                let request = github_request(write, &write.after)?;
+                let since = pitcrew_sync_github::GithubTimestamp::new(utc_rfc3339(since_unix));
+                let found =
+                    pitcrew_sync_github::write::find_earlier(upstream, config, &request, &since)
+                        .await
+                        .map_err(|e| github_problem(&e))?;
+                Ok(found.map(|w| github_sent(config, write, w)))
             }
-            failed(message, status)
+            Self::Jira { upstream, config } => {
+                let request = jira_request(write, &write.after)?;
+                let found =
+                    pitcrew_sync_jira::write::find_earlier(upstream, config, &request, since_unix)
+                        .await
+                        .map_err(|e| jira_problem(&e))?;
+                Ok(found.map(jira_sent))
+            }
+        }
+    }
+
+    /// Sends `fields` (what is left of `write`) once and says what came of it.
+    async fn deliver(&self, write: &WriteProposal, fields: &WriteFields) -> WriteResult {
+        match self {
+            Self::Github { upstream, config } => {
+                let request = match github_request(write, fields) {
+                    Ok(request) => request,
+                    Err((message, status)) => return failed(message, status),
+                };
+                match pitcrew_sync_github::write::send(upstream, config, &request).await {
+                    Ok(written) => github_sent(config, write, written),
+                    Err(e) => {
+                        let mut message = e.to_string();
+                        if matches!(e, pitcrew_sync_github::write::WriteError::Malformed(_)) {
+                            message.push_str("; a retry first looks upstream for it.");
+                        }
+                        failed(message, e.status())
+                    }
+                }
+            }
+            Self::Jira { upstream, config } => {
+                let request = match jira_request(write, fields) {
+                    Ok(request) => request,
+                    Err((message, status)) => return failed(message, status),
+                };
+                match pitcrew_sync_jira::write::send(upstream, config, &request).await {
+                    Ok(written) => jira_sent(written),
+                    Err(e) => failed(e.to_string(), e.status()),
+                }
+            }
         }
     }
 }
 
-async fn deliver_jira(
-    upstream: &super::http::Upstream,
-    config: &pitcrew_sync_jira::write::WriteConfig,
+/// The GitHub write that sends `fields` of `write`.
+fn github_request(
     write: &WriteProposal,
+    fields: &WriteFields,
+) -> Result<pitcrew_sync_github::write::IssueWrite, Problem> {
+    use pitcrew_sync_github::write::{IssueEdit, IssueWrite, StateChange};
+    if write.operation == WriteOperation::CreateIssue {
+        let repo = pitcrew_sync_github::RepoRef::new(write.scope.clone())
+            .map_err(|_| ("The repository's name is malformed.".to_owned(), None))?;
+        return Ok(IssueWrite::Create {
+            repo,
+            title: fields.title.clone().unwrap_or_default(),
+            body: fields.body.clone().unwrap_or_default(),
+            labels: fields.labels.clone().unwrap_or_default(),
+            milestone: milestone_number(fields),
+        });
+    }
+    let (repo, number) = github_issue(write)?;
+    if write.operation == WriteOperation::Comment {
+        return Ok(IssueWrite::Comment {
+            repo,
+            number,
+            body: fields.comment.clone().unwrap_or_default(),
+        });
+    }
+    let state = fields.state.map(|state| match state {
+        IssueState::Open => StateChange::Reopen,
+        IssueState::Closed => StateChange::Close(match fields.close_reason {
+            Some(CloseReason::NotPlanned) => pitcrew_sync_github::CloseReason::NotPlanned,
+            _ => pitcrew_sync_github::CloseReason::Completed,
+        }),
+    });
+    Ok(IssueWrite::Edit {
+        repo,
+        number,
+        edit: IssueEdit {
+            title: fields.title.clone(),
+            body: fields.body.clone(),
+            add_labels: fields.add_labels.clone().unwrap_or_default(),
+            remove_labels: fields.remove_labels.clone().unwrap_or_default(),
+            milestone: milestone_number(fields),
+            state,
+        },
+    })
+}
+
+/// What GitHub said it wrote, as a result: a created issue becomes `created`.
+fn github_sent(
+    config: &pitcrew_sync_github::write::WriteConfig,
+    write: &WriteProposal,
+    written: pitcrew_sync_github::write::Written,
 ) -> WriteResult {
+    let created = written.number.map(|n| ExternalRef {
+        system: ExternalSystem::Github,
+        key: format!("{}#{n}", write.scope),
+        url: written.url.clone().or_else(|| {
+            (github_host(config.api_base.as_deref()) == "github.com")
+                .then(|| format!("https://github.com/{}/issues/{n}", write.scope))
+        }),
+    });
+    let url = written
+        .url
+        .or_else(|| created.as_ref().and_then(|c| c.url.clone()))
+        .or_else(|| write.target.as_ref().and_then(|t| t.url.clone()));
+    WriteResult::Sent { created, url }
+}
+
+/// The Jira write that sends `fields` of `write`.
+fn jira_request(
+    write: &WriteProposal,
+    fields: &WriteFields,
+) -> Result<pitcrew_sync_jira::write::IssueWrite, Problem> {
     use pitcrew_sync_jira::write::{IssueEdit, IssueWrite};
-    let after = &write.after;
     let key = || {
         write
             .target
@@ -1185,54 +1625,55 @@ async fn deliver_jira(
             .map(|t| t.key.clone())
             .unwrap_or_default()
     };
-    let request = match write.operation {
+    Ok(match write.operation {
         WriteOperation::CreateIssue => {
-            let Ok(project) = pitcrew_sync_jira::ProjectRef::new(write.scope.clone()) else {
-                return failed("The Jira project's key is malformed.".into(), None);
-            };
+            let project = pitcrew_sync_jira::ProjectRef::new(write.scope.clone())
+                .map_err(|_| ("The Jira project's key is malformed.".to_owned(), None))?;
             IssueWrite::Create {
                 project,
-                summary: after.title.clone().unwrap_or_default(),
-                description: after.body.clone().unwrap_or_default(),
-                labels: after.labels.clone().unwrap_or_default(),
-                epic: after.epic.clone(),
+                summary: fields.title.clone().unwrap_or_default(),
+                description: fields.body.clone().unwrap_or_default(),
+                labels: fields.labels.clone().unwrap_or_default(),
+                epic: fields.epic.clone(),
             }
         }
         WriteOperation::Comment => IssueWrite::Comment {
             key: key(),
-            body: after.comment.clone().unwrap_or_default(),
+            body: fields.comment.clone().unwrap_or_default(),
         },
-        WriteOperation::Update => IssueWrite::Edit {
-            key: key(),
-            edit: IssueEdit {
-                summary: after.title.clone(),
-                description: after.body.clone(),
-                labels: after.labels.clone(),
-                epic: after.epic.clone(),
-            },
-        },
-        WriteOperation::Close => IssueWrite::Transition {
-            key: key(),
-            to: pitcrew_sync_jira::StatusCategory::Done,
-        },
-        WriteOperation::Reopen => IssueWrite::Transition {
-            key: key(),
-            to: pitcrew_sync_jira::StatusCategory::New,
-        },
-    };
-    match pitcrew_sync_jira::write::send(upstream, config, &request).await {
-        Ok(written) => {
-            let created = written.key.map(|key| ExternalRef {
-                system: ExternalSystem::Jira,
-                key,
-                url: written.url.clone(),
-            });
-            WriteResult::Sent {
-                created,
-                url: written.url,
+        WriteOperation::Close | WriteOperation::Reopen if fields.state.is_some() => {
+            IssueWrite::Transition {
+                key: key(),
+                to: if fields.state == Some(IssueState::Open) {
+                    pitcrew_sync_jira::StatusCategory::New
+                } else {
+                    pitcrew_sync_jira::StatusCategory::Done
+                },
             }
         }
-        Err(e) => failed(e.to_string(), e.status()),
+        _ => IssueWrite::Edit {
+            key: key(),
+            edit: IssueEdit {
+                summary: fields.title.clone(),
+                description: fields.body.clone(),
+                add_labels: fields.add_labels.clone().unwrap_or_default(),
+                remove_labels: fields.remove_labels.clone().unwrap_or_default(),
+                epic: fields.epic.clone(),
+            },
+        },
+    })
+}
+
+/// What Jira said it wrote, as a result: a created issue becomes `created`.
+fn jira_sent(written: pitcrew_sync_jira::write::Written) -> WriteResult {
+    let created = written.key.map(|key| ExternalRef {
+        system: ExternalSystem::Jira,
+        key,
+        url: written.url.clone(),
+    });
+    WriteResult::Sent {
+        created,
+        url: written.url,
     }
 }
 
@@ -1268,7 +1709,12 @@ mod tests {
             requested_by: MemberId::new(),
             cause: None,
         };
-        let (title, body) = ask_text(&write, "PAP-3", "Because @sam changed PAP-3 in PitCrew.");
+        let (title, body) = ask_text(
+            &write,
+            "PAP-3",
+            "Because @sam changed PAP-3 in PitCrew.",
+            &[],
+        );
         assert_eq!(
             title,
             "GitHub: change title, labels, milestone of example-org/demo-repo#1"
@@ -1281,6 +1727,101 @@ mod tests {
         );
         assert!(body.ends_with("https://github.com/example-org/demo-repo/issues/1"));
         assert!(body.starts_with("PitCrew sends this to GitHub only if you choose Send."));
+    }
+
+    #[test]
+    fn a_label_change_touches_only_the_labels_the_hub_holds() {
+        // Upstream has 40; the hub holds the first 32. A person removes one and adds one.
+        let seen: Vec<String> = (1..=40).map(|n| format!("l{n:02}")).collect();
+        let mut labels = fit_labels(&seen);
+        assert_eq!(labels.len(), 32);
+        labels.retain(|l| l != "l05");
+        labels.push("new".into());
+        let (add, remove) = label_change(&seen, &labels);
+        assert_eq!(
+            (add, remove),
+            (vec!["new".to_string()], vec!["l05".to_string()])
+        );
+        // The 8 the hub never held are neither added nor removed.
+        let (add, remove) = label_change(&seen, &fit_labels(&seen));
+        assert!(add.is_empty() && remove.is_empty());
+    }
+
+    fn update(before: WriteFields, after: WriteFields) -> WriteProposal {
+        WriteProposal {
+            ask: AskId::new(),
+            integration: IntegrationId::new(),
+            system: ExternalSystem::Github,
+            scope: "example-org/demo-repo".into(),
+            target: None,
+            task: None,
+            operation: WriteOperation::Update,
+            before,
+            after,
+            requested_by: MemberId::new(),
+            cause: None,
+        }
+    }
+
+    #[test]
+    fn upstream_now_decides_what_is_left_to_send() {
+        let write = update(
+            WriteFields {
+                title: Some("Old".into()),
+                body: Some("Body".into()),
+                labels: Some(vec!["bug".into(), "tests".into()]),
+                milestone: Some("example-org/demo-repo#milestone:1".into()),
+                ..WriteFields::default()
+            },
+            WriteFields {
+                title: Some("New".into()),
+                body: Some("Body, fixed".into()),
+                add_labels: Some(vec!["docs".into(), "bug".into()]),
+                remove_labels: Some(vec!["tests".into(), "gone".into()]),
+                milestone: Some("example-org/demo-repo#milestone:2".into()),
+                ..WriteFields::default()
+            },
+        );
+        let now = Now {
+            title: "Old".into(),
+            body: "Body".into(),
+            body_exact: true,
+            labels: vec!["bug".into(), "tests\u{200b}".into(), "security".into()],
+            parent: Some("example-org/demo-repo#milestone:1".into()),
+            open: true,
+            url: None,
+        };
+        // Everything still as read: all of it, labels against upstream's own spelling.
+        let rest = reconcile(&write, &now).unwrap();
+        assert_eq!(rest.title.as_deref(), Some("New"));
+        assert_eq!(rest.body.as_deref(), Some("Body, fixed"));
+        assert_eq!(rest.add_labels, Some(vec!["docs".to_string()]));
+        assert_eq!(rest.remove_labels, Some(vec!["tests\u{200b}".to_string()]));
+        assert_eq!(
+            rest.milestone.as_deref(),
+            Some("example-org/demo-repo#milestone:2")
+        );
+        // Upstream already has it: nothing left.
+        let there = Now {
+            title: "New".into(),
+            body: "Body, fixed".into(),
+            labels: vec!["bug".into(), "docs".into()],
+            parent: Some("example-org/demo-repo#milestone:2".into()),
+            ..now.clone()
+        };
+        assert!(reconcile(&write, &there).unwrap().is_empty());
+        // Changed upstream since: nothing is sent, and the fields are named.
+        let moved = Now {
+            title: "Someone else's".into(),
+            body: "Body".into(),
+            body_exact: false,
+            parent: None,
+            ..now.clone()
+        };
+        assert_eq!(
+            reconcile(&write, &moved).unwrap_err(),
+            vec!["title", "body", "milestone"]
+        );
     }
 
     #[test]

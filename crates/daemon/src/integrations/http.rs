@@ -140,6 +140,7 @@ impl HttpsTransport {
             Method::Post => hyper::Method::POST,
             Method::Patch => hyper::Method::PATCH,
             Method::Put => hyper::Method::PUT,
+            Method::Delete => hyper::Method::DELETE,
         };
         let mut builder = hyper::Request::builder()
             .method(method)

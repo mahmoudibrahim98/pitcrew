@@ -39,10 +39,11 @@ use pitcrew_protocol::integrations::{
     SyncStatus,
 };
 use pitcrew_protocol::model::{ExternalSystem, TimestampMs, Workstream};
+use pitcrew_protocol::writes::WriteResult;
 use pitcrew_sync_github::probe::CheckOutcome;
 use saved::{Files, Record, Saved};
 use secret::{GhCli, Secret, SecretFiles};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
@@ -195,8 +196,12 @@ pub struct Integrations {
     running: Mutex<HashSet<IntegrationId>>,
     /// Asked for with `POST …/sync`.
     requested: Mutex<HashSet<IntegrationId>>,
-    /// Failed writes a person asked to send again (`POST /v1/writes/{id}/retry`).
-    retries: Mutex<HashSet<AskId>>,
+    /// Results of writes the store could not record when they came back (a busy database):
+    /// recorded first at the next pass, before writes still `sending` are swept as cut off.
+    unfinished: Mutex<HashMap<AskId, (MemberId, WriteResult)>>,
+    /// Tests: how many of the next results to keep in memory as if the store had refused them.
+    #[cfg(test)]
+    fail_finishes: std::sync::atomic::AtomicUsize,
     wake: Notify,
 }
 
@@ -241,7 +246,9 @@ impl Integrations {
             saved: Mutex::new(saved),
             running: Mutex::new(HashSet::new()),
             requested: Mutex::new(HashSet::new()),
-            retries: Mutex::new(HashSet::new()),
+            unfinished: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fail_finishes: std::sync::atomic::AtomicUsize::new(0),
             wake: Notify::new(),
         })
     }
