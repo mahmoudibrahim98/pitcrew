@@ -111,7 +111,7 @@ pub use board_routes::{board_device_routes, board_session_routes};
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, SessionLink, WorkstreamPatch};
 pub use dispatch::{
     CONFINED_BRIEF, Confinement, DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT,
-    MAX_BRIEF, NEVER_STARTED, NewDispatch, PROMPT_FILE, RecordedStart, SessionRequest,
+    MAX_BRIEF, NEVER_STARTED, NewDispatch, PROMPT_FILE, RecordedStart, RunToken, SessionRequest,
 };
 pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};
@@ -119,7 +119,11 @@ pub use office::{
     Applied, BackOffice, OFFICE_HANDLE, OFFICE_NAME, OfficeCommands, OfficeRun,
     projections_with_office,
 };
-pub use orchestrator::{ENGINES, SESSION_TITLE as ORCHESTRATOR_SESSION_TITLE};
+pub use orchestrator::{
+    ENGINES as ORCHESTRATOR_ENGINES, READ_VERBS, SESSION_MAX_RUNTIME as ORCHESTRATOR_MAX_RUNTIME,
+    SESSION_TITLE as ORCHESTRATOR_SESSION_TITLE, confinement as orchestrator_confinement,
+    not_offered as orchestrator_not_offered,
+};
 pub use orchestrator_routes::orchestrator_routes;
 pub use pitcrew_protocol::api::{
     NewProject, NewTask, NewWorkstream, Setup, SetupDone, SetupPerson,

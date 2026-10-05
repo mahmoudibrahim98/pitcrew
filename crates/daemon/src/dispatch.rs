@@ -83,9 +83,8 @@ const ENDPOINTS: [&str; 3] = ["PITCREW_SOCKET", "PITCREW_PIPE", "PITCREW_URL"];
 #[derive(Debug)]
 pub struct RunnerLink {
     attached: Arc<Attached>,
-    /// Where scratch folders are made (`scratch/` in the state directory), if anywhere.
-    scratch: Option<PathBuf>,
-    /// Confined runs (board drafts): their folders, files, tokens and ends.
+    /// Confined runs (board drafts, the Orchestrator's sessions): their folders, files, tokens and
+    /// ends.
     confined: Option<Ender>,
 }
 
@@ -96,16 +95,8 @@ impl RunnerLink {
     pub fn new(attached: Arc<Attached>) -> Self {
         Self {
             attached,
-            scratch: None,
             confined: None,
         }
-    }
-
-    /// Makes scratch folders (`Dispatcher::scratch`, the Orchestrator's) under `dir`.
-    #[must_use]
-    pub fn with_scratch(mut self, dir: PathBuf) -> Self {
-        self.scratch = Some(dir);
-        self
     }
 
     /// Starts confined runs too (`SessionRequest::confinement`, a board draft's) with `runs`; the
@@ -230,20 +221,6 @@ impl Dispatcher for RunnerLink {
                 }
             }
         }
-    }
-
-    /// `scratch/<name>` in the state directory, on this hub's machine only
-    /// ([`crate::orchestrator::scratch_folder`]).
-    fn scratch(&self, machine: &MachineId, name: &str) -> Result<String, DispatchError> {
-        self.runner(machine)?;
-        let root = self.scratch.as_ref().ok_or_else(|| {
-            DispatchError::Unavailable("this hub keeps no scratch folders".into())
-        })?;
-        let folder =
-            crate::orchestrator::scratch_folder(root, name).map_err(DispatchError::Unavailable)?;
-        folder.into_os_string().into_string().map_err(|_| {
-            DispatchError::Unavailable("the state directory's path is not UTF-8".into())
-        })
     }
 
     fn command(&self, machine: &MachineId, command: &RunnerCommand) -> Result<(), DispatchError> {
@@ -391,25 +368,15 @@ impl AgentEnv {
         let _ = self.endpoint.set((variable, value));
     }
 
-    /// The file holding a token of `scope` (an agent's, or a reader's) for `agent`, acting for
-    /// `owner`: the one there while it verifies as exactly that, else a new token minted into it.
-    /// Only its id is logged.
-    fn token_file(
-        &self,
-        agent: MemberId,
-        owner: MemberId,
-        scope: TokenScope,
-    ) -> anyhow::Result<PathBuf> {
+    /// The file holding a token for `agent`, acting for `owner`: the one there while it verifies
+    /// as exactly that, else a new token minted into it. Only its id is logged.
+    fn token_file(&self, agent: MemberId, owner: MemberId) -> anyhow::Result<PathBuf> {
         let want = Caller {
             member: agent,
-            scope,
+            scope: TokenScope::Agent,
             on_behalf_of: Some(owner),
         };
-        let name = match scope {
-            TokenScope::Reader => format!("{}.reader.token", agent.0),
-            _ => format!("{}.token", agent.0),
-        };
-        let path = self.dir.join(name);
+        let path = self.dir.join(format!("{}.token", agent.0));
         let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
         if let Ok(Some(raw)) = read_token(&path)
             && self.tokens.verify(&raw) == Some(want)
@@ -419,7 +386,7 @@ impl AgentEnv {
         private_dir(&self.dir)?;
         let (info, token) = self.tokens.mint(want)?;
         write_token(&path, &token)?;
-        tracing::info!(token = %info.id, %agent, ?scope, path = %path.display(), "minted a token for the sessions an agent runs");
+        tracing::info!(token = %info.id, %agent, path = %path.display(), "minted an agent token for the sessions it runs");
         Ok(path)
     }
 }
@@ -449,18 +416,13 @@ impl SessionEnv for AgentEnv {
                 owner: Some(owner),
             } => (agent, owner),
         };
-        // A confined run's CLI gets its session token, which can do only its run's one thing;
-        // and a board draft's session never gets its agent's token, even once its run is gone.
-        // The Orchestrator's sessions only read: their CLI's token can do nothing else.
+        // A confined run's CLI gets the token minted for its run alone (a board draft's session
+        // token, the Orchestrator's reader token); and neither a board draft's session nor an
+        // Orchestrator session ever gets its agent's token, even once its run is gone.
         let confined = self
             .confined
             .as_ref()
             .and_then(|runs| runs.token_file(&session));
-        let scope = if work.reads_only(&session) {
-            TokenScope::Reader
-        } else {
-            TokenScope::Agent
-        };
         let file = match confined {
             Some(file) => file,
             None if work.is_draft_session(&session).unwrap_or(true) => {
@@ -469,7 +431,13 @@ impl SessionEnv for AgentEnv {
                      CLI cannot be given one"
                 ));
             }
-            None => self.token_file(agent, owner, scope).map_err(|e| {
+            None if work.is_orchestrator_session(&session) => {
+                return Err(format!(
+                    "session {session} is an Orchestrator session, and its run's token is gone, \
+                     so its CLI cannot be given one"
+                ));
+            }
+            None => self.token_file(agent, owner).map_err(|e| {
                 tracing::error!(%agent, error = %format!("{e:#}"), "cannot write an agent's token file");
                 "the agent's token file cannot be written".to_owned()
             })?,
@@ -976,6 +944,44 @@ mod tests {
         assert!(env.env_for(orphaned.id).unwrap_err().contains("no owner"));
         // Not stored: no agent yet, so nothing.
         assert_eq!(env.env_for(SessionId::new()).unwrap(), Vec::new());
+    }
+
+    /// An Orchestrator session whose run is gone (its run's token revoked, or a start that never
+    /// prepared one) never falls back to its agent's token: the hub keeps every Orchestrator
+    /// session it started, cleared or not, and the CLI is refused one.
+    #[test]
+    fn an_orchestrator_session_never_gets_its_agents_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sam = member(MemberKind::Human, "@sam", None);
+        let office = member(MemberKind::Agent, "@office", Some(sam.id));
+        let asked = session(Some(office.id));
+        let other = session(Some(office.id));
+        let file = tmp.path().join("orchestrator.json");
+        std::fs::write(
+            &file,
+            serde_json::json!({
+                "version": 1,
+                "people": [{"member": sam.id, "sessions": [asked.id]}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let work = work(tmp.path(), &[&sam, &office], &[&asked, &other]);
+        let work = Arc::new(
+            Arc::into_inner(work)
+                .unwrap()
+                .with_orchestrator_file(file)
+                .unwrap(),
+        );
+        let tokens: Arc<dyn TokenStore> = Arc::new(FileTokenStore::in_memory());
+        let dir = tmp.path().join("agents");
+        let env = AgentEnv::new(&work, Arc::clone(&tokens), dir.clone());
+        let refused = env.env_for(asked.id).unwrap_err();
+        assert!(refused.contains("Orchestrator"), "{refused}");
+        assert!(tokens.list().is_empty(), "no token was minted");
+        assert!(!dir.join(format!("{}.token", office.id.0)).exists());
+        // Another session of the same agent gets its agent's token, as before.
+        assert!(env.env_for(other.id).is_ok());
     }
 
     fn request(machine: MachineId, cwd: &str) -> DispatchRequest {

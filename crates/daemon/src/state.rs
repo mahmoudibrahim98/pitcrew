@@ -11,9 +11,7 @@
 //! | `recaps.sqlite3` | The recap index's blocks (`WorkService::with_recap_file`): a cache, made when the index is first built, replaced at every start and removed when the daemon stops; never read from one run to the next. Private (0600). When this directory is on a network filesystem, it is in a private folder (0700) on a local disk instead, in the temporary folder or else `$XDG_RUNTIME_DIR`, or the blocks stay in memory. On Unix that folder is named after this directory and the user, so the next start reuses the one a hard kill left and replaces its file; on Windows (or when something else has that name) its name is random, and a hard kill leaves it until the temporary folder is cleaned. |
 //! | `runner/<log id>/` | The runner's index of the transcripts it watches (`pitcrew-runner`), one per hub log. |
 //! | `agents/<agent id>.token` | An agent token for each agent whose sessions the runner started (a dispatch's), bound to that agent and its owner; the CLI is given its path (`PITCREW_TOKEN_FILE`). The folder is private (0700), each file too (0600). |
-//! | `agents/<agent id>.reader.token` | A reader token (it may only read) for an agent the Orchestrator's sessions run as, bound to that agent and its owner, given to those sessions' CLIs instead. Private (0600). |
-//! | `orchestrator.json` | The Orchestrator's conversations, per person (`WorkService::with_orchestrator_file`): not in the event log, so a person can clear theirs. Private (0600). |
-//! | `scratch/orchestrator-<member id>/` | The folder a person's Orchestrator sessions run in, with the CLIs' settings a session that only reads needs (`.claude/settings.json`). Private (0700). |
+//! | `orchestrator.json` | The Orchestrator's conversations, per person, and the ids of every Orchestrator session started for them (`WorkService::with_orchestrator_file`): not in the event log, so a person can clear their conversations. Private (0600). One this hub cannot read is moved aside (`orchestrator.json.unreadable-<ms>`) and the hub starts with none. |
 //! | `integrations.json` | The GitHub and Jira connections (no secret), each with its sync member and last sync status (`crate::integrations`). Private (0600). |
 //! | `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream), and its stored secret when it has one. The folder is private (0700; an owner-only DACL on Windows), each file too (0600). Never in the event log. |
 //! | `run/pitcrewd.sock` | The private socket (Unix). |
@@ -110,12 +108,6 @@ impl StateDir {
     #[must_use]
     pub fn orchestrator(&self) -> PathBuf {
         self.root.join("orchestrator.json")
-    }
-
-    /// The folders sessions that run in nobody's project start in (the Orchestrator's).
-    #[must_use]
-    pub fn scratch(&self) -> PathBuf {
-        self.root.join("scratch")
     }
 }
 

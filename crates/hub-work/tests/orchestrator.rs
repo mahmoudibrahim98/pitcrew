@@ -9,12 +9,13 @@ mod common;
 use axum::Router;
 use common::{OFFICE, SAM, WRITER, agent, call, demo, expect, open, person, reader};
 use pitcrew_hub_work::{
-    DispatchError, DispatchRequest, Dispatcher, SessionRequest, WorkService, orchestrator_routes,
+    CONFINED_BRIEF, DispatchError, DispatchRequest, Dispatcher, RunToken, SessionRequest,
+    WorkService, orchestrator_routes,
 };
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{MachineId, SessionId};
 use pitcrew_protocol::model::{Engine, PermissionMode};
-use pitcrew_protocol::runner::{EndMode, RunnerCommand};
+use pitcrew_protocol::runner::RunnerCommand;
 use pitcrew_protocol::transcript::{TranscriptItem, TranscriptPage};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -28,6 +29,9 @@ const SES1: &str = "01JB000000000000000SES0001";
 const SUBMISSION: &str = "01JB000000000000000WST0001";
 const PAPER: &str = "01JB000000000000000PRJ0001";
 
+/// An engine the Orchestrator offers besides Claude Code: OpenCode, but on Windows none.
+const OTHER: &str = if cfg!(windows) { "claude" } else { "opencode" };
+
 /// The runner link, with transcripts in memory.
 #[derive(Debug, Default)]
 struct Runner {
@@ -36,6 +40,8 @@ struct Runner {
     transcripts: Mutex<HashMap<SessionId, Vec<TranscriptItem>>>,
     missing: Mutex<Vec<Engine>>,
     fail: Mutex<Option<DispatchError>>,
+    /// The confined sessions finished (their token stopped, their CLI ended).
+    finished: Mutex<Vec<SessionId>>,
 }
 
 impl Runner {
@@ -45,6 +51,10 @@ impl Runner {
 
     fn commands(&self) -> Vec<RunnerCommand> {
         self.commands.lock().expect("commands").clone()
+    }
+
+    fn finished(&self) -> Vec<SessionId> {
+        self.finished.lock().expect("finished").clone()
     }
 
     /// Appends `items` to `session`'s transcript, at offsets after what it holds.
@@ -106,8 +116,13 @@ impl Dispatcher for Runner {
         self.fail.lock().expect("fail").clone().map_or(Ok(()), Err)
     }
 
-    fn scratch(&self, _: &MachineId, name: &str) -> Result<String, DispatchError> {
-        Ok(format!("/state/scratch/{name}"))
+    fn confined_folder(&self, session: &SessionId) -> Option<String> {
+        Some(format!("/cache/scratch/{}", session.0))
+    }
+
+    fn finish_session(&self, session: &SessionId) -> Result<(), DispatchError> {
+        self.finished.lock().expect("finished").push(*session);
+        Ok(())
     }
 
     fn command(&self, _: &MachineId, command: &RunnerCommand) -> Result<(), DispatchError> {
@@ -225,14 +240,16 @@ async fn a_question_starts_a_reading_session_and_its_answer_streams_from_its_tra
     let work = service(tmp.path(), &runner, &clock);
 
     let empty = state(&work).await;
-    assert_eq!(
-        empty["engines"],
+    // Codex is not offered (its sandbox keeps `pitcrew` from the hub), nor OpenCode on Windows.
+    let engines = if cfg!(windows) {
+        json!([{"engine": "claude", "installed": true}])
+    } else {
         json!([
             {"engine": "claude", "installed": true},
-            {"engine": "codex", "installed": true},
             {"engine": "opencode", "installed": true},
         ])
-    );
+    };
+    assert_eq!(empty["engines"], engines);
     assert!(empty.get("engine").is_none());
     assert_eq!(empty["conversations"], json!([]));
     assert_eq!(empty["limits"]["answer_bytes"], 16384);
@@ -255,13 +272,13 @@ async fn a_question_starts_a_reading_session_and_its_answer_streams_from_its_tra
     let session = session_of(&conversation);
     assert_eq!(conversation["session"], session.0.to_string());
 
-    // Stored first, as the back office's, titled Orchestrator, in the scratch folder; started
-    // with the CLI's own permission mode and the prompt.
+    // Stored first, as the back office's, titled Orchestrator, in its own confined folder;
+    // started confined, with a reader token, the prompt in its folder's file.
     let stored = work.session(&session).expect("stored");
     assert_eq!(stored.title.as_deref(), Some("Orchestrator"));
     assert_eq!(stored.agent, Some(OFFICE.parse().expect("office")));
     assert_eq!(stored.workstream, None);
-    assert_eq!(stored.cwd, format!("/state/scratch/orchestrator-{SAM}"));
+    assert_eq!(stored.cwd, format!("/cache/scratch/{}", session.0));
     let appended: Vec<String> = work
         .store()
         .since(rev, usize::MAX)
@@ -284,8 +301,33 @@ async fn a_question_starts_a_reading_session_and_its_answer_streams_from_its_tra
     );
     assert!(start.brief.contains("pitcrew session list"));
     assert!(start.brief.contains("Sam Rivera (@sam)"));
-    assert!(work.reads_only(&session), "its CLI gets a reader token");
-    assert!(!work.reads_only(&SES1.parse().expect("session")));
+    let confinement = start.confinement.clone().expect("a confined run");
+    assert_eq!(confinement, pitcrew_hub_work::orchestrator_confinement());
+    assert_eq!(
+        confinement.token,
+        RunToken::Reader,
+        "its CLI gets a reader token"
+    );
+    assert!(confinement.writes.is_empty(), "it writes no file");
+    assert!(confinement.commands.contains(&"session list".to_owned()));
+    assert!(!confinement.commands.iter().any(|c| c.starts_with("board")));
+    // Its command line carries one plain line, never the prompt (a Windows `.cmd` shim refuses
+    // the prompt's quotes and brackets); the prompt goes in its folder's prompt.md.
+    match start.start_command() {
+        RunnerCommand::StartSession {
+            brief, confined, ..
+        } => {
+            assert_eq!(brief.as_deref(), Some(CONFINED_BRIEF));
+            assert!(confined);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!CONFINED_BRIEF.chars().any(|c| "\"%!^&|<>()".contains(c)));
+    assert_eq!(
+        work.orchestrator_asker(&session),
+        Some(SAM.parse().expect("sam"))
+    );
+    assert!(!work.is_orchestrator_session(&SES1.parse().expect("session")));
 
     // Nothing in the transcript yet: still answering.
     assert_eq!(work.follow_orchestrator().expect("follow"), 1);
@@ -376,15 +418,14 @@ async fn follow_ups_type_into_the_live_session_and_a_new_conversation_ends_the_o
     let runner = Arc::new(Runner::default());
     let clock = Arc::new(AtomicI64::new(1_790_900_000_000));
     let work = service(tmp.path(), &runner, &clock);
-    let first = ask(
-        &work,
-        json!({"text": "What is blocked?", "engine": "codex"}),
-    )
-    .await;
+    let first = ask(&work, json!({"text": "What is blocked?", "engine": OTHER})).await;
     expect(&first, 202);
     let id = first.1["id"].as_str().expect("id").to_owned();
     let session = session_of(&first.1);
-    assert_eq!(runner.starts()[0].engine, Engine::Codex);
+    assert_eq!(
+        serde_json::to_value(runner.starts()[0].engine).expect("engine"),
+        OTHER
+    );
     runner.write(
         session,
         vec![
@@ -402,7 +443,7 @@ async fn follow_ups_type_into_the_live_session_and_a_new_conversation_ends_the_o
     )
     .await;
     expect(&res, 202);
-    assert_eq!(res.1["engine"], "codex", "a follow-up keeps its engine");
+    assert_eq!(res.1["engine"], OTHER, "a follow-up keeps its engine");
     assert_eq!(runner.starts().len(), 1, "no new session");
     assert_eq!(
         runner.commands(),
@@ -422,7 +463,7 @@ async fn follow_ups_type_into_the_live_session_and_a_new_conversation_ends_the_o
     );
     work.follow_orchestrator().expect("follow");
     let now = state(&work).await;
-    assert_eq!(now["engine"], "codex", "remembered");
+    assert_eq!(now["engine"], OTHER, "remembered");
     let turns = &now["conversations"][0]["turns"];
     assert_eq!(turns[0]["answer"], "PAP-4 waits for a review.");
     assert_eq!(turns[1]["state"], "answered");
@@ -448,20 +489,15 @@ async fn follow_ups_type_into_the_live_session_and_a_new_conversation_ends_the_o
     );
     work.follow_orchestrator().expect("follow");
 
-    // A new conversation ends the old one's session, and remembers the engine asked for.
+    // A new conversation finishes the old one's session (its token stops, its CLI ends), and
+    // remembers the engine asked for.
     let second = ask(
         &work,
         json!({"text": "Which session touched method.tex?", "engine": "claude"}),
     )
     .await;
     expect(&second, 202);
-    assert_eq!(
-        runner.commands().last(),
-        Some(&RunnerCommand::EndSession {
-            session,
-            mode: EndMode::Kill
-        })
-    );
+    assert_eq!(runner.finished(), vec![session]);
     assert_eq!(runner.starts().len(), 2);
     let now = state(&work).await;
     assert_eq!(now["engine"], "claude");
@@ -497,18 +533,15 @@ async fn follow_ups_type_into_the_live_session_and_a_new_conversation_ends_the_o
     let starts = runner.starts();
     assert_eq!(starts.len(), 3);
     let brief = &starts[2].brief;
-    assert_eq!(starts[2].engine, Engine::Codex);
+    assert_eq!(
+        serde_json::to_value(starts[2].engine).expect("engine"),
+        OTHER
+    );
     assert!(brief.contains("<earlier>\nQ: What is blocked?\nA: PAP-4 waits for a review.\n"));
     assert!(brief.ends_with("And before that?\n"));
     assert_ne!(session_of(&res.1), session);
-    // The newer conversation's session ended, as only one runs at a time.
-    assert_eq!(
-        runner.commands().last(),
-        Some(&RunnerCommand::EndSession {
-            session: second_session,
-            mode: EndMode::Kill
-        })
-    );
+    // The newer conversation's session finished, as only one runs at a time.
+    assert_eq!(runner.finished().last(), Some(&second_session));
 }
 
 #[tokio::test]
@@ -603,11 +636,7 @@ async fn cancel_stops_the_answer_and_clear_forgets_and_ends() {
     let runner = Arc::new(Runner::default());
     let clock = Arc::new(AtomicI64::new(1_790_900_000_000));
     let work = service(tmp.path(), &runner, &clock);
-    let res = ask(
-        &work,
-        json!({"text": "What is blocked?", "engine": "opencode"}),
-    )
-    .await;
+    let res = ask(&work, json!({"text": "What is blocked?", "engine": OTHER})).await;
     expect(&res, 202);
     let id = res.1["id"].as_str().expect("id").to_owned();
     let session = session_of(&res.1);
@@ -657,21 +686,36 @@ async fn cancel_stops_the_answer_and_clear_forgets_and_ends() {
     .await;
     assert_eq!(cleared.0, 204);
     assert_eq!(
-        runner.commands().last(),
-        Some(&RunnerCommand::EndSession {
-            session,
-            mode: EndMode::Kill
-        })
+        runner.finished(),
+        vec![session],
+        "its token stops, its CLI ends"
     );
     let now = state(&work).await;
     assert_eq!(now["conversations"], json!([]));
-    assert_eq!(now["engine"], "opencode", "the engine stays remembered");
-    assert!(!work.reads_only(&session));
+    assert_eq!(now["engine"], OTHER, "the engine stays remembered");
+    // Still known as theirs: its transcript stays theirs alone, and it gets no agent's token.
+    assert_eq!(
+        work.orchestrator_asker(&session),
+        Some(SAM.parse().expect("sam"))
+    );
     let file = std::fs::read_to_string(tmp.path().join("orchestrator.json")).expect("file");
     assert!(
         !file.contains("What is blocked?"),
         "a clear forgets the questions"
     );
+    // Clearing again finishes nothing more: the session is not a conversation's any more.
+    expect(
+        &call(
+            &app,
+            Some(person(SAM)),
+            "DELETE",
+            "/v1/orchestrator/conversations",
+            None,
+        )
+        .await,
+        204,
+    );
+    assert_eq!(runner.finished(), vec![session]);
 }
 
 #[tokio::test]
@@ -745,20 +789,30 @@ async fn who_may_ask_and_what_refuses_a_question() {
     let lee_view = call(&app, Some(person(lee)), "GET", "/v1/orchestrator", None).await;
     assert_eq!(lee_view.1["conversations"], json!([]));
 
-    // An engine that is not installed; a start the runner refuses.
+    // An engine not offered (Codex: its read-only sandbox keeps `pitcrew` from the hub); one that
+    // is not installed; a start the runner refuses.
     let tmp = tempfile::tempdir().expect("tmp");
     let runner = Arc::new(Runner::default());
-    runner.missing.lock().expect("missing").push(Engine::Codex);
+    runner.missing.lock().expect("missing").push(Engine::Claude);
     let work = service(tmp.path(), &runner, &clock);
     let res = ask(&work, json!({"text": "Hi", "engine": "codex"})).await;
+    expect(&res, 400);
+    assert!(
+        res.1["message"]
+            .as_str()
+            .expect("m")
+            .contains("Codex cannot answer")
+    );
+    let res = ask(&work, json!({"text": "Hi", "engine": "claude"})).await;
     expect(&res, 409);
     assert!(
         res.1["message"]
             .as_str()
             .expect("m")
-            .contains("Codex is not installed")
+            .contains("Claude Code is not installed")
     );
     assert!(runner.starts().is_empty());
+    runner.missing.lock().expect("missing").clear();
     *runner.fail.lock().expect("fail") = Some(DispatchError::Rejected("synthetic refusal".into()));
     let res = ask(&work, json!({"text": "Hi"})).await;
     expect(&res, 409);
@@ -828,7 +882,7 @@ async fn conversations_survive_a_restart_in_a_private_file() {
             .with_orchestrator_file(tmp.path().join("orchestrator.json"))
             .expect("the file"),
     );
-    assert!(work.reads_only(&session));
+    assert!(work.is_orchestrator_session(&session));
     runner.write(
         session,
         vec![
@@ -840,17 +894,77 @@ async fn conversations_survive_a_restart_in_a_private_file() {
     assert_eq!(work.follow_orchestrator().expect("follow"), 0);
     let view = state(&work).await;
     assert_eq!(view["conversations"][0]["turns"][0]["answer"], "Yes.");
-    // A file this hub cannot read is refused, not overwritten.
-    std::fs::write(
-        tmp.path().join("bad.json"),
-        "{\"version\": 9, \"people\": []}",
-    )
-    .expect("w");
-    assert!(
-        WorkService::new(open(&tmp.path().join("hub2.db")), demo.workspace.clone())
-            .with_orchestrator_file(tmp.path().join("bad.json"))
-            .is_err()
+    // When the hub restarts, the sessions still running end (their tokens were in memory), and
+    // their runs are finished; the turn one was answering fails. (This stand-in runner reports no
+    // end of its own, so the first session, finished when the second started, runs on too.)
+    let ask_again = ask(&work, json!({"text": "And now?"})).await;
+    expect(&ask_again, 202);
+    let running = session_of(&ask_again.1);
+    assert_eq!(
+        work.end_orchestrator_sessions("synthetic restart")
+            .expect("ended"),
+        2
     );
+    assert_eq!(
+        work.session(&session).expect("session").state,
+        pitcrew_protocol::model::SessionState::Ended
+    );
+    assert_eq!(
+        work.session(&running).expect("session").state,
+        pitcrew_protocol::model::SessionState::Ended
+    );
+    assert!(runner.finished().contains(&running));
+    work.follow_orchestrator().expect("follow");
+    assert_eq!(
+        state(&work).await["conversations"][0]["turns"][0]["state"],
+        "failed"
+    );
+    assert_eq!(work.end_orchestrator_sessions("again").expect("none"), 0);
+}
+
+/// A file this hub cannot read (a newer version, a variant it does not know, or one that does not
+/// parse) never stops the hub: it is moved aside, and the hub starts with no conversations.
+#[tokio::test]
+async fn an_unreadable_file_is_moved_aside_and_the_hub_starts_empty() {
+    let demo = demo();
+    for (i, text) in [
+        "{\"version\": 9, \"people\": []}".to_owned(),
+        format!(
+            "{{\"version\": 1, \"people\": [{{\"member\": \"{SAM}\", \"conversations\": [\
+             {{\"id\": \"01JB000000000000000CNV0001\", \"engine\": \"claude\", \
+             \"agent\": \"{OFFICE}\", \"started\": 1, \"turns\": [{{\"turn\": {{\
+             \"question\": \"q\", \"asked\": 1, \"session\": \"{SES1}\", \
+             \"state\": \"pondering\", \"answer\": \"\", \"references\": [], \
+             \"suggestions\": []}}}}]}}]}}]}}"
+        ),
+        "{ not json".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let file = tmp.path().join("orchestrator.json");
+        std::fs::write(&file, &text).expect("w");
+        let work = WorkService::new(open(&tmp.path().join("hub.db")), demo.workspace.clone())
+            .with_orchestrator_file(file.clone())
+            .unwrap_or_else(|e| panic!("case {i}: {e}"));
+        assert!(!file.exists(), "case {i}: moved aside");
+        let aside: Vec<String> = std::fs::read_dir(tmp.path())
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().into_string().expect("name"))
+            .filter(|n| n.starts_with("orchestrator.json.unreadable-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "case {i}: {aside:?}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(&aside[0])).expect("r"),
+            text,
+            "case {i}: kept as it was"
+        );
+        let view = work
+            .orchestrator(&person(SAM))
+            .unwrap_or_else(|e| panic!("case {i}: {e}"));
+        assert!(view.conversations.is_empty(), "case {i}");
+    }
 }
 
 /// The token an Orchestrator session's CLI gets reads the work and changes none of it: the reads

@@ -33,7 +33,10 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
     others). **Every other request of a reader to a route is `403 forbidden`** before its body is
     read: any `POST`, `PUT`, `PATCH` or `DELETE`, and any WebSocket upgrade (the stream,
     terminals); as for anyone, a route or method that does not exist is `404`. Its reads see what
-    those routes show anyone. Reader tokens name an agent and its owner, as agent tokens do.
+    those routes show anyone. Reader tokens name an agent and its owner, as agent tokens do. The
+    hub mints one for each Orchestrator session alone (its confined run, see "Orchestrator"), in
+    the daemon's memory only, and revokes it when the session ends, when its person clears their
+    conversations, and with the daemon.
   - `{ "session": SessionId }` (`pcs_…`), a **session token**: minted by the hub for one session
     it starts on its own behalf (a confined run: a board draft's, see "Board drafts"), bound to
     that session, and given to its CLI (`PITCREW_TOKEN_FILE`) in place of its agent's token. It
@@ -41,8 +44,8 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
     session** below, and each of those only for its own session's resource; every other route
     is `403 forbidden` (an agent route too). It lives in the daemon's memory only (never in the
     token registry), and is revoked when its run has done its one thing, when its session ends,
-    when the run passes its time, and with the daemon. This is shared plumbing: a later confined
-    run (the Orchestrator's) gets its own session token the same way.
+    when the run passes its time, and with the daemon. This is shared plumbing: the Orchestrator's
+    confined runs get a **reader** token minted the same way instead (they only read).
   - The hub stamps `author` (the caller) and, for agents and session tokens, `on_behalf_of` (the
     owner) from the token, never from the body. A reader never authors an event.
 - Mock tokens: `dev-device-token` (acts as `@sam`), `dev-agent-token` (acts as `@writer`) and
@@ -1293,30 +1296,47 @@ The Orchestrator panel answers a person's questions about their work across proj
 and machines (what each agent did today, what is blocked, where something was decided, which
 session touched a file), with links to what it used. **No API keys:** each question runs as a
 session of an agent CLI the person already uses (their choice of engine, remembered), started by
-the hub in a private scratch folder with a versioned prompt and a **reader** token (see "Transport
-and auth"): it finds things with the `pitcrew` CLI's read verbs and cannot change anything. **Any
-action comes back as a suggestion the person clicks.** Types: `crates/protocol/src/orchestrator.rs`.
+the hub as a **confined run** (as a board draft's is) with a versioned prompt and a **reader**
+token minted for that session alone (see "Transport and auth"): it finds things with the
+`pitcrew` CLI's read verbs and cannot change anything in PitCrew. **Any action comes back as a
+suggestion the person clicks.** Types: `crates/protocol/src/orchestrator.rs`.
 
 | Method and path | Body → response | Notes |
 |---|---|---|
 | `GET /v1/orchestrator` | → `Orchestrator` | The caller's own: the engines, the remembered one, the bounds, and their conversations, newest first. |
 | `POST /v1/orchestrator/questions` | `Question` → `Conversation` (202) | A new conversation, or a follow-up in `conversation`. Emits `session_discovered` when it starts a session. |
 | `POST /v1/orchestrator/conversations/{id}/cancel` | → `Conversation` | Stops the answer under way: its CLI gets Esc. |
-| `DELETE /v1/orchestrator/conversations` | → 204 | Clears the caller's history, and ends their Orchestrator session. |
+| `DELETE /v1/orchestrator/conversations` | → 204 | Clears the caller's history, and finishes their Orchestrator session. |
 
 All four are for device tokens only (`403` for agent and reader tokens), and see only the caller's
 own conversations: another person's are `404`. Ids in paths are bare ULIDs (`cnv_…` is accepted
 too). **The conversations are not events:** the hub keeps them per person in its state directory
 (`orchestrator.json`, private to its user), never on the stream or in the activity log, so a
-clear forgets them. Only the sessions that answer are in the log, as any session is.
+clear forgets them. Only the sessions that answer are in the log, as any session is. A file the
+hub cannot read (a newer version, a variant it does not know, or one that does not parse) never
+stops it: it is moved aside (`orchestrator.json.unreadable-<ms>`) and the hub starts with no
+conversations.
+
+**An Orchestrator session's transcript and terminal are its asker's alone**: `GET
+/v1/sessions/{id}/transcript` and `GET /v1/sessions/{id}/terminal` for one are `403` for anyone
+but the person who asked (another person's device token included; a reader's and an agent's are
+refused there already), before and after they clear. The hub remembers every Orchestrator session
+it started for a person, cleared or not, for this. The session itself (`GET /v1/sessions/{id}`,
+its state and its activity in `GET /v1/events`, the tools it ran included) is listed as any
+session is.
 
 **`Orchestrator`**: `{ "engines": EngineStatus[], "engine"?: Engine, "limits": OrchestratorLimits,
 "conversations": Conversation[] }`.
-- `EngineStatus` is `{ "engine", "installed": bool }` for `claude`, `codex` and `opencode`:
-  whether that CLI is on the hub machine's `PATH`, where questions run. No engine installed is the
-  panel's "nothing to ask with" state, which points to signing in to an agent CLI. Whether a CLI
-  is signed in is not known here (PitCrew never reads a CLI's login): a CLI that waits for its
-  login or for its folder to be trusted shows it in its session's terminal.
+- `EngineStatus` is `{ "engine", "installed": bool }` for each engine the Orchestrator offers:
+  `claude` and `opencode` (only `claude` on Windows), whether that CLI is on the hub machine's
+  `PATH`, where questions run. **Codex is not offered**: its read-only sandbox keeps `pitcrew` from
+  reaching the hub (a Unix socket or loopback TCP alike), so every read would wait for the person's
+  approval in its terminal, and widening its sandbox would give it the network and writes too.
+  OpenCode is not offered on Windows, where its commands run in `cmd.exe` and its confinement
+  cannot hold. No engine installed is the panel's "nothing to ask with" state, which points to
+  signing in to an agent CLI. Whether a CLI is signed in is not known here (onboarding's
+  `GET /v1/machines/{id}/agents` says, to the hub's owner): a CLI that waits for its login or for
+  its folder to be trusted shows it in its session's terminal.
 - `engine`: the engine the caller chose last for a new conversation, the next one's default
   (absent before the first).
 - `OrchestratorLimits`: `{ "question_chars": 4000, "answer_bytes": 16384, "answer_seconds": 300,
@@ -1330,30 +1350,51 @@ MemberId }`), refusals first, with nothing changed:
   trimmed (a follow-up's line breaks become spaces: it is typed into the CLI);
 - `400` an unknown agent, a person as the agent, or none named when the caller has no back office
   (`@office`, the default); `403` an agent the caller does not own;
+- `400` an `engine` the Orchestrator does not offer (`codex`, and `opencode` on Windows), for a
+  question that starts a session;
 - `409` while one of the caller's answers is under way (one at a time: cancel it first), a
   conversation at its `turns`, or an engine whose CLI is not installed (`installed: false`);
-- `503` when no session can start: no runner attached, the hub has no machine of its own, or it is
-  not live.
+- `503` when no session can start: no runner attached, the hub has no machine of its own, it is
+  not live, or there is no scratch folder for confined runs.
 
-Without `conversation` it is a new conversation, in `engine` (else the remembered one, else
-`claude`), which becomes the remembered one; the caller's other Orchestrator session ends first
-(one at a time per person). With `conversation` it is a follow-up in that conversation's engine
+Without `conversation` it is a new conversation, in `engine` (else the remembered one while it is
+offered, else `claude`), which becomes the remembered one; the caller's other Orchestrator session
+is finished first (one at a time per person: its token stops at once, its CLI is ended). With `conversation` it is a follow-up in that conversation's engine
 (`engine` is ignored): if the conversation's session lives, the question is typed into it (the
 runner's `SendText`); if it has ended, a new session starts, whose prompt carries the
 conversation's last questions and answers (at most 6 KiB, cut and marked as data).
 
 A new session is stored first (`session_discovered`: title `Orchestrator`, state `starting`, the
-agent named, linked to nothing), then its CLI starts in the caller's scratch folder on the hub's
-own machine (`scratch/orchestrator-<member>` in the state directory: made if missing, private to
-the daemon's user) with the CLI's own default permission mode (never a persona's), and the prompt
-(`crates/office/prompts/orchestrator/v1.md`, `orchestrator/v1`: the workspace, the person, today's
-date, the read verbs, how to cite and how to suggest, then the question) as its first prompt. Its
-CLI gets a **reader** token for the agent and its owner (`PITCREW_TOKEN_FILE`:
-`agents/<agent>.reader.token`), as a dispatch's gets an agent token. For Claude Code the folder
-holds `.claude/settings.json`, which allows `pitcrew`'s read verbs and denies editing files and
-the web. A start the runner refuses or fails ends the session and answers as a dispatch does
-(`409`, `503` or `500`); the turn is then `failed`. The answer is `202` with the conversation, its
-new turn `answering`.
+agent named, linked to nothing, its `cwd` its private folder), then its CLI starts **confined**
+(the daemon's `crates/daemon/src/confined.rs`, as for a board draft), whatever the agent's
+persona's permission mode and the person's own settings for that CLI:
+- on the hub's own machine, in a **fresh private folder** `scratch/<session>` in PitCrew's cache
+  folder (0700, an owner-only ACL on Windows), never the state directory, made new for this
+  session (a follow-up typed into a live session stays in its folder; a new session gets a new
+  one) and removed when the session ends, so nothing an answer could write there (a
+  `CLAUDE.md`, an `AGENTS.md`, a settings file) reaches a later session;
+- with its prompt (`crates/office/prompts/orchestrator/v1.md`, `orchestrator/v1`: the workspace,
+  the person, today's date, the read verbs, how to cite and how to suggest, then the question) in
+  `prompt.md` there (0600), and one plain line on its command line (`Read the file prompt.md in
+  this folder and follow its instructions.`), which passes a Windows `.cmd` shim;
+- in its CLI's confined shape: Claude Code `--permission-mode=default --setting-sources=project
+  --strict-mcp-config` with a project `.claude/settings.json` that pre-approves only `pitcrew`'s
+  read verbs (never `board submit`), denies every file edit, web fetch and search, reading or
+  changing the state directory, and reading the agent CLIs' own folders and common credential
+  stores (`~/.ssh`, `~/.claude`, `~/.codex`, …); a read elsewhere outside its folder asks the
+  person in its terminal (Claude Code's denials win over its allowances, so it cannot be told to
+  deny every read but its folder's). OpenCode with a deny-all `opencode.json` but reading its
+  folder (`external_directory` denied) and `pitcrew <read verb>`;
+- with a **reader token** minted for this session alone (`PITCREW_TOKEN_FILE`:
+  `sessions/<session>.token` in the state directory), never its agent's token, even once its run
+  is gone; revoked when the session ends, when the person clears, and with the daemon;
+- for at most **60 minutes**: then its CLI is ended (a follow-up after that starts a new
+  session). When the daemon starts, Orchestrator sessions left running are ended (their tokens
+  were in the last daemon's memory).
+
+A start the runner refuses or fails ends the session and answers as a dispatch does (`409`, `503`
+or `500`); the turn is then `failed`. The answer is `202` with the conversation, its new turn
+`answering`.
 
 **`Conversation`**: `{ "id", "engine", "agent", "started", "session"?: SessionId, "turns":
 OrchestratorTurn[] }`; `session` is the session that answers it while that lives (absent once it
@@ -1398,12 +1439,15 @@ route (`POST /v1/tasks/{id}/move`, after they confirm) or by opening the page.
 **Cancel**: `404` unknown; `409` when no turn of it is answering; `503` when its CLI cannot be
 reached (nothing changes). Otherwise its CLI gets Esc and the turn is `canceled`.
 
-**Clear**: the caller's conversations are forgotten, and their Orchestrator session ends
-(`EndSession`, `kill`: an Orchestrator session holds nothing to save). The remembered engine
-stays. The sessions stay in the log, and their transcripts in their CLI's own folder, as any
-session's do.
+**Clear**: under the command lock, the caller's conversations are forgotten and each live
+Orchestrator session of theirs is finished: its reader token stops at once, then its CLI is ended
+and its folder removed. The remembered engine stays. **The sessions stay in the log, and their
+transcripts stay in each CLI's own folder (`~/.claude/projects/…`, and so on), as any session's
+do:** the hub does not delete a CLI's files, and still serves those transcripts to their asker
+alone.
 
-**The CLI's read verbs** (all `GET`s; the reader token can do nothing else), each with `--json`:
+**The CLI's read verbs** (all `GET`s; the reader token can do nothing else; the confinement's
+allowed commands are exactly these and `pitcrew whoami`), each with `--json`:
 `pitcrew search <words…>` (projects, workstreams, tasks, sessions and recent recap lines whose
 text has every word), `pitcrew session list [--since today|<YYYY-MM-DD>] [--state …]
 [--workstream <id>] [--task <task>]`, `pitcrew session show <id>`, `pitcrew recap blocks

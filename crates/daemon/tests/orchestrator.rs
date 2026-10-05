@@ -5,15 +5,20 @@
 //! in a transcript as Claude Code does, citing what it read.
 //!
 //! The test asks "What did my agents do today?" and checks that:
-//! - the stand-in ran in the person's scratch folder with a **reader** token's file (no token in
-//!   its environment); every read verb answered it, and both writes were refused (`pitcrew` exits
-//!   3);
+//! - the stand-in ran **confined**: in a fresh private folder of its own outside the state
+//!   directory (its prompt in `prompt.md`, one plain line on its command line, Claude Code's
+//!   confined flags, settings that allow only the read verbs and deny every edit), with the file
+//!   of a **reader** token minted for its session alone (no token in its environment, never its
+//!   agent's); every read verb answered it, and both writes were refused (`pitcrew` exits 3);
 //! - the answer arrives from the transcript, with **working links**: each reference names a
 //!   session and a task the hub serves; its suggestion is a suggestion (nothing moved);
 //! - the reader token is refused (`403`) on **every write route of the contract**, every
 //!   WebSocket, and the device-only reads, and answers the reads marked **read**;
+//! - the session's transcript and terminal are the asker's alone: another person's device token
+//!   gets `403`, before and after clearing;
 //! - a follow-up is typed into the live session and answered there; clearing forgets the
-//!   conversation and ends its session.
+//!   conversation, revokes the reader token at once, ends its session, and removes its folder and
+//!   token file.
 //!
 //! Unix only (the stand-in is a shell script). pitcrew-ptyd and pitcrew must have been built next
 //! to `pitcrewd` (`cargo test --workspace` builds both); if they are not, the test says so and
@@ -36,8 +41,8 @@ const MARK: &str = "PITCREW_TEST_RUN";
 const QUESTION: &str = "What did my agents do today?";
 const FOLLOW_UP: &str = "And which tasks moved?";
 
-/// A stand-in for Claude Code started with the Orchestrator's prompt. It notes what it was given,
-/// runs `pitcrew`'s read verbs and two writes, then writes its transcript (under the
+/// A stand-in for Claude Code started for an Orchestrator question. It notes what it was given and
+/// where (its prompt from its folder's `prompt.md`), runs `pitcrew`'s read verbs and two writes, then writes its transcript (under the
 /// `--session-id` it was given): the question, one tool run, and an answer citing the first
 /// session `pitcrew session list` shows that is not its own, and PAP-1, with a suggestion. Each
 /// line typed into its terminal afterwards is a follow-up, answered in the transcript too.
@@ -48,10 +53,13 @@ for arg in "$@"; do
   case "$arg" in --session-id=*) id=${arg#--session-id=} ;; esac
 done
 [ -n "$id" ] || { echo "no --session-id" >&2; exit 2; }
-for prompt in "$@"; do :; done
 out="@OUT@/$id"
 mkdir -p "$out"
-printf '%s' "$prompt" > "$out/prompt"
+printf '%s\n' "$@" > "$out/args"
+cp prompt.md "$out/prompt"
+ls -A > "$out/files"
+ls -ld . | cut -c1-10 > "$out/mode"
+cat .claude/settings.json > "$out/settings" 2> /dev/null
 printf '%s' "${PITCREW_TOKEN_FILE:-}" > "$out/token-file"
 if [ -n "${PITCREW_TOKEN:-}" ]; then : > "$out/token-in-env"; fi
 pwd -P > "$out/cwd"
@@ -108,6 +116,44 @@ fn built() -> Option<(PathBuf, PathBuf)> {
         }
     }
     Some((ptyd, cli))
+}
+
+/// A second person's device token in `state` (made now, private, before the daemon starts): a
+/// member of the hub who did not ask. Random each run, never printed.
+fn second_person(state: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::os::unix::fs::PermissionsExt as _;
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::fs::create_dir_all(state).unwrap();
+    std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+        | 1;
+    // 32 bytes, unpadded base64url: 43 characters, the last carrying only 2 bits.
+    let mut token = String::from("pcd_");
+    for at in 0..43 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let index = (seed % 64) as usize;
+        token.push(ALPHABET[if at == 42 { index & !3 } else { index }] as char);
+    }
+    let sha256: String = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let tokens = json!({ "version": 1, "tokens": [{
+        "id": "01J00000000000000000000001",
+        "sha256": sha256,
+        "caller": { "member": "01JB000000000000000MEM0007", "scope": "device" },
+        "created_at": 0,
+    }] });
+    let path = state.join("tokens.json");
+    std::fs::write(&path, tokens.to_string()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    token
 }
 
 fn private_folder(dir: &Path) {
@@ -260,6 +306,7 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
     private_folder(&endpoint);
     let endpoint = endpoint.join("ptyd");
     let state = tmp.path().join("state");
+    let second = second_person(&state);
     let mut daemon = Daemon::start_with(
         &state,
         &[
@@ -299,7 +346,7 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
     );
     assert_eq!(before["conversations"], json!([]));
 
-    // The question: a session that only reads, in the person's scratch folder.
+    // The question: a confined session that only reads.
     let asked = ok(
         &daemon.post(
             "/v1/orchestrator/questions",
@@ -366,6 +413,8 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
         "its own session is today's"
     );
     assert!(read("show.out").starts_with(&format!("ses_{}  Draft method section", id::SES1)));
+    // Its prompt in its folder's file, and one plain line on its command line, after Claude
+    // Code's confined flags.
     let prompt = read("prompt");
     assert!(prompt.ends_with(&format!("The question:\n\n{QUESTION}\n")));
     assert!(prompt.contains("pitcrew session list"));
@@ -373,22 +422,69 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
         !prompt.contains(&device),
         "the device token is never in a prompt"
     );
+    let args: Vec<String> = read("args").lines().map(str::to_owned).collect();
+    for flag in [
+        "--permission-mode=default",
+        "--setting-sources=project",
+        "--strict-mcp-config",
+    ] {
+        assert!(args.iter().any(|a| a == flag), "{flag}: {args:?}");
+    }
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some(pitcrew_hub_work::CONFINED_BRIEF)
+    );
+    assert!(
+        !args.iter().any(|a| a.contains(QUESTION)),
+        "the question is never on the command line"
+    );
+    // A fresh private folder of its own, outside the state directory, holding only its prompt
+    // and its settings, which allow only the read verbs and deny every edit.
+    let cwd = PathBuf::from(read("cwd").trim());
+    assert!(
+        !cwd.starts_with(state.canonicalize().unwrap()) && !cwd.starts_with(&state),
+        "{}",
+        cwd.display()
+    );
+    assert!(cwd.ends_with(&session), "{}", cwd.display());
+    assert_eq!(
+        read("files").lines().collect::<Vec<_>>(),
+        [".claude", "prompt.md"]
+    );
+    assert_eq!(read("mode").trim(), "drwx------");
+    let settings: Value = serde_json::from_str(&read("settings")).unwrap();
+    let allow = settings["permissions"]["allow"].as_array().unwrap();
+    assert!(
+        allow.contains(&json!("Bash(pitcrew session list:*)")),
+        "{settings}"
+    );
+    assert!(
+        allow
+            .iter()
+            .all(|a| a.as_str().unwrap().starts_with("Bash(pitcrew ")),
+        "{settings}"
+    );
+    assert!(!settings.to_string().contains("board submit"), "{settings}");
+    let deny = settings["permissions"]["deny"].as_array().unwrap();
+    for denied in ["Edit", "Write", "WebFetch", "Read(~/.ssh/**)"] {
+        assert!(deny.contains(&json!(denied)), "{denied}: {settings}");
+    }
+    // Its token: a reader's, minted for its session alone; never its agent's.
     assert!(
         !native.join("token-in-env").exists(),
         "no token in the environment"
     );
     let token_file = read("token-file");
     assert!(
-        token_file.ends_with(&format!("{}.reader.token", id::OFFICE)),
-        "the CLI was not given the back office's reader token file"
+        token_file.ends_with(&format!("sessions/{session}.token")),
+        "the CLI was not given its session's own token file"
     );
-    assert_eq!(
-        PathBuf::from(read("cwd").trim()),
-        state
-            .join("scratch")
-            .join(format!("orchestrator-{}", id::SAM))
-            .canonicalize()
-            .unwrap()
+    assert!(
+        !state
+            .join("agents")
+            .join(format!("{}.token", id::OFFICE))
+            .exists(),
+        "no agent token was minted for it"
     );
 
     // The answer, with working links, and its suggestion only a suggestion.
@@ -487,6 +583,46 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
     let pap1 = ok(&daemon.get("/v1/tasks/PAP-1", Some(&device)), 200, "PAP-1");
     assert_eq!(pap1["status"], "in_progress", "the reader changed nothing");
 
+    // The session's transcript and terminal are the asker's alone.
+    let transcript = format!("/v1/sessions/{session}/transcript");
+    ok(
+        &daemon.get(&transcript, Some(&device)),
+        200,
+        "the asker reads it",
+    );
+    let asker_only = |daemon: &Daemon| {
+        assert_eq!(
+            daemon.get(&transcript, Some(&second)).status,
+            403,
+            "another person's transcript read"
+        );
+        let socket = request(
+            daemon.port,
+            "GET",
+            &format!("/v1/sessions/{session}/terminal"),
+            Some(&second),
+            None,
+            &[
+                ("Upgrade", "websocket"),
+                ("Connection", "Upgrade"),
+                ("Sec-WebSocket-Version", "13"),
+                ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ],
+        );
+        assert_eq!(socket.status, 403, "another person's terminal");
+    };
+    asker_only(&daemon);
+    assert_eq!(
+        daemon
+            .get(
+                &format!("/v1/sessions/{}/transcript", id::SES1),
+                Some(&second)
+            )
+            .status,
+        200,
+        "other sessions' transcripts are as before"
+    );
+
     // A follow-up is typed into the live session, and answered there.
     let follow = ok(
         &daemon.post(
@@ -517,13 +653,24 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
     );
     assert_eq!(cleared.status, 204, "{}", cleared.body);
     assert_eq!(orchestrator(&daemon)["conversations"], json!([]));
+    assert_eq!(
+        daemon.get("/v1/me", Some(&reader)).status,
+        401,
+        "its reader token stops at once"
+    );
     eventually("its session ends", || {
         daemon
             .get(&format!("/v1/sessions/{session}"), Some(&device))
             .json()["state"]
             == "ended"
     });
+    eventually("its folder is removed", || !cwd.exists());
+    eventually("its token file is removed", || {
+        !Path::new(&token_file).exists()
+    });
     let saved = std::fs::read_to_string(state.join("orchestrator.json")).unwrap();
     assert!(!saved.contains(QUESTION), "a clear forgets the questions");
+    // Still the asker's alone after clearing.
+    asker_only(&daemon);
     daemon.stop();
 }

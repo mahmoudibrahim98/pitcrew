@@ -1,5 +1,5 @@
 //! Confined runs: what this daemon does for a session PitCrew starts on its own behalf (a board
-//! draft's now, the Orchestrator's later), hub-work's `Confinement` carried out. Shared plumbing:
+//! draft's, the Orchestrator's), hub-work's `Confinement` carried out. Shared plumbing:
 //! every such run gets the same shape, whatever its CLI, and whatever the person's own settings
 //! for that CLI say.
 //!
@@ -16,19 +16,21 @@
 //!   passes Windows `.cmd` shims and never shows on `/proc/<pid>/cmdline`), and the CLI's
 //!   settings ([`claude_settings`], [`opencode_settings`]); Codex has none it would read from an
 //!   untrusted folder, and runs read-only instead (see the runner's `start_spec`). All 0600.
-//! - **Its token**: a session token (`TokenScope::Session`, `pcs_…`) bound to the session,
-//!   minted into the in-memory registry ([`HubTokens`]) and written to `sessions/<session>.token`
-//!   in the state directory (0600), which the CLI's `PITCREW_TOKEN_FILE` names instead of its
-//!   agent's token file ([`crate::dispatch::AgentEnv`]). It is revoked, and its file removed, as
-//!   soon as the run has done its one thing ([`ConfinedRuns::revoke`]), when the run ends, and with
-//!   the daemon (it was never on disk).
+//! - **Its token**, minted for this session alone as the confinement says (`RunToken`): a session
+//!   token (`TokenScope::Session`, `pcs_…`) bound to the session (a board draft's), or a reader
+//!   token (`TokenScope::Reader`, `pcr_…`, which may only read: the Orchestrator's). Minted into
+//!   the in-memory registry ([`HubTokens`]) and written to `sessions/<session>.token` in the state
+//!   directory (0600), which the CLI's `PITCREW_TOKEN_FILE` names instead of its agent's token
+//!   file ([`crate::dispatch::AgentEnv`]). It is revoked, and its file removed, as soon as the run
+//!   has done its one thing ([`ConfinedRuns::revoke`]), when the run ends, and with the daemon (it
+//!   was never on disk).
 //! - **Its end** ([`Ender`]): at most the confinement's running time, then its CLI is ended
 //!   (gracefully, else killed) and its session with it; when its session ends otherwise (its CLI
 //!   exits, a person ends it), its folder and token go within [`POLL`].
 
 use crate::runner::Attached;
 use pitcrew_auth::{FileTokenStore, SecretToken, TokenError, TokenId, TokenInfo, TokenStore};
-use pitcrew_hub_work::{Confinement, PROMPT_FILE, SessionRequest, WorkService};
+use pitcrew_hub_work::{Confinement, PROMPT_FILE, RunToken, SessionRequest, WorkService};
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::ids::{CommandId, SessionId};
 use pitcrew_protocol::model::{Engine, SessionState};
@@ -46,8 +48,10 @@ pub const POLL: Duration = Duration::from_secs(5);
 /// How long a finished run's CLI is left to say it is done before it is ended.
 pub const GRACE: Duration = Duration::from_secs(3);
 
-/// The hub's tokens: the registry's (devices and agents, on disk), and the session tokens of
-/// confined runs, in memory only, so none outlives the daemon. What the API verifies against.
+/// The hub's tokens: the registry's (devices and agents, on disk), and the tokens of confined runs
+/// (session and reader tokens), in memory only, so none outlives the daemon. What the API verifies
+/// against. A reader token is looked for in memory first, then in the registry (where only a
+/// person's own provisioning could have put one: the daemon never does).
 #[derive(Debug)]
 pub struct HubTokens {
     registry: Arc<FileTokenStore>,
@@ -66,16 +70,18 @@ impl TokenStore for HubTokens {
     fn verify(&self, token: &str) -> Option<Caller> {
         match pitcrew_auth::token::claimed_prefix(token)? {
             pitcrew_auth::token::SESSION_PREFIX => self.sessions.verify(token),
+            pitcrew_auth::token::READER_PREFIX => self
+                .sessions
+                .verify(token)
+                .or_else(|| self.registry.verify(token)),
             _ => self.registry.verify(token),
         }
     }
 
     fn mint(&self, caller: Caller) -> Result<(TokenInfo, SecretToken), TokenError> {
         match caller.scope {
-            TokenScope::Session(_) => self.sessions.mint(caller),
-            TokenScope::Device | TokenScope::Agent | TokenScope::Reader => {
-                self.registry.mint(caller)
-            }
+            TokenScope::Session(_) | TokenScope::Reader => self.sessions.mint(caller),
+            TokenScope::Device | TokenScope::Agent => self.registry.mint(caller),
         }
     }
 
@@ -250,7 +256,10 @@ impl ConfinedRuns {
         }
         let caller = Caller {
             member: request.agent,
-            scope: TokenScope::Session(request.session),
+            scope: match confinement.token {
+                RunToken::Session => TokenScope::Session(request.session),
+                RunToken::Reader => TokenScope::Reader,
+            },
             on_behalf_of: Some(owner),
         };
         let token_file = self
@@ -490,12 +499,34 @@ fn quoted(text: &str) -> String {
     serde_json::Value::String(text.to_owned()).to_string()
 }
 
+/// Files outside a confined run's folder that its CLI's file tools may never read, whatever the
+/// person approves: the agent CLIs' own folders (their logins, settings and every other session's
+/// transcript) and common credential stores. Claude Code's rules name them from the home folder.
+pub const SECRET_READS: [&str; 13] = [
+    "~/.ssh/**",
+    "~/.aws/**",
+    "~/.gnupg/**",
+    "~/.config/gh/**",
+    "~/.netrc",
+    "~/.git-credentials",
+    "~/.docker/config.json",
+    "~/.kube/**",
+    "~/.claude/**",
+    "~/.claude.json",
+    "~/.codex/**",
+    "~/.config/opencode/**",
+    "~/.local/share/opencode/**",
+];
+
 /// Claude Code's project settings for a confined run (`.claude/settings.json`; with
 /// `--setting-sources=project`, the only settings file it reads). In its `default` mode, every
-/// tool use not allowed here needs the person's approval in the run's terminal; these are
-/// allowed without asking: `pitcrew <command> …` for each of the confinement's commands, and
-/// writing each of its files in the folder. Denied outright: web fetch and search, and reading or
-/// changing the PitCrew state directory. Bypass mode is disabled.
+/// tool use not allowed here needs the person's approval in the run's terminal (reading a file
+/// outside its folder too); these are allowed without asking: `pitcrew <command> …` for each of
+/// the confinement's commands, and writing each of its files in the folder. Denied outright: web
+/// fetch and search; reading or changing the PitCrew state directory; reading [`SECRET_READS`];
+/// and, for a run that writes no file (the Orchestrator's), every file edit. Bypass mode is
+/// disabled. (Claude Code's denials win over its allowances, so "every read but the folder's"
+/// cannot be denied: a read elsewhere asks the person instead.)
 #[must_use]
 pub fn claude_settings(confinement: &Confinement, state: &Path) -> String {
     let mut allow: Vec<String> = confinement
@@ -508,13 +539,17 @@ pub fn claude_settings(confinement: &Confinement, state: &Path) -> String {
         allow.push(format!("Edit(./{file})"));
     }
     let state = format!("{}/**", claude_absolute(state));
-    let deny = [
+    let mut deny = vec![
         "WebFetch".to_owned(),
         "WebSearch".to_owned(),
         format!("Read({state})"),
         format!("Edit({state})"),
         format!("Write({state})"),
     ];
+    deny.extend(SECRET_READS.iter().map(|path| format!("Read({path})")));
+    if confinement.writes.is_empty() {
+        deny.extend(["Edit", "MultiEdit", "Write", "NotebookEdit"].map(str::to_owned));
+    }
     let list = |items: &[String]| {
         items
             .iter()
@@ -533,17 +568,17 @@ pub fn claude_settings(confinement: &Confinement, state: &Path) -> String {
 
 /// OpenCode's project config for a confined run (`opencode.json`). Its rules are matched last to
 /// first, so the order is the point: everything denied, then reading, listing and searching its
-/// own folder allowed (`external_directory` denies the rest of the disk), and `pitcrew <command>
-/// …` for each of the confinement's commands. Edits, web fetch and search stay denied: it passes
-/// its proposal on standard input. The person's global OpenCode config is merged under it.
+/// own folder allowed (`external_directory` denies the rest of the disk), and `pitcrew <command>`
+/// and `pitcrew <command> …` for each of the confinement's commands. Edits, web fetch and search
+/// stay denied: a board draft passes its proposal on standard input. The person's global OpenCode
+/// config is merged under it.
 #[must_use]
 pub fn opencode_settings(confinement: &Confinement) -> String {
     let mut bash = vec![format!("      {}: \"deny\"", quoted("*"))];
     for command in &confinement.commands {
-        bash.push(format!(
-            "      {}: \"allow\"",
-            quoted(&format!("pitcrew {command} *"))
-        ));
+        for rule in [format!("pitcrew {command}"), format!("pitcrew {command} *")] {
+            bash.push(format!("      {}: \"allow\"", quoted(&rule)));
+        }
     }
     format!(
         "{{\n  \"$schema\": \"https://opencode.ai/config.json\",\n  \"permission\": {{\n    \
@@ -673,6 +708,7 @@ mod tests {
             commands: vec!["board submit".into()],
             writes: vec!["proposal.json".into()],
             max_runtime: Duration::from_secs(30 * 60),
+            token: RunToken::Session,
         }
     }
 
@@ -799,6 +835,63 @@ mod tests {
         assert!(!root.exists());
     }
 
+    /// The Orchestrator's run: a reader token minted for its session alone (never on disk but its
+    /// file, never its agent's), settings that allow only the read verbs and deny every edit.
+    #[test]
+    fn a_reader_run_gets_its_own_reader_token_and_may_edit_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (runs, state, _) = runs(dir.path());
+        let confinement = pitcrew_hub_work::orchestrator_confinement();
+        let mut request = request(Engine::Claude);
+        request.confinement = Some(confinement.clone());
+        let (folder, _stop) = runs.prepare(&request, &confinement).unwrap();
+        let file = runs.token_file(&request.session).unwrap();
+        assert!(file.starts_with(state.join("sessions")));
+        let raw = crate::state::read_token(&file).unwrap().unwrap();
+        assert!(raw.starts_with("pcr_"));
+        let caller = runs.tokens.verify(&raw).unwrap();
+        assert_eq!(caller.scope, TokenScope::Reader);
+        assert_eq!(caller.member, request.agent);
+        assert_eq!(caller.on_behalf_of, request.owner);
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(folder.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let allow: Vec<String> = pitcrew_hub_work::READ_VERBS
+            .iter()
+            .map(|v| format!("Bash(pitcrew {v}:*)"))
+            .collect();
+        assert_eq!(settings["permissions"]["allow"], serde_json::json!(allow));
+        let deny = settings["permissions"]["deny"].as_array().unwrap();
+        for tool in ["Edit", "MultiEdit", "Write", "NotebookEdit", "WebFetch"] {
+            assert!(deny.contains(&serde_json::json!(tool)), "{tool}");
+        }
+        // Another run's token is not this one's: each run gets its own.
+        let mut other = super::tests::request(Engine::Claude);
+        other.confinement = Some(confinement.clone());
+        let (_, _stop2) = runs.prepare(&other, &confinement).unwrap();
+        let other_raw = crate::state::read_token(&runs.token_file(&other.session).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_ne!(other_raw, raw);
+        // Finished: its token stops.
+        runs.finish(&request.session);
+        assert_eq!(runs.tokens.verify(&raw), None);
+        assert!(runs.tokens.verify(&other_raw).is_some());
+        // OpenCode's: the read verbs, bare and with words after them.
+        let text = opencode_settings(&confinement);
+        let opencode: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            opencode["permission"]["bash"]["pitcrew session list"],
+            "allow"
+        );
+        assert_eq!(
+            opencode["permission"]["bash"]["pitcrew session list *"],
+            "allow"
+        );
+        assert!(!text.contains("board submit"));
+    }
+
     #[test]
     fn a_scratch_folder_that_nests_with_the_state_directory_starts_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -853,16 +946,17 @@ mod tests {
                 "Edit(./proposal.json)"
             ])
         );
-        assert_eq!(
-            settings["permissions"]["deny"],
-            serde_json::json!([
-                "WebFetch",
-                "WebSearch",
-                format!("Read({state_rule})"),
-                format!("Edit({state_rule})"),
-                format!("Write({state_rule})")
-            ])
-        );
+        let mut deny = vec![
+            "WebFetch".to_owned(),
+            "WebSearch".to_owned(),
+            format!("Read({state_rule})"),
+            format!("Edit({state_rule})"),
+            format!("Write({state_rule})"),
+        ];
+        deny.extend(SECRET_READS.iter().map(|p| format!("Read({p})")));
+        assert_eq!(settings["permissions"]["deny"], serde_json::json!(deny));
+        assert!(deny.contains(&"Read(~/.ssh/**)".to_owned()));
+        assert!(deny.contains(&"Read(~/.claude/**)".to_owned()));
         assert_eq!(settings["permissions"]["defaultMode"], "default");
         assert_eq!(
             settings["permissions"]["disableBypassPermissionsMode"],
@@ -898,6 +992,7 @@ mod tests {
         }
         assert_eq!(permission["bash"]["*"], "deny");
         assert_eq!(permission["bash"]["pitcrew board submit *"], "allow");
+        assert_eq!(permission["bash"]["pitcrew board submit"], "allow");
         // OpenCode matches its rules last to first: the catch-all denials come first.
         let star = text.find("\"*\": \"deny\"").unwrap();
         assert!(star < text.find("\"read\"").unwrap());
@@ -935,5 +1030,23 @@ mod tests {
         hub.revoke(info.id).unwrap();
         assert_eq!(hub.verify(token.expose()), None);
         assert_eq!(hub.verify(device.expose()), Some(person));
+        // A reader token the hub mints lives in memory too; one already in the registry (put
+        // there before the daemon started, as the conformance suite does) still verifies.
+        let reader = Caller {
+            member: MemberId::new(),
+            scope: TokenScope::Reader,
+            on_behalf_of: Some(person.member),
+        };
+        let (minted, read) = hub.mint(reader).unwrap();
+        assert_eq!(hub.verify(read.expose()), Some(reader));
+        assert_eq!(
+            registry.list().len(),
+            1,
+            "a reader token the hub mints is never on disk"
+        );
+        let (_, kept) = registry.mint(reader).unwrap();
+        assert_eq!(hub.verify(kept.expose()), Some(reader));
+        hub.revoke(minted.id).unwrap();
+        assert_eq!(hub.verify(read.expose()), None);
     }
 }

@@ -38,7 +38,7 @@
 //! when it runs past [`DRAFT_MAX_RUNTIME`], or when the hub restarts ([`WorkService::end_running_drafts`]:
 //! its session token is gone).
 
-use crate::dispatch::{Confinement, DispatchError, SessionRequest, own_agent, refused};
+use crate::dispatch::{Confinement, DispatchError, RunToken, SessionRequest, own_agent, refused};
 use crate::error::{Result, WorkError};
 use crate::query::{self, SessionFilter, TaskFilter};
 use crate::recap::{BlockFilter, RecapIndex};
@@ -129,6 +129,7 @@ fn draft_confinement() -> Confinement {
         commands: vec!["board submit".to_owned()],
         writes: vec![PROPOSAL_FILE.to_owned()],
         max_runtime: DRAFT_MAX_RUNTIME,
+        token: RunToken::Session,
     }
 }
 

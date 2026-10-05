@@ -10,17 +10,22 @@
 //!    - one answer at a time per person (`409` while one is under way), at most
 //!      [`MAX_TURNS`] questions per conversation (`409`);
 //!    - a new conversation runs as the caller's own agent ([`own_agent`]: the back office by
-//!      default), in the engine asked for, else the remembered one, else Claude Code; its CLI must
-//!      be installed on the hub's own machine (`409` when the runner link says it is not);
+//!      default), in the engine asked for, else the remembered one, else Claude Code, among
+//!      [`ENGINES`] (`400` for another); its CLI must be installed on the hub's own machine
+//!      (`409` when the runner link says it is not);
 //!    - a follow-up whose session still lives is typed into it (`SendText`, after
 //!      [`clean_question`] made it one line and [`typed`] made it never a CLI command); one whose
 //!      session ended starts a new session, whose prompt carries the conversation so far;
 //!    - a new session is stored first (`session_discovered`: titled [`SESSION_TITLE`], the agent
-//!      named, linked to nothing), in the caller's scratch folder on the hub's machine
-//!      ([`Dispatcher::scratch`]), with the CLI's own default permission mode, and the prompt
-//!      (`pitcrew_office::orchestrator::prompt`); then the [`Dispatcher`] starts it. Its CLI gets
-//!      a reader token: the daemon asks [`WorkService::reads_only`] which sessions are these.
-//!    - starting a new conversation ends the caller's other Orchestrator session (one at a time).
+//!      named, linked to nothing, its `cwd` the folder [`Dispatcher::confined_folder`] names), and
+//!      its id is kept for good in the person's `sessions` (never cleared: what the hub knows of
+//!      its Orchestrator sessions, see [`WorkService::orchestrator_asker`]); then the
+//!      [`Dispatcher`] starts it as a **confined run** ([`confinement`]): a fresh private folder
+//!      with the prompt (`pitcrew_office::orchestrator::prompt`) in its `prompt.md`, the CLI's
+//!      confined launch shape, and a **reader token** minted for that session alone (never its
+//!      agent's token), revoked when the session ends;
+//!    - starting a new conversation finishes the caller's other Orchestrator session (one at a
+//!      time): its token stops at once, and its CLI is ended.
 //!
 //!    A start or a typing that fails marks the turn `failed` and answers why (`409`, `503` or
 //!    `500`, as a dispatch does).
@@ -33,14 +38,18 @@
 //!    suggestions are found in the text (`pitcrew_office::orchestrator::scan`) and kept only when
 //!    the hub knows what they name.
 //! 3. **Cancel** ([`WorkService::cancel_answer`]): Esc, then `canceled`. **Clear**
-//!    ([`WorkService::clear_conversations`]): the caller's conversations are forgotten and their
-//!    session is ended.
+//!    ([`WorkService::clear_conversations`], under the command lock): the caller's conversations
+//!    are forgotten, and each live session is finished (its token stops at once, its CLI is
+//!    ended). The CLIs' own transcripts of those sessions stay where each CLI keeps them, and only
+//!    their asker may read them through the hub.
+//! 4. **When the hub restarts** ([`WorkService::end_orchestrator_sessions`]): every Orchestrator
+//!    session still running is ended, since its token lived in the last daemon's memory.
 //!
 //! Nothing here acts on the work: a suggestion is data the panel shows, and only a person's click
 //! makes a request, as that person.
 
 use crate::commands::require_person;
-use crate::dispatch::{DispatchError, SessionRequest, own_agent, refused};
+use crate::dispatch::{Confinement, DispatchError, RunToken, SessionRequest, own_agent, refused};
 use crate::error::{Result, WorkError};
 use crate::query::{self, TaskRef};
 use crate::service::WorkService;
@@ -58,7 +67,7 @@ use pitcrew_protocol::orchestrator::{
     MAX_ANSWER_SECONDS, MAX_CONVERSATIONS, MAX_QUESTION_CHARS, MAX_REFERENCES, MAX_TURNS,
     Orchestrator, OrchestratorLimits, OrchestratorTurn, Question, ReferenceTarget, TurnState,
 };
-use pitcrew_protocol::runner::{EndMode, RunnerCommand};
+use pitcrew_protocol::runner::RunnerCommand;
 use pitcrew_protocol::transcript::TranscriptItem;
 use pitcrew_store::sql::Connection;
 use serde::{Deserialize, Serialize};
@@ -68,8 +77,30 @@ use std::sync::{MutexGuard, PoisonError};
 
 /// The title, and the terminal's name, of every Orchestrator session.
 pub const SESSION_TITLE: &str = "Orchestrator";
-/// The engines the panel offers, in its order.
-pub const ENGINES: [Engine; 3] = [Engine::Claude, Engine::Codex, Engine::OpenCode];
+/// The engines the panel offers, in its order: the CLIs that run confined and can still reach the
+/// hub through `pitcrew`'s read verbs ([`not_offered`] says why the others are not).
+#[cfg(not(windows))]
+pub const ENGINES: &[Engine] = &[Engine::Claude, Engine::OpenCode];
+/// The engines the panel offers, in its order: on Windows, Claude Code only ([`not_offered`]).
+#[cfg(windows)]
+pub const ENGINES: &[Engine] = &[Engine::Claude];
+/// The `pitcrew` commands an Orchestrator session's CLI may run without asking: the read verbs,
+/// each only `GET`s (its token could do nothing else anyway).
+pub const READ_VERBS: [&str; 9] = [
+    "whoami",
+    "search",
+    "session list",
+    "session show",
+    "recap blocks",
+    "recap days",
+    "activity",
+    "task list",
+    "task show",
+];
+/// The longest an Orchestrator session runs; a follow-up after it starts a new session.
+pub const SESSION_MAX_RUNTIME: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// The most Orchestrator session ids kept per person, newest kept.
+const MAX_SESSIONS_KEPT: usize = 2000;
 /// The file's format.
 const FILE_VERSION: u32 = 1;
 /// Items read per transcript page.
@@ -101,6 +132,11 @@ struct Person {
     /// Oldest first.
     #[serde(default)]
     conversations: Vec<Stored>,
+    /// Every Orchestrator session started for them, oldest first, kept when they clear their
+    /// conversations: their transcripts stay theirs alone, and the sessions never get an agent's
+    /// token (at most [`MAX_SESSIONS_KEPT`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sessions: Vec<SessionId>,
 }
 
 /// A conversation, with what following its turns needs.
@@ -251,6 +287,7 @@ impl OrchestratorState {
             member,
             engine: None,
             conversations: Vec::new(),
+            sessions: Vec::new(),
         });
         let last = self.people.len() - 1;
         &mut self.people[last]
@@ -302,30 +339,16 @@ impl WorkService {
     /// Keeps the Orchestrator's conversations in `file` (`orchestrator.json` in the daemon's state
     /// directory), loading what it holds. Without it they live only as long as the service.
     ///
+    /// A file this hub cannot read as its own (a newer version, a variant it does not know, or
+    /// one that does not parse) never stops the hub: it is logged, moved aside
+    /// (`orchestrator.json.unreadable-<ms>`, kept for a person to look at), and the hub starts
+    /// with no conversations.
+    ///
     /// # Errors
     ///
-    /// An unreadable file, or one that does not parse.
+    /// Never for the file's contents; kept fallible for the callers' chain.
     pub fn with_orchestrator_file(self, file: PathBuf) -> Result<Self> {
-        let people = match std::fs::read(&file) {
-            Ok(bytes) => {
-                let saved: Saved = serde_json::from_slice(&bytes)?;
-                if saved.version != FILE_VERSION {
-                    return Err(WorkError::internal(format!(
-                        "{} is version {}; this hub reads version {FILE_VERSION}",
-                        file.display(),
-                        saved.version
-                    )));
-                }
-                saved.people
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => {
-                return Err(WorkError::internal(format!(
-                    "reading {}: {e}",
-                    file.display()
-                )));
-            }
-        };
+        let people = load_people(&file, self.now());
         *self.conversations() = OrchestratorState {
             file: Some(file),
             people,
@@ -339,14 +362,68 @@ impl WorkService {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether `session` is an Orchestrator session: its CLI gets a token that may only read.
+    /// The person whose Orchestrator session `session` is, if it is one (the hub keeps every one
+    /// it started, cleared or not). Its transcript and terminal are theirs alone, and its CLI never
+    /// gets its agent's token.
     #[must_use]
-    pub fn reads_only(&self, session: &SessionId) -> bool {
-        self.conversations().people.iter().any(|p| {
-            p.conversations.iter().any(|c| {
-                c.session == Some(*session) || c.turns.iter().any(|t| t.turn.session == *session)
+    pub fn orchestrator_asker(&self, session: &SessionId) -> Option<MemberId> {
+        self.conversations()
+            .people
+            .iter()
+            .find(|p| {
+                p.sessions.contains(session)
+                    || p.conversations.iter().any(|c| {
+                        c.session == Some(*session)
+                            || c.turns.iter().any(|t| t.turn.session == *session)
+                    })
             })
-        })
+            .map(|p| p.member)
+    }
+
+    /// Whether `session` is an Orchestrator session (see [`Self::orchestrator_asker`]).
+    #[must_use]
+    pub fn is_orchestrator_session(&self, session: &SessionId) -> bool {
+        self.orchestrator_asker(session).is_some()
+    }
+
+    /// Ends every Orchestrator session still running, in the log and through the dispatcher:
+    /// called when the daemon starts, since each one's token lived in the last daemon's memory.
+    /// How many were.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn end_orchestrator_sessions(&self, reason: &str) -> Result<usize> {
+        let sessions: Vec<SessionId> = {
+            let state = self.conversations();
+            let mut all: Vec<SessionId> = state
+                .people
+                .iter()
+                .flat_map(|p| {
+                    p.sessions
+                        .iter()
+                        .copied()
+                        .chain(p.conversations.iter().filter_map(|c| c.session))
+                })
+                .collect();
+            all.sort_unstable_by_key(|s| s.0);
+            all.dedup();
+            all
+        };
+        let live: Vec<SessionId> = self.read(|c| {
+            let mut live = Vec::new();
+            for id in &sessions {
+                if query::session(c, id)?.is_some_and(|s| s.state != SessionState::Ended) {
+                    live.push(*id);
+                }
+            }
+            Ok(live)
+        })?;
+        for session in &live {
+            self.end_confined_session(session, reason)?;
+            self.finish_confined(session);
+        }
+        Ok(live.len())
     }
 
     /// `GET /v1/orchestrator`: the caller's own. People only.
@@ -373,7 +450,7 @@ impl WorkService {
         })
     }
 
-    /// Each engine, and whether its CLI is installed on the hub's own machine.
+    /// Each engine offered, and whether its CLI is installed on the hub's own machine.
     fn engines(&self) -> Vec<EngineStatus> {
         let dispatcher = self.dispatcher();
         let machine = self.hub_machine();
@@ -437,11 +514,17 @@ impl WorkService {
                 ),
                 None => None,
             };
+            // A remembered engine no longer offered is passed over; one asked for is refused.
             let engine = existing.as_ref().map_or_else(
                 || {
                     question
                         .engine
-                        .or_else(|| person.as_ref().and_then(|p| p.engine))
+                        .or_else(|| {
+                            person
+                                .as_ref()
+                                .and_then(|p| p.engine)
+                                .filter(|e| ENGINES.contains(e))
+                        })
                         .unwrap_or(Engine::Claude)
                 },
                 |c| c.engine,
@@ -522,11 +605,17 @@ impl WorkService {
                     )
                 }
                 None => {
+                    if let Some(why) = not_offered(engine) {
+                        return Err(WorkError::invalid(why));
+                    }
                     let machine = self.orchestrator_machine(dispatcher.as_deref(), engine)?;
                     let d = dispatcher.as_ref().ok_or_else(no_runner)?;
-                    let cwd = d
-                        .scratch(&machine, &format!("orchestrator-{}", caller.member.0))
-                        .map_err(|e| refused(&e))?;
+                    let session_id = SessionId::new();
+                    // Its own fresh private folder, made at its start (a confined run).
+                    let cwd = guarded(|| Ok(d.confined_folder(&session_id)))
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
                     let earlier: Vec<Earlier> = stored
                         .turns
                         .iter()
@@ -550,7 +639,7 @@ impl WorkService {
                         earlier: &earlier,
                     });
                     let session = Session {
-                        id: SessionId::new(),
+                        id: session_id,
                         engine,
                         native_id: String::new(),
                         machine,
@@ -582,11 +671,11 @@ impl WorkService {
                             .as_ref()
                             .filter(|p| p.engine == engine)
                             .and_then(|p| p.model.clone()),
-                        // The CLI's own default, never a persona's: it only reads.
+                        // Never a persona's mode: it runs confined, and only reads.
                         permission_mode: PermissionMode::Default,
                         name: SESSION_TITLE.to_owned(),
                         brief,
-                        confinement: None,
+                        confinement: Some(confinement()),
                     };
                     let turn = StoredTurn {
                         turn: new_turn(text, now, session.id),
@@ -595,7 +684,7 @@ impl WorkService {
                         prompt_at: None,
                     };
                     stored.session = Some(session.id);
-                    // Stored before its CLI starts, so its CLI's token is a reader's.
+                    remember_session(state.person_mut(caller.member), session.id);
                     self.append(&[self.by(caller, EventBody::SessionDiscovered { session })])?;
                     (Step::Start(Box::new(request)), turn)
                 }
@@ -618,14 +707,9 @@ impl WorkService {
         };
 
         let dispatcher = dispatcher.ok_or_else(no_runner)?;
-        for (machine, session) in ending {
-            let end = RunnerCommand::EndSession {
-                session,
-                mode: EndMode::Kill,
-            };
-            if let Err(e) = guarded(|| dispatcher.command(&machine, &end)) {
-                tracing::warn!(%session, error = %e, "cannot end an earlier Orchestrator session");
-            }
+        // One at a time: the person's other session stops (its token at once, its CLI soon).
+        for (_, session) in ending {
+            self.finish_confined(&session);
         }
         let outcome = match &step {
             Step::Type {
@@ -764,47 +848,46 @@ impl WorkService {
         self.conversation(caller, id)
     }
 
-    /// `DELETE /v1/orchestrator/conversations`: forgets the caller's conversations and ends their
-    /// session. The remembered engine stays.
+    /// `DELETE /v1/orchestrator/conversations`: forgets the caller's conversations and finishes
+    /// their live sessions (each token stops at once, each CLI is ended), under the command lock,
+    /// so no question is half asked meanwhile. The remembered engine stays, and so does the list
+    /// of the caller's Orchestrator sessions (their transcripts stay theirs alone).
     ///
     /// # Errors
     ///
     /// `forbidden` for an agent or a reader; the file cannot be written; database errors.
     pub fn clear_conversations(&self, caller: &Caller) -> Result<()> {
         require_person(caller, "Clearing the Orchestrator's history")?;
+        let _guard = self.lock();
         let sessions: Vec<SessionId> = {
             let mut state = self.conversations();
             let person = state.person_mut(caller.member);
             let sessions = person
                 .conversations
                 .iter()
-                .filter_map(|c| c.session)
+                .flat_map(|c| {
+                    c.session
+                        .into_iter()
+                        .chain(c.turns.iter().map(|t| t.turn.session))
+                })
                 .collect();
             person.conversations.clear();
             state.save()?;
             sessions
         };
-        let live: Vec<Session> = self.read(|c| {
+        let live: Vec<SessionId> = self.read(|c| {
             let mut live = Vec::new();
             for id in &sessions {
-                if let Some(s) = query::session(c, id)?
-                    && s.state != SessionState::Ended
+                if query::session(c, id)?.is_some_and(|s| s.state != SessionState::Ended)
+                    && !live.contains(id)
                 {
-                    live.push(s);
+                    live.push(*id);
                 }
             }
             Ok(live)
         })?;
-        if let Some(dispatcher) = self.dispatcher() {
-            for session in live {
-                let end = RunnerCommand::EndSession {
-                    session: session.id,
-                    mode: EndMode::Kill,
-                };
-                if let Err(e) = guarded(|| dispatcher.command(&session.machine, &end)) {
-                    tracing::warn!(session = %session.id, error = %e, "cannot end a cleared Orchestrator session");
-                }
-            }
+        for session in live {
+            self.finish_confined(&session);
         }
         Ok(())
     }
@@ -1193,6 +1276,87 @@ fn guarded<T>(
 ) -> std::result::Result<T, DispatchError> {
     catch_unwind(AssertUnwindSafe(call))
         .unwrap_or_else(|_| Err(DispatchError::Failed("the runner link panicked".into())))
+}
+
+/// Keeps `session` among `person`'s Orchestrator sessions, newest last, at most
+/// [`MAX_SESSIONS_KEPT`].
+fn remember_session(person: &mut Person, session: SessionId) {
+    if !person.sessions.contains(&session) {
+        person.sessions.push(session);
+    }
+    let over = person.sessions.len().saturating_sub(MAX_SESSIONS_KEPT);
+    person.sessions.drain(..over);
+}
+
+/// Why `engine` cannot answer the Orchestrator here, if it cannot: it must run confined and still
+/// reach the hub through `pitcrew`'s read verbs.
+#[must_use]
+pub fn not_offered(engine: Engine) -> Option<String> {
+    if ENGINES.contains(&engine) {
+        return None;
+    }
+    Some(match engine {
+        Engine::Codex => "Codex cannot answer the Orchestrator: its read-only sandbox keeps \
+                          `pitcrew` from reaching the hub, so each read would wait for your \
+                          approval in its terminal. Use Claude Code or OpenCode."
+            .to_owned(),
+        Engine::OpenCode => "OpenCode cannot answer the Orchestrator on Windows: its commands \
+                             run in cmd.exe, where its confinement cannot hold. Use Claude Code."
+            .to_owned(),
+        other => format!("{} cannot answer the Orchestrator.", engine_name(other)),
+    })
+}
+
+/// How an Orchestrator session runs: confined, with a reader token, allowed only `pitcrew`'s
+/// read verbs without asking, writing no file, for at most [`SESSION_MAX_RUNTIME`].
+#[must_use]
+pub fn confinement() -> Confinement {
+    Confinement {
+        commands: READ_VERBS.iter().map(|&verb| verb.to_owned()).collect(),
+        writes: Vec::new(),
+        max_runtime: SESSION_MAX_RUNTIME,
+        token: RunToken::Reader,
+    }
+}
+
+/// The people `file` holds, or none: a file that is missing, unreadable, of another version or
+/// that does not parse never stops the hub; one that exists is moved aside (named with `now`) and
+/// logged.
+fn load_people(file: &std::path::Path, now: TimestampMs) -> Vec<Person> {
+    let bytes = match std::fs::read(file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(file = %file.display(), error = %e, "cannot read the Orchestrator's conversations; starting with none");
+            return Vec::new();
+        }
+    };
+    let why = match serde_json::from_slice::<Saved>(&bytes) {
+        Ok(saved) if saved.version == FILE_VERSION => return saved.people,
+        Ok(saved) => format!(
+            "it is version {}; this hub reads version {FILE_VERSION}",
+            saved.version
+        ),
+        Err(e) => format!("it does not parse: {e}"),
+    };
+    let mut aside = file.as_os_str().to_owned();
+    aside.push(format!(".unreadable-{now}"));
+    let aside = PathBuf::from(aside);
+    match std::fs::rename(file, &aside) {
+        Ok(()) => tracing::warn!(
+            file = %file.display(),
+            moved = %aside.display(),
+            why,
+            "the Orchestrator's conversations could not be read; the file was moved aside and the hub starts with none"
+        ),
+        Err(e) => tracing::warn!(
+            file = %file.display(),
+            why,
+            error = %e,
+            "the Orchestrator's conversations could not be read, nor the file moved aside; the hub starts with none"
+        ),
+    }
+    Vec::new()
 }
 
 /// An engine's name for people.

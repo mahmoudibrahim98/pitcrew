@@ -436,28 +436,35 @@ accepts it** (`src/board.rs`, `src/board_routes.rs`; api-v1.md, "Board drafts"; 
 ### Confined runs (shared with the Orchestrator)
 
 `Confinement` on a `SessionRequest` marks a run PitCrew starts on its own behalf: the `pitcrew`
-commands its CLI may run without asking, the files in its folder it may write, and its longest
-running time. Hub-work only decides it; the runner link carries it out (the daemon's
+commands its CLI may run without asking, the files in its folder it may write, its longest
+running time, and the token its CLI gets (`RunToken`: a session token for a board draft, a reader
+token for the Orchestrator; never its agent's). Hub-work only decides it; the runner link carries it out (the daemon's
 `crate::confined`: a fresh private folder, `PROMPT_FILE`, `CONFINED_BRIEF` on the command line,
 the CLI's confined shape, a session token). `Dispatcher` has `confined_folder` (the folder, for the
-session's record) and `finish_session` (its one thing is done). A later confined run names its own
-`Confinement`.
+session's record) and `finish_session` (its one thing is done, or the hub ends it). The
+Orchestrator names its own `Confinement` (see "The Orchestrator").
 
 ## The Orchestrator
 
 The Orchestrator panel's conversations (`src/orchestrator.rs`, `src/orchestrator_routes.rs`;
 api-v1.md, "Orchestrator"; brief `0-orchestrator-chat`); the module's comment has the details:
 
-- **A question runs as a session** of an agent CLI the person already uses (Claude Code, Codex or
-  OpenCode, remembered per person), as one of the person's own agents (`own_agent`, shared with
-  board drafts: the back office by default), on the hub's own machine, in a scratch folder the
-  `Dispatcher` makes (`Dispatcher::scratch`), titled `Orchestrator` and linked to nothing. The
-  prompt is `orchestrator/v1` (`pitcrew_office::orchestrator::prompt`). Its CLI reads with a
-  **reader token**: the daemon mints one for the sessions `reads_only` names.
+- **A question runs as a session** of an agent CLI the person already uses (`ENGINES`: Claude Code
+  or OpenCode, only Claude Code on Windows, remembered per person; Codex is not offered, see
+  `not_offered`), as one of the person's own agents (`own_agent`, shared with board drafts: the
+  back office by default), on the hub's own machine, titled `Orchestrator` and linked to nothing.
+  It is a **confined run** (`orchestrator_confinement`: `READ_VERBS` as its commands, no
+  `writes`, `SESSION_MAX_RUNTIME` 60 minutes, `RunToken::Reader`): a fresh private folder the
+  `Dispatcher` names (`confined_folder`, its `cwd`), the prompt `orchestrator/v1`
+  (`pitcrew_office::orchestrator::prompt`) in its `prompt.md`, and a **reader token** minted for
+  that session alone. Its id is kept for good in the person's `sessions`
+  (`orchestrator_asker`, `is_orchestrator_session`): its transcript and terminal are the asker's
+  alone, and the daemon never gives it its agent's token.
 - **One answer at a time** per person, 20 questions a conversation, 20 conversations kept. A
   follow-up types into the live session (one line, never a CLI command); one whose session ended
-  starts a new session with the conversation so far as data in its prompt. A new conversation ends
-  the person's other Orchestrator session.
+  starts a new session with the conversation so far as data in its prompt. A new conversation
+  finishes the person's other Orchestrator session (`Dispatcher::finish_session`: its token
+  stops at once, its CLI is ended).
 - **Answers are followed from the transcript** (`follow_orchestrator`, which the daemon calls
   about once a second, through `Dispatcher::transcript`): the text after the turn's prompt, until
   its turn ends. Past 16 KiB it is cut, past 300 s it times out (both send the CLI Esc); a session
@@ -465,10 +472,13 @@ api-v1.md, "Orchestrator"; brief `0-orchestrator-chat`); the module's comment ha
 - **References and suggestions** are found in the answer (`pitcrew_office::orchestrator::scan`)
   and kept only when the hub knows what they name and the person may see it; suggestion lines
   leave the text. **Nothing here acts on the work**: a suggestion is data the panel shows.
-- **Cancel** sends Esc and ends the turn `canceled`; **clear** forgets the person's conversations
-  and ends their session.
+- **Cancel** sends Esc and ends the turn `canceled`; **clear** (under the command lock) forgets
+  the person's conversations and finishes their live sessions. When the hub restarts,
+  `end_orchestrator_sessions` ends the sessions left running (their tokens were in memory).
 - **Where conversations live:** `orchestrator.json` in the state directory, written atomically
-  (0600), never the event log, so clearing forgets them for real. Without the file (tests), in
+  (0600), never the event log, so clearing forgets them for real. A file this hub cannot read (a
+  newer version, an unknown variant, or one that does not parse) is moved aside
+  (`orchestrator.json.unreadable-<ms>`) and the hub starts with none. Without the file (tests), in
   memory.
 
 ## Commands
@@ -774,12 +784,15 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   session ends its draft; a failed start ends it; drafts left running end when the hub restarts;
   an unreadable draft event is skipped; hidden sessions are neither sent nor evidence.
 - `tests/orchestrator.rs`: the Orchestrator through the routes, with a stand-in runner that keeps
-  transcripts in memory: a question starts a reading session in the scratch folder and its answer
+  transcripts in memory: a question starts a confined session with a reader token in the folder
+  the dispatcher names, with one plain line on its command line, and its answer
   streams from the transcript, with references, suggestions (which move nothing) and usage;
   follow-ups type into the live session, one ended starts another, and a new conversation ends the
   old one; one answer at a time, cut at the size limit, timed out, failed when the session ends;
-  cancel and clear; who may ask and what refuses a question; conversations survive a restart in a
-  private file; a reader reads and changes nothing.
+  cancel, and clear, which finishes the session and keeps it its asker's; who may ask and what
+  refuses a question (Codex is not offered); conversations survive a restart in a private file,
+  and sessions left running end; an unreadable file is moved aside; a reader reads and changes
+  nothing.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other
   routes and commands. `tests/task_shape.rs`: the `Task` shape pin.
 

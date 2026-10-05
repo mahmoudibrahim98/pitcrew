@@ -204,26 +204,6 @@ pub trait Dispatcher: Send + Sync + std::fmt::Debug {
         ))
     }
 
-    /// A private folder on `machine` for sessions that run in nobody's project (the
-    /// Orchestrator's), `name` among the link's own: made if missing, private to the runner's
-    /// user, holding the agent CLIs' settings a session that only reads needs. Answers its path,
-    /// for [`SessionRequest::cwd`]. Called under the command lock: answer at once, and never call
-    /// back into the service. The default refuses.
-    ///
-    /// # Errors
-    ///
-    /// [`DispatchError`]: no such folder can be made there.
-    fn scratch(
-        &self,
-        machine: &MachineId,
-        name: &str,
-    ) -> std::result::Result<String, DispatchError> {
-        let _ = (machine, name);
-        Err(DispatchError::Unavailable(
-            "this hub's runner link has no scratch folders".into(),
-        ))
-    }
-
     /// Runs `command` on `machine`'s runner for a session the hub started: typing a follow-up
     /// (`SendText`), Esc (`Interrupt`), or ending it (`EndSession`). Called without the lock;
     /// blocking. The default refuses.
@@ -299,9 +279,10 @@ pub const CONFINED_BRIEF: &str =
 /// The file in a confined session's folder that holds its prompt.
 pub const PROMPT_FILE: &str = "prompt.md";
 
-/// How a run PitCrew starts on its own behalf is confined: a board draft's now (`crate::board`),
-/// and every such run after it. The hub decides it; the runner link carries it out, for every CLI
-/// alike, whatever the person's own settings for that CLI say:
+/// How a run PitCrew starts on its own behalf is confined: a board draft's (`crate::board`), the
+/// Orchestrator's (`crate::orchestrator`), and every such run after them. The hub decides it; the
+/// runner link carries it out, for every CLI alike, whatever the person's own settings for that
+/// CLI say:
 ///
 /// - **A fresh private folder**: made new for the session (never reused), owner-only, outside the
 ///   PitCrew state directory, holding only [`PROMPT_FILE`] (the request's `brief`) and the CLI's
@@ -310,11 +291,11 @@ pub const PROMPT_FILE: &str = "prompt.md";
 ///   with [`CONFINED_BRIEF`], in the default permission mode (the request's is ignored).
 /// - **Its settings files** pre-approve only `pitcrew <command> …` for each of [`Self::commands`]
 ///   and writing each of [`Self::writes`] in the folder, and deny what the CLI's settings can deny
-///   (web fetch and search; the state directory).
-/// - **A session token** (`TokenScope::Session`) bound to the session, in place of its agent's
-///   token: it reaches only the routes mounted for session tokens, for this session's own
-///   resource. Kept in memory only; revoked at [`Dispatcher::finish_session`], when the session
-///   ends, and with the daemon.
+///   (web fetch and search; the state directory; every file edit when it writes none).
+/// - **Its own token**, minted for this session alone, in place of its agent's token
+///   ([`Self::token`]): a session token for a run that answers through one route, a reader token
+///   for a run that only reads. Kept in memory only; revoked at [`Dispatcher::finish_session`],
+///   when the session ends, and with the daemon. Its CLI never gets its agent's token.
 /// - **At most [`Self::max_runtime`]**: then its CLI is ended, and its session with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confinement {
@@ -325,6 +306,19 @@ pub struct Confinement {
     pub writes: Vec<String>,
     /// The longest it runs.
     pub max_runtime: std::time::Duration,
+    /// The token its CLI gets.
+    pub token: RunToken,
+}
+
+/// The token a confined run's CLI gets, minted for its session alone: never its agent's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunToken {
+    /// A session token (`TokenScope::Session`) bound to the session: it reaches only the routes
+    /// mounted for session tokens, for this session's own resource (a board draft's proposal).
+    Session,
+    /// A reader token (`TokenScope::Reader`): `GET`s on the routes marked **agent** or **read**,
+    /// and nothing else (the Orchestrator's).
+    Reader,
 }
 
 /// A session the hub stored for an agent outside a dispatch (a board draft's), for

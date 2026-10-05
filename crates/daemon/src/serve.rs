@@ -286,7 +286,6 @@ fn open_with(
     ));
     let work_cell: Arc<OnceLock<Weak<WorkService>>> = Arc::default();
     let link = RunnerLink::new(Arc::clone(&attached))
-        .with_scratch(state.scratch())
         .with_confined(Arc::clone(&confined), Arc::clone(&work_cell));
     // The recap index keeps its blocks on disk, in a cache file of its own next to the store
     // (replaced when the index is built, removed when the daemon stops; on a local disk instead
@@ -582,6 +581,16 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         Ok(ended) => tracing::info!(ended, "ended the board drafts the last daemon left running"),
         Err(e) => tracing::warn!(error = %e, "cannot end the board drafts left running"),
     }
+    match work.end_orchestrator_sessions("the hub restarted, which ended the session's token") {
+        Ok(0) => {}
+        Ok(ended) => {
+            tracing::info!(
+                ended,
+                "ended the Orchestrator sessions the last daemon left running"
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot end the Orchestrator sessions left running"),
+    }
     drop(confined);
 
     let _locations = crate::locations::watch(&work, &workers);
@@ -643,8 +652,21 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         .device(crate::files::routes(Arc::clone(&work), state.root()))
         .device(crate::onboarding::routes(Arc::clone(&work)))
         // A sign-in's terminal opens only for the member who started it.
-        .device(terminals.routes(TerminalConfig::default()))
-        .device(transcripts.routes())
+        // An Orchestrator session's terminal and transcript are its asker's alone.
+        .device(terminals.routes(TerminalConfig::default()).route_layer(
+            axum::middleware::from_fn_with_state(
+                Arc::clone(&work),
+                crate::orchestrator::asker_only,
+            ),
+        ))
+        .device(
+            transcripts
+                .routes()
+                .route_layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&work),
+                    crate::orchestrator::asker_only,
+                )),
+        )
         .device(sessions.routes())
         .device(crate::integrations::routes(Arc::clone(&integrations)))
         .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))))
