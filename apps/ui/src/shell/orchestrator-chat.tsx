@@ -263,7 +263,7 @@ function NoEngine() {
     <div className="flex flex-col gap-2 p-4 text-sm">
       <p className="font-medium">No agent CLI to ask with</p>
       <p className="text-ink-2">
-        The Orchestrator answers with an agent CLI you already use: Claude Code, Codex or OpenCode, on this
+        The Orchestrator answers with an agent CLI you already use: Claude Code or OpenCode, on this
         hub&apos;s machine. None of them is installed there yet.
       </p>
       <Link to={paths.signIn(ws)} className={LINK}>
@@ -354,36 +354,50 @@ function Turn({ turn }: { turn: OrchestratorTurn }) {
   );
 }
 
+/**
+ * What a suggestion is, whatever its place: its kind, its task and status, or its target. While an
+ * answer streams its suggestions can be added or dropped, so one is followed by this, never by its
+ * position, and a confirmation always moves the task it showed.
+ */
+export function suggestionKey(s: AnswerSuggestion): string {
+  return s.kind === 'move_task' ? `move_task:${s.task}:${s.to}` : `open:${JSON.stringify(s.target)}`;
+}
+
 function Suggestions({ suggestions, open }: { suggestions: AnswerSuggestion[]; open: (path: string) => void }) {
   const ws = useWorkspaceId();
   const move = useMoveTask();
-  const [confirming, setConfirming] = useState<number | undefined>(undefined);
-  const [done, setDone] = useState<Set<number>>(() => new Set());
+  const [confirming, setConfirming] = useState<string | undefined>(undefined);
+  const [done, setDone] = useState<Set<string>>(() => new Set());
+  const confirmed = suggestions.find(
+    (s): s is Extract<AnswerSuggestion, { kind: 'move_task' }> =>
+      s.kind === 'move_task' && suggestionKey(s) === confirming,
+  );
   return (
     <div className="flex flex-col gap-1.5" role="group" aria-label="Suggestions">
       <p className="text-xs text-ink-2">Suggested, if you choose:</p>
       <div className="flex flex-wrap gap-1.5">
-        {suggestions.map((s, i) =>
-          s.kind === 'open' ? (
-            <Button key={i} className="h-6 text-xs" onClick={() => open(referencePath(ws, s.target))}>
+        {suggestions.map((s) => {
+          const key = suggestionKey(s);
+          return s.kind === 'open' ? (
+            <Button key={key} className="h-6 text-xs" onClick={() => open(referencePath(ws, s.target))}>
               {s.label}
             </Button>
           ) : (
             <Button
-              key={i}
+              key={key}
               className="h-6 text-xs"
-              disabled={done.has(i) || move.isPending}
-              aria-pressed={confirming === i}
-              onClick={() => setConfirming(confirming === i ? undefined : i)}
+              disabled={done.has(key) || move.isPending}
+              aria-pressed={confirming === key}
+              onClick={() => setConfirming(confirming === key ? undefined : key)}
             >
-              {done.has(i) ? `${s.label}: done` : s.label}
+              {done.has(key) ? `${s.label}: done` : s.label}
             </Button>
-          ),
-        )}
+          );
+        })}
       </div>
-      {confirming !== undefined && suggestions[confirming]?.kind === 'move_task' && (
+      {confirmed !== undefined && (
         <ConfirmMove
-          suggestion={suggestions[confirming] as Extract<AnswerSuggestion, { kind: 'move_task' }>}
+          suggestion={confirmed}
           pending={move.isPending}
           onCancel={() => setConfirming(undefined)}
           onConfirm={(s) =>
@@ -391,7 +405,7 @@ function Suggestions({ suggestions, open }: { suggestions: AnswerSuggestion[]; o
               { task: s.task, to: s.to },
               {
                 onSuccess: () => {
-                  setDone((d) => new Set(d).add(confirming));
+                  setDone((d) => new Set(d).add(suggestionKey(s)));
                   setConfirming(undefined);
                 },
               },

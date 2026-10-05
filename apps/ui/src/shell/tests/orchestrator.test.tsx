@@ -12,7 +12,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { freePort, spawnHub, type HubProcess } from '../../../tests/hub-process.ts';
 import { createApi } from '../../data/api.ts';
 import { keys } from '../../data/keys.ts';
-import type { Orchestrator } from '../../data/orchestrator.ts';
+import type { AnswerSuggestion, Orchestrator } from '../../data/orchestrator.ts';
+import type { TaskStatus } from '../../data/index.ts';
+import { suggestionKey } from '../orchestrator-chat.tsx';
 import { createQueryClient, DataProvider } from '../../data/provider.tsx';
 import type { SocketFactory } from '../../data/stream.ts';
 import { createAppRouter } from '../routes.tsx';
@@ -182,7 +184,6 @@ describe('the Orchestrator panel', () => {
     const none: Orchestrator = {
       engines: [
         { engine: 'claude', installed: false },
-        { engine: 'codex', installed: false },
         { engine: 'opencode', installed: false },
       ],
       limits: { question_chars: 4000, answer_bytes: 16384, answer_seconds: 300, turns: 20, conversations: 20 },
@@ -196,5 +197,34 @@ describe('the Orchestrator panel', () => {
     const link = within(panel()).getByRole('link', { name: 'Install one and sign in' });
     expect(link.getAttribute('href')).toBe(`/w/${WORKSPACE}/sign-in`);
     expect((field() as HTMLTextAreaElement).disabled).toBe(true);
+  });
+
+  it("links to a sign-in page that shows each agent CLI's sign-in on the hub's machine", async () => {
+    useShell.setState({ ...initialShellState, orchestratorOpen: false });
+    renderApp(`/w/${WORKSPACE}/sign-in`);
+    await screen.findByRole('heading', { name: 'Sign in to your agents' }, { timeout: 8_000 });
+    // Onboarding's sign-in panel, over the hub's machine setup: each CLI with its own login.
+    await screen.findByRole('button', { name: /^Sign in to Claude Code/ }, { timeout: 8_000 });
+    // And how to do it by hand.
+    expect(screen.getByText('opencode auth login')).toBeTruthy();
+  });
+});
+
+describe('suggestions', () => {
+  it('are followed by what they are, never by their place', () => {
+    const move = (task: string, to: TaskStatus): AnswerSuggestion => ({
+      kind: 'move_task',
+      task,
+      key: 'PAP-1',
+      to,
+      label: `Move PAP-1 to ${to}`,
+    });
+    const a = move('01JB000000000000000TSK0001', 'review');
+    expect(suggestionKey(a)).toBe(suggestionKey({ ...a, label: 'Another label' }));
+    expect(suggestionKey(a)).not.toBe(suggestionKey(move('01JB000000000000000TSK0001', 'done')));
+    expect(suggestionKey(a)).not.toBe(suggestionKey(move('01JB000000000000000TSK0002', 'review')));
+    const open = (id: string): AnswerSuggestion => ({ kind: 'open', target: { kind: 'session', id }, label: 'Open' });
+    expect(suggestionKey(open('01JB000000000000000SES0001'))).not.toBe(suggestionKey(open('01JB000000000000000SES0002')));
+    expect(suggestionKey(open('01JB000000000000000SES0001'))).not.toBe(suggestionKey(a));
   });
 });

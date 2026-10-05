@@ -434,7 +434,10 @@ impl WorkService {
     pub fn orchestrator(&self, caller: &Caller) -> Result<Orchestrator> {
         require_person(caller, "The Orchestrator")?;
         let person = self.conversations().person(caller.member).cloned();
-        let (engine, stored) = person.map_or((None, Vec::new()), |p| (p.engine, p.conversations));
+        // A remembered engine no longer offered is not the next one's default.
+        let (engine, stored) = person.map_or((None, Vec::new()), |p| {
+            (p.engine.filter(|e| ENGINES.contains(e)), p.conversations)
+        });
         let conversations = self.read(|c| {
             stored
                 .iter()

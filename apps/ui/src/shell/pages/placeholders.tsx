@@ -2,8 +2,10 @@
 // features register their own. They show just enough to navigate by.
 
 import { Link, useParams } from '@tanstack/react-router';
-import type { ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import {
+  useApi,
+  useMachines,
   useMe,
   useProjects,
   useSessions,
@@ -14,6 +16,8 @@ import {
   type TaskStatus,
 } from '../../data/index.ts';
 import { StatusPill, type Tone } from '../../design/index.ts';
+import { createHubOnboardingApi } from '../../onboarding/hub-api.ts';
+import { SignInPanel } from '../../onboarding/sign-in-panel.tsx';
 import { isOpenTask, useMyOpenAsks } from '../data.ts';
 import { useWorkspaceId } from '../layout.ts';
 import { paths } from '../paths.ts';
@@ -236,18 +240,28 @@ export function SetupPage() {
 /** The agent CLIs the Orchestrator answers with, and how each signs in, in its own terminal. */
 const SIGN_IN: { engine: string; install: string; signIn: string }[] = [
   { engine: 'Claude Code', install: 'claude', signIn: 'claude, then /login' },
-  { engine: 'Codex', install: 'codex', signIn: 'codex login' },
   { engine: 'OpenCode', install: 'opencode', signIn: 'opencode auth login' },
 ];
 
-/** `paths.signIn`, until the onboarding feature serves its sign-in step there. */
+/**
+ * `paths.signIn`: the agent CLIs on this hub's machine, whether each is signed in, and its own login
+ * in a terminal (onboarding's sign-in panel, over `GET /v1/machines/{id}/agents`; the hub's owner
+ * only, so anyone else sees why not). How to do it by hand follows.
+ */
 export function SignInPage() {
+  const data = useApi();
+  const api = useMemo(() => createHubOnboardingApi({ transport: data.transport }), [data.transport]);
+  const own = useMachines()
+    .data?.find((m) => m.kind === 'local')
+    ?.name.trim();
   return (
     <Page title="Sign in to your agents">
       <p className="text-sm text-ink-2">
         The Orchestrator answers with an agent CLI you already use, on this hub&apos;s machine, signed in as
-        you. Install one there and sign in once, in a terminal:
+        you.
       </p>
+      <SignInPanel api={api} target={{ kind: 'local' }} machineLabel={own === '' ? undefined : own} />
+      <p className="text-sm text-ink-2">Or install one there and sign in once, in a terminal:</p>
       <List label="Agent CLIs" empty="">
         {SIGN_IN.map((row) => (
           <Row key={row.engine}>

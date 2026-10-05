@@ -46,13 +46,18 @@ person already uses, on the hub's machine, with a token that may only read.
   projects; a recap to its workstream or project); `[label](reference)` links one too. Every
   other link stays text, its URL beside it.
 - **Suggestions are buttons**, and nothing happens until the person clicks one: "Open …" goes to
-  its route; "Move …" asks first, then moves the task as the person (`useMoveTask`).
+  its route; "Move …" asks first, then moves the task as the person (`useMoveTask`). While an
+  answer streams its suggestions may change, so each is followed by what it is (`suggestionKey`:
+  its kind, task and status, or target), never by its place: a confirmation always moves the task
+  it showed.
 - **Esc** (anywhere in the panel, not in its menus or dialog) or **Stop** ends an answer under
   way. **New conversation**, **History** (earlier conversations) and **Clear history…** (asks
   first; ends the answering session too) are in the toolbar.
 - **No agent CLI installed** on the hub's machine: the panel says so, and links to
-  `paths.signIn(ws)` (`/w/$ws/sign-in`), a well-known path the shell fills with a placeholder
-  (how to install and sign in to each CLI) until onboarding serves its sign-in step there.
+  `paths.signIn(ws)` (`/w/$ws/sign-in`). That page shows onboarding's sign-in panel for the hub's
+  own machine (each CLI, whether it is signed in, and its own login in a terminal; the hub's owner
+  only, so anyone else is told why), then how to install and sign in by hand. The engines are the
+  ones the hub offers (Claude Code and OpenCode; Codex cannot answer the Orchestrator).
 
 ## Workspaces in the desktop app
 

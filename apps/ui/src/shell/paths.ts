@@ -22,7 +22,7 @@ export const paths = {
   /** The first-run wizard: where a workspace with `setup_needed` is sent (filled by onboarding). */
   setup: (ws: string) => `/w/${seg(ws)}/onboarding`,
   /**
-   * Signing in to the agent CLIs on the hub's machine (onboarding's sign-in, when it lands). The
+   * Signing in to the agent CLIs on the hub's machine (onboarding's sign-in panel). The
    * Orchestrator links here when no agent CLI can answer.
    */
   signIn: (ws: string) => `/w/${seg(ws)}/sign-in`,

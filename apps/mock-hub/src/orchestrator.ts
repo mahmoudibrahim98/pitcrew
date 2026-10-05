@@ -129,7 +129,7 @@ export function orchestratorOf(hub: Hub, member: MemberId): Orchestrator {
   const person = peopleOf(hub).get(member);
   return {
     engines: OFFERED.map((engine) => ({ engine, installed: INSTALLED[engine] })),
-    ...(person?.engine === undefined ? {} : { engine: person.engine }),
+    ...(person?.engine === undefined || !OFFERED.includes(person.engine) ? {} : { engine: person.engine }),
     limits: LIMITS,
     conversations: [...(person?.conversations ?? [])].reverse().map((c) => view(hub, c)),
   };
