@@ -8,7 +8,14 @@ use pitcrew_protocol::{
 use serde_json::json;
 
 fn profile(handle: &str) -> SaveProfile {
-    serde_json::from_value(json!({"name":" Sam Updated ", "handle":handle, "avatar":{"initials":"SU","colour":"#abcdef"}})).unwrap()
+    SaveProfile {
+        name: " Sam Updated ".into(),
+        handle: handle.into(),
+        avatar: pitcrew_protocol::model::Avatar {
+            initials: "SU".into(),
+            colour: "#abcdef".into(),
+        },
+    }
 }
 #[test]
 fn profile_is_owned_validated_idempotent_and_replayable() {
