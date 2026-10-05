@@ -769,6 +769,21 @@ workstream-only link clears the task. Each emits `session_linked` with basis `ma
 links are firm, matching the runner; the sessions projection version is bumped so replay applies
 that rule. `tests/manual_links.rs` covers route validation and protection against later inference.
 
+## Directory writes and creation dialogs
+
+Device-only `POST /v1/personas`, `PUT /v1/personas/{id}`, `POST /v1/teams` and
+`PUT /v1/teams/{id}` validate all fields/references before appending `persona_saved` or
+`team_saved`. `PersonaEdit` and `TeamEdit` are protocol request types. Creating a persona also
+appends its caller-owned agent member in the same batch; editing updates linked member names.
+Teams retain their existing member-id model, deduplicate members and include the lead.
+`NewProject.first_workstream` optionally creates the project's first workstream in the same
+append, using the project root as its location. This keeps the creation dialog atomic.
+`tests/directory.rs` covers refusals, authorization, atomic creation and directory replay.
+
+Successful onboarding scans call `ensure_engine_agents`: missing detected engines receive a
+person-owned agent member and default persona in one batch. The writer lock makes concurrent
+scans idempotent; existing owned agents are reused. Service actors without personas do not count.
+
 Workspace safety preferences are projected from person-authored `safety_changed` events (`work.safety`), with validated permission modes and a 0–100 hourly automatic-acceptance budget. An explicit save controls low-risk task completion and brief acceptance; disabled or exhausted budgets leave proposals for review. Existing hubs retain their per-task policy until the first explicit save. Rebuilding preferences retains the hourly budget because acceptances remain in the event log.
 
 Onboarding review: hook previews detect supported CLIs on PATH or through their
@@ -777,3 +792,5 @@ skipped engines. No-change previews cannot set the wizard's installed flag.
 Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
+
+Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.

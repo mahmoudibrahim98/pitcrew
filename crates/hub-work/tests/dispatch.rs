@@ -1264,7 +1264,14 @@ async fn a_person_dispatches_and_starts_only_their_own_agents() {
     let runner = Recorder::new(Answer::Start);
     let work = service(dir.path(), Some(Arc::clone(&runner)));
     let kim = someone(MemberKind::Human, "@kim", None);
-    let kimbot = someone(MemberKind::Agent, "@kimbot", Some(kim.id));
+    let mut kimbot = someone(MemberKind::Agent, "@kimbot", Some(kim.id));
+    kimbot.persona = work
+        .members()
+        .expect("members")
+        .iter()
+        .find(|m| m.id == member(RUNNER))
+        .expect("runner")
+        .persona;
     let stray = someone(MemberKind::Agent, "@stray", None);
     add_members(&work, &[&kim, &kimbot, &stray]);
     let app = app(&work);
@@ -1464,27 +1471,15 @@ async fn an_ended_session_is_not_revived_by_a_restatement() {
 }
 
 #[tokio::test]
-async fn dispatch_without_persona_uses_workspace_permission_default() {
+async fn dispatch_without_persona_is_refused_without_events_or_runner_calls() {
     let dir = tempfile::tempdir().expect("tempdir");
     let runner = Recorder::new(Answer::Start);
     let work = service(dir.path(), Some(Arc::clone(&runner)));
-    work.save_safety(
-        &person(SAM),
-        pitcrew_protocol::onboarding::SafetySettings {
-            permission_mode: PermissionMode::AcceptEdits,
-            ..Default::default()
-        },
-    )
-    .expect("save safety");
-    let res = dispatch(
-        &work,
-        "PAP-2",
-        json!({"agent": WRITER, "brief": "Synthetic task."}),
-    )
-    .await;
-    expect(&res, 202);
-    assert_eq!(
-        runner.calls()[0].permission_mode,
-        PermissionMode::AcceptEdits
-    );
+    let sync = someone(MemberKind::Agent, "@synthetic-sync", Some(member(SAM)));
+    add_members(&work, &[&sync]);
+    let rev = work.store().latest_rev().expect("rev");
+    let res = dispatch(&work, "PAP-2", json!({"agent": sync.id})).await;
+    expect(&res, 400);
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    assert!(runner.calls().is_empty());
 }

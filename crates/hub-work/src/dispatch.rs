@@ -45,7 +45,7 @@
 //! [`WorkService::set_hub_machine`]): without it, a dispatch with nowhere
 //! else to run answers `503` rather than guessing among the workspace's machines. The folder is
 //! the first of those locations on that machine, or `~` when none is. The engine, model and
-//! permission mode come from the agent's persona (Claude Code by default).
+//! permission mode come from the agent's required persona; service actors cannot dispatch.
 
 use crate::error::{Result, WorkError};
 use crate::query::{self, TaskRef};
@@ -293,6 +293,12 @@ impl WorkService {
                 agent.handle
             )));
         }
+        require_owner(caller, &agent)?;
+        let persona = match agent.persona {
+            Some(id) => query::persona(conn, &id)?,
+            None => None,
+        }
+        .ok_or_else(|| WorkError::invalid("agent must have a persona to dispatch."))?;
         let requested = match &new.machine {
             Some(id) => Some(
                 query::machine(conn, id)?
@@ -316,7 +322,6 @@ impl WorkService {
                 )
             }));
         }
-        require_owner(caller, &agent)?;
         if matches!(task.status, TaskStatus::Done | TaskStatus::Canceled) {
             let status = crate::codec::enum_text(&task.status).unwrap_or_default();
             return Err(WorkError::conflict(format!(
@@ -343,20 +348,14 @@ impl WorkService {
             )));
         }
         let place = locations.iter().find(|l| l.machine == machine.id);
-        let persona = match &agent.persona {
-            Some(id) => query::persona(conn, id)?,
-            None => None,
-        };
         Ok(Plan {
             owner: agent.owner,
             cwd: place.map_or_else(|| "~".to_owned(), |l| l.path.clone()),
             branch: place.and_then(|l| l.branch.clone()),
-            engine: persona.as_ref().map_or(Engine::Claude, |p| p.engine),
-            persona: persona.as_ref().map(|p| p.id),
-            model: persona.as_ref().and_then(|p| p.model.clone()),
-            permission_mode: persona.map_or(crate::safety::settings(conn)?.permission_mode, |p| {
-                p.permission_mode
-            }),
+            engine: persona.engine,
+            persona: Some(persona.id),
+            model: persona.model,
+            permission_mode: persona.permission_mode,
             machine,
             task,
             brief,

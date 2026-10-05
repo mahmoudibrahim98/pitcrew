@@ -98,6 +98,15 @@ creates exactly the accepted items, labelled `drafted`, and nothing for the reje
 and the three events' shapes. On the daemon the draft's CLI is the stand-in `claude`, in the
 temporary home, as for a dispatch; it never proposes by itself (the suite's agent token does).
 
+Directory creation/editing cases cover all four POST/PUT routes, device-only access, bounded
+fields, unknown members/targets, forged metadata, persona-linked membership, lead inclusion,
+deduplication, event authors and unchanged revisions on refusal. Atomic-project cases prove an
+invalid first workstream or key conflict creates neither a project nor a workstream, and a valid
+request creates both. Both targets run these cases.
+
+Directory conformance also dispatches a task through the member created by New agent, exercising
+the recipe/member ownership link against both servers.
+
 Hook-install conformance writes agent configurations. It is disabled unless
 `PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed
 synthetic targets. Do not set it when pointing the suite at an existing hub.

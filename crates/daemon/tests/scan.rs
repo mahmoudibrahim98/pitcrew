@@ -570,4 +570,28 @@ fn a_fresh_hub_scans_its_machine_once_set_up() {
     let report = report_of(Scan::start(daemon.port, &machine, Some(&device)));
     assert_eq!(report["counts"]["sessions"], 3, "{report:#}");
     assert_eq!(report["suggestions"].as_array().unwrap().len(), 3);
+    let owner = setup.json()["me"]["id"].as_str().unwrap().to_owned();
+    let members = daemon.get("/v1/members", Some(&device)).json();
+    let personas = daemon.get("/v1/personas", Some(&device)).json();
+    for engine in ["claude", "codex", "opencode"] {
+        let matching: Vec<_> = members
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["kind"] == "agent"
+                    && m["owner"] == owner
+                    && personas
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|p| p["id"] == m["persona"] && p["engine"] == engine)
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "{engine}: {members:#}");
+        assert_ne!(matching[0]["handle"], "@office");
+    }
+    report_of(Scan::start(daemon.port, &machine, Some(&device)));
+    assert_eq!(daemon.get("/v1/members", Some(&device)).json(), members);
+    assert_eq!(daemon.get("/v1/personas", Some(&device)).json(), personas);
 }

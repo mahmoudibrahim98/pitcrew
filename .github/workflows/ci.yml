@@ -105,6 +105,8 @@ jobs:
           pnpm --filter @pitcrew/ui e2e
       - name: Fresh-config onboarding (Chromium)
         run: pnpm --filter @pitcrew/ui exec playwright test --config e2e/fresh.config.ts
+      - name: Create dialogs browser tests
+        run: pnpm --filter @pitcrew/ui exec playwright test --config src/projects/tests/e2e/create-dialogs.config.ts
 
   rust:
     name: Rust (${{ matrix.os }})

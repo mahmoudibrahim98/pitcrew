@@ -50,6 +50,8 @@ import {
   type MemberId,
   type Mover,
   type Project,
+  type Persona,
+  type Team,
   type Receipt,
   type Session,
   type Subtask,
@@ -177,6 +179,12 @@ export async function handleApi(hub: Hub, request: ApiRequest): Promise<Reply> {
   const { pattern, access, handler } = match.route;
   if (access === 'device' && caller.scope !== 'device') {
     throw forbidden(`${request.method} ${pattern} needs a device token.`);
+  }
+  if (request.method === 'PUT' && pattern === '/v1/personas/:id') {
+    found(hub.findPersona(match.params.get('id') ?? ''), 'No such persona.');
+  }
+  if (request.method === 'PUT' && pattern === '/v1/teams/:id') {
+    found(hub.findTeam(match.params.get('id') ?? ''), 'No such team.');
   }
   const body = request.method === 'GET' ? undefined : await request.readBody();
   const param = (name: string): string => {
@@ -399,7 +407,7 @@ const setupHub: Handler = (hub, ctx) => {
   // The person is the device token's own member id, which nothing knew until now.
   const me = ctx.caller.memberId;
   const member: Member = { id: me, kind: 'human', handle, name };
-  const machine: Machine = { id: ulid(), name: machineName, kind: 'local', liveness: 'live' };
+  const machine: Machine = { id: ulid(), name: machineName, kind: 'local', liveness: 'live', info: { hostname: machineName, os: process.platform === 'win32' ? 'windows' : process.platform === 'darwin' ? 'macos' : process.platform, arch: process.arch === 'x64' ? 'x86_64' : process.arch === 'arm64' ? 'aarch64' : process.arch, has_tmux: false, home_on_network_fs: false } };
   hub.members.push(member);
   hub.machines.push(machine);
   hub.workspace.name = workspaceName;
@@ -407,6 +415,63 @@ const setupHub: Handler = (hub, ctx) => {
   hub.append(me, { type: 'member_added', data: { member } });
   hub.append(me, { type: 'machine_added', data: { machine } });
   return ok({ workspace: hub.workspace, me: member, machine });
+};
+
+
+// Directory writes use the same validation before mutation as the real hub.
+function directoryText(value: string, field: string, max: number): string {
+  const text = value.trim();
+  if (text === '' || [...text].length > max || /[\p{Cc}]/u.test(text)) {
+    throw invalid(`${field} must be 1–${max} characters without controls.`);
+  }
+  return text;
+}
+const savePersona = (editing = false): Handler => (hub, ctx) => {
+  const previous = !editing ? undefined
+    : found(hub.findPersona(ctx.param('id')), 'No such persona.');
+  if (previous !== undefined && hub.members.some((m) => m.persona === previous.id && m.owner !== ctx.caller.memberId)) throw forbidden('A person may edit only personas whose members they own.');
+  memberRef(hub, ctx.caller.memberId, 'caller');
+  const f = new Fields(ctx.body);
+  const name = directoryText(f.string('name'), 'name', 80);
+  const modelValue = f.optString('model');
+  const model = modelValue === undefined ? undefined : directoryText(modelValue, 'model', 200);
+  if (f.isNull('permission_mode')) throw invalid('permission_mode must be a permission mode.');
+  const instructions = f.optString('instructions');
+  if (instructions !== undefined && [...instructions].length > 32_000) throw invalid('instructions must be at most 32000 characters.');
+  const persona: Persona = { id: previous?.id ?? ulid(), name, model, instructions,
+    engine: f.enumOf('engine', ENGINES), permission_mode: f.optEnum('permission_mode', PERMISSION_MODES) ?? 'default' };
+  if (persona.permission_mode === 'bypass_permissions') throw invalid('Bypass permissions cannot be saved as the workspace default while the runner disallows it.');
+  if (model?.startsWith('-')) throw invalid("model must not start with '-'.");
+  const members: Member[] = previous === undefined ? (() => {
+    const id = ulid();
+    return [{ id, name, handle: hub.agentHandle(persona.engine), kind: 'agent', owner: ctx.caller.memberId, persona: persona.id }];
+  })() : hub.members.filter((m) => m.persona === persona.id).map((m) => ({ ...m, name }));
+  if (previous === undefined) hub.personas.push(persona);
+  else hub.personas[hub.personas.indexOf(previous)] = persona;
+  hub.append(ctx.caller.memberId, { type: 'persona_saved', data: { persona } });
+  for (const member of members) {
+    const at = hub.members.findIndex((m) => m.id === member.id);
+    if (at === -1) hub.members.push(member); else hub.members[at] = member;
+    hub.append(ctx.caller.memberId, { type: 'member_added', data: { member } });
+  }
+  return previous === undefined ? created(persona) : ok(persona);
+};
+const saveTeam = (editing = false): Handler => (hub, ctx) => {
+  const previous = !editing ? undefined
+    : found(hub.findTeam(ctx.param('id')), 'No such team.');
+  memberRef(hub, ctx.caller.memberId, 'caller');
+  const f = new Fields(ctx.body);
+  const name = directoryText(f.string('name'), 'name', 80);
+  const lead = memberRef(hub, f.string('lead'), 'lead').id;
+  const ids = f.optStringArray('members');
+  if (ids === undefined || ids.length > 256) throw invalid('members must be an array of at most 256 ids.');
+  const members = [...new Set(ids.map((id) => memberRef(hub, id, 'members').id))];
+  if (!members.includes(lead)) members.unshift(lead);
+  if (members.length > 256) throw invalid('A team has at most 256 members.');
+  const team: Team = { id: previous?.id ?? ulid(), name, lead, members };
+  if (previous === undefined) hub.teams.push(team); else hub.teams[hub.teams.indexOf(previous)] = team;
+  hub.append(ctx.caller.memberId, { type: 'team_saved', data: { team } });
+  return previous === undefined ? created(team) : ok(team);
 };
 
 // ─── Projects and workstreams ───────────────────────────────────────────────────────────────────
@@ -425,6 +490,7 @@ const createProject: Handler = (hub, ctx) => {
     throw invalid('key must be 2 to 10 characters: an uppercase letter, then uppercase letters or digits.');
   }
   const name = fields.text('name');
+  const firstWorkstream = fields.optText('first_workstream');
   const leadId = fields.optString('lead');
   const lead = leadId === undefined ? ctx.caller.memberId : memberRef(hub, leadId, 'lead').id;
   const members: MemberId[] = [];
@@ -461,6 +527,12 @@ const createProject: Handler = (hub, ctx) => {
   };
   hub.projects.push(project);
   hub.append(ctx.caller.memberId, { type: 'project_created', data: { project } });
+  if (firstWorkstream !== undefined) {
+    const workstream: Workstream = { id: ulid(), project: project.id, name: firstWorkstream,
+      status: 'active', health: 'on_track', locations: root === undefined ? [] : [root], external: [] };
+    hub.workstreams.push(workstream);
+    hub.append(ctx.caller.memberId, { type: 'workstream_created', data: { workstream } });
+  }
   return created(project);
 };
 
@@ -493,6 +565,7 @@ const createWorkstream: Handler = (hub, ctx) => {
 function knownLocation(hub: Hub, value: unknown, where: string): Location {
   const location = readLocation(value, where);
   const machine = known(hub.findMachine(location.machine), `${where}.machine: no machine ${location.machine}.`);
+  if (machine.id === hub.machines.find((m) => m.kind === 'local')?.id && (location.path.includes('\0') || !(process.platform === 'win32' ? /^[A-Za-z]:[\\/]/.test(location.path) || /^\\\\[^\\/]+\\[^\\/]+(?:\\|$)/.test(location.path) : location.path.startsWith('/')))) throw invalid(`${where}.path must be absolute for this machine.`);
   return { ...location, machine: machine.id };
 }
 
@@ -906,6 +979,8 @@ const dispatchTask: Handler = (hub, ctx) => {
   const task = taskAt(hub, ctx.param('id'));
   const fields = new Fields(ctx.body);
   const agent = agentRef(hub, fields.string('agent'), 'agent');
+  if (agent.owner !== ctx.caller.memberId) throw forbidden(`${agent.handle} is not your agent: a person may run only their own agents.`);
+  if (agent.persona === undefined || hub.findPersona(agent.persona) === undefined) throw invalid('agent must have a persona to dispatch.');
   const brief = fields.optString('brief') ?? (task.description !== '' ? task.description : task.title);
   const place = placeFor(hub, task, fields.optString('machine'));
   if (task.status === 'done' || task.status === 'canceled') {
@@ -1502,7 +1577,7 @@ const ROUTES: Route[] = [
   route('GET', '/v1/machines', 'device', (hub) => ok(hub.machines)),
   route('POST', '/v1/machines/:id/scan', 'device', (hub, ctx) => ({
     status: 200,
-    stream: startScan(hub, ctx.param('id')),
+    stream: startScan(hub, ctx.param('id'), ctx.caller.memberId),
   })),
   // Machine setup (machine-setup.ts).
   route('GET', '/v1/machines/:id/check', 'device', (hub, ctx) =>
@@ -1523,7 +1598,11 @@ const ROUTES: Route[] = [
   }),
   route('GET', '/v1/members', 'agent', (hub) => ok(hub.members)),
   route('GET', '/v1/personas', 'device', (hub) => ok(hub.personas)),
+  route('POST', '/v1/personas', 'device', savePersona()),
+  route('PUT', '/v1/personas/:id', 'device', savePersona(true)),
   route('GET', '/v1/teams', 'device', (hub) => ok(hub.teams)),
+  route('POST', '/v1/teams', 'device', saveTeam()),
+  route('PUT', '/v1/teams/:id', 'device', saveTeam(true)),
   // Projects and workstreams.
   route('GET', '/v1/projects', 'device', (hub) => ok(hub.projects)),
   route('GET', '/v1/projects/:id', 'device', (hub, ctx) =>

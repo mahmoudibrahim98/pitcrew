@@ -137,6 +137,8 @@ async fn setup_succeeds_once_then_conflicts_and_is_idempotent_under_a_retry() {
     assert!(first.1["me"]["owner"].is_null());
     assert_eq!(first.1["machine"]["name"], json!(machine));
     assert_eq!(first.1["machine"]["kind"], json!("local"));
+    assert_eq!(first.1["machine"]["info"]["os"], std::env::consts::OS);
+    assert_eq!(first.1["machine"]["info"]["arch"], std::env::consts::ARCH);
     assert_eq!(first.1["machine"]["liveness"], json!("live"));
 
     // A retried, identical request: never a second person.
@@ -453,5 +455,52 @@ async fn the_listener_sees_the_commit_not_a_state_from_before_it() {
     assert!(
         *checker.saw_the_member.lock().expect("lock"),
         "the listener ran before the append committed: it read no member yet"
+    );
+}
+
+#[tokio::test]
+async fn local_project_roots_must_be_absolute_on_the_hubs_platform() {
+    let dir = tempfile::tempdir().expect("temp");
+    let work = fresh(dir.path());
+    let app = app(&work);
+    let caller = device(MemberId::new());
+    let (ws, name, handle, machine) = GOOD;
+    let setup = call(
+        &app,
+        Some(caller),
+        "POST",
+        "/v1/setup",
+        Some(body(ws, name, handle, machine)),
+    )
+    .await;
+    expect(&setup, 200);
+    let machine = &setup.1["machine"]["id"];
+    let rev = work.store().latest_rev().expect("rev");
+    for path in [
+        "relative",
+        if cfg!(windows) {
+            "/unix/path"
+        } else {
+            "C:\\synthetic\\path"
+        },
+    ] {
+        expect(&call(&app, Some(caller), "POST", "/v1/projects", Some(json!({"name":"Invalid", "key":"BAD", "root":{"machine":machine,"path":path},"first_workstream":"Synthetic"}))).await, 400);
+    }
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    let root = dir
+        .path()
+        .join("synthetic-project")
+        .to_string_lossy()
+        .into_owned();
+    expect(
+        &call(
+            &app,
+            Some(caller),
+            "POST",
+            "/v1/projects",
+            Some(json!({"name":"Synthetic", "key":"SYN", "root":{"machine":machine,"path":root}})),
+        )
+        .await,
+        201,
     );
 }

@@ -292,6 +292,7 @@ function send(res: ServerResponse, reply: Reply): void {
     // A client that went away misses the rest; the route's work goes on to its end regardless.
     const open = (): boolean => !res.destroyed && !res.writableEnded;
     reply.stream.start({
+      canceled: () => !open(),
       write: (line) => {
         if (open()) res.write(line);
       },
