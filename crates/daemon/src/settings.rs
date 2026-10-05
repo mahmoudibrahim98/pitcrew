@@ -16,13 +16,19 @@ struct Settings {
 }
 
 pub fn routes(work: Arc<WorkService>, root: &std::path::Path) -> Router {
+    let settings = Settings {
+        work,
+        root: root.to_path_buf(),
+    };
+    // Persistence uses startup configuration, never a path extracted from a request.
+    let rename_settings = settings.clone();
     Router::new()
         .route("/v1/settings", get(info))
-        .route("/v1/settings/workspace", put(rename))
-        .with_state(Settings {
-            work,
-            root: root.to_path_buf(),
-        })
+        .route(
+            "/v1/settings/workspace",
+            put(move |caller, body| rename(rename_settings.clone(), caller, body)),
+        )
+        .with_state(settings)
 }
 
 async fn info(
@@ -42,7 +48,7 @@ struct Rename {
 }
 
 async fn rename(
-    State(settings): State<Settings>,
+    settings: Settings,
     Extension(caller): Extension<Caller>,
     body: Result<Json<Rename>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Workspace>, WorkError> {
@@ -122,7 +128,7 @@ mod tests {
                     .method("PUT")
                     .uri("/v1/settings/workspace")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"name":"Updated workspace"}"#))
+                    .body(Body::from(r#"{"name":"../Updated workspace"}"#))
                     .unwrap(),
             )
             .await
@@ -130,14 +136,14 @@ mod tests {
         assert_eq!(response.status(), 200);
         assert_eq!(
             work.workspace_at().unwrap().workspace.name,
-            "Updated workspace"
+            "../Updated workspace"
         );
         assert_eq!(
             crate::state::read_workspace(&temp.path().join("workspace.json"))
                 .unwrap()
                 .unwrap()
                 .name,
-            "Updated workspace"
+            "../Updated workspace"
         );
         let agent = Caller {
             scope: TokenScope::Agent,
