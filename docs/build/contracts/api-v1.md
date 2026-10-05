@@ -2,6 +2,33 @@
 
 The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use it.
 
+## Settings after setup
+
+All writes below require a device token. Profile edits affect only the token's person;
+workspace and persona edits require the workspace's first person (the owner). Unknown ids are
+`404`, another person editing owner settings is `403`, malformed or unknown fields are `400`,
+and a handle already held by another member is `409`. Names are trimmed, 1–80 Unicode code
+points without control characters; handles follow the setup rules and cannot be `@office`.
+
+- `PUT /v1/me/profile`: `{name, handle, avatar: {initials, colour}}` → the updated `Member`.
+  Initials are 1–4 code points without controls or hidden characters; colour is `#RRGGBB`.
+  `Member.avatar` is optional for older members. Updates append `member_added` and survive replay.
+- `PUT /v1/personas/{id}`: `{name, engine, model?, instructions?, permission_mode}` → `Persona`.
+  Edits an existing default-agent recipe, appending `persona_saved`; new sessions use the new
+  recipe, existing sessions keep theirs. Model is at most 200 code points, instructions at most
+  32,768, neither with NUL; bypass permissions remains refused by the runner.
+- `GET /v1/settings`: owner id, read-only `data_folder`, `logs` description, `daemon_version`,
+  and `protocol_version`. Owner-only: folder paths are never exposed to agents or other people.
+- `PUT /v1/settings/workspace`: `{name}` → `Workspace`. Owner-only. The daemon atomically saves
+  `workspace.json` before updating its live name; the UI refreshes workspace data after success.
+  Like setup naming, this does not append a work event.
+
+Settings reuses machine checks, CLI accounts and sign-in, hook previews/install, safety and
+integration routes. Remote machines are managed through their own workspace transport. Theme
+and density are local UI preferences and apply immediately. There are no hub notification
+preferences: native desktop notifications remain controlled by the tray. Hook removal is deferred
+until the CLI exposes retained uninstall plans with exact deletion previews.
+
 - **Types** are the Rust types in `crates/protocol`. JSON field names are exactly the serde names;
   enums are `snake_case` strings; ids are bare 26-character ULIDs; times are UTC milliseconds.
 - **The real server** is stream H (`crates/api`). **The mock** is `apps/mock-hub`, which serves
