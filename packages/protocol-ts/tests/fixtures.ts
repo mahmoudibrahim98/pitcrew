@@ -215,25 +215,6 @@ export const write: import('../index.ts').UpstreamWrite = {
   },
   "state": "sent"
 };
-export const writeRetryRequested: import('../index.ts').EventBody = {
-  "data": {
-    "ask": "01J00000000000000000000000",
-    "by": "01J00000000000000000000000",
-    "task": "01J00000000000000000000000"
-  },
-  "type": "write_retry_requested"
-};
-export const writeFinished: import('../index.ts').EventBody = {
-  "data": {
-    "ask": "01J00000000000000000000000",
-    "result": {
-      "outcome": "not_sent",
-      "reason": "Not sent: Sam chose not to."
-    },
-    "task": "01J00000000000000000000000"
-  },
-  "type": "write_finished"
-};
 export const machineCheck: import('../index.ts').MachineCheck = {
   "rows": [
     {
@@ -250,11 +231,30 @@ export const machineCheck: import('../index.ts').MachineCheck = {
     }
   ]
 };
+export const writeRetryRequested: import('../index.ts').EventBody = {
+  "data": {
+    "ask": "01J00000000000000000000000",
+    "by": "01J00000000000000000000000",
+    "task": "01J00000000000000000000000"
+  },
+  "type": "write_retry_requested"
+};
 export const agentAccount: import('../index.ts').AgentAccount = {
   "account": "ChatGPT",
   "engine": "codex",
   "installed": true,
   "signed_in": true
+};
+export const writeFinished: import('../index.ts').EventBody = {
+  "data": {
+    "ask": "01J00000000000000000000000",
+    "result": {
+      "outcome": "not_sent",
+      "reason": "Not sent: Sam chose not to."
+    },
+    "task": "01J00000000000000000000000"
+  },
+  "type": "write_finished"
 };
 export const signIn: import('../index.ts').SignIn = {
   "command": [

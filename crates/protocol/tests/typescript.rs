@@ -183,6 +183,11 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     scan::ScanReport::export_all(&config)?;
     scan::Suggestion::export_all(&config)?;
     scan::WorkstreamSuggestion::export_all(&config)?;
+    // Machine setup (api-v1.md, "Machine setup").
+    machine_setup::MachineCheck::export_all(&config)?;
+    machine_setup::AgentAccount::export_all(&config)?;
+    machine_setup::StartSignIn::export_all(&config)?;
+    machine_setup::SignIn::export_all(&config)?;
     transcript::PlanItem::export_all(&config)?;
     transcript::PlanStatus::export_all(&config)?;
     transcript::TranscriptItem::export_all(&config)?;
@@ -434,28 +439,6 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     fixture(
         &config,
         &mut examples,
-        "writeRetryRequested",
-        events::EventBody::WriteRetryRequested {
-            ask,
-            task: Some(id),
-            by: "01J00000000000000000000000".parse()?,
-        },
-    )?;
-    fixture(
-        &config,
-        &mut examples,
-        "writeFinished",
-        events::EventBody::WriteFinished {
-            ask,
-            task: Some(id),
-            result: writes::WriteResult::NotSent {
-                reason: "Not sent: Sam chose not to.".into(),
-            },
-        },
-    )?;
-    fixture(
-        &config,
-        &mut examples,
         "machineCheck",
         machine_setup::MachineCheck {
             rows: vec![
@@ -479,6 +462,16 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     fixture(
         &config,
         &mut examples,
+        "writeRetryRequested",
+        events::EventBody::WriteRetryRequested {
+            ask,
+            task: Some(id),
+            by: "01J00000000000000000000000".parse()?,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
         "agentAccount",
         machine_setup::AgentAccount {
             engine: model::Engine::Codex,
@@ -486,6 +479,18 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
             signed_in: Some(true),
             account: Some("ChatGPT".into()),
             detail: None,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "writeFinished",
+        events::EventBody::WriteFinished {
+            ask,
+            task: Some(id),
+            result: writes::WriteResult::NotSent {
+                reason: "Not sent: Sam chose not to.".into(),
+            },
         },
     )?;
     fixture(

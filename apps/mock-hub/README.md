@@ -105,6 +105,18 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   then `done`. Only the hub's own machine (its first `local` one); another is 409, an unknown one
   404. One scan at a time: a second is 409 until the first has written its report, even if its
   client went away. It reads no folder.
+- **Machine setup** (`GET /v1/machines/{id}/check`, `…/agents`, `…/agents/{engine}/sign-in`
+  with `GET`, `POST` and `DELETE`;
+  `src/machine-setup.ts`): a fixed check of a synthetic laptop (Claude Code, Codex, tmux and git
+  there; OpenCode and gh missing, with `install_page`; no SLURM), accounts (Codex signed in with
+  ChatGPT, Claude Code not, OpenCode not installed), and a sign-in whose terminal
+  (`/v1/sessions/{terminal}/terminal`) shows a canned login, echoes keys, and ends on Enter or by
+  itself after about two seconds (`startServer({ delays: { signIn } })`); Claude Code then reports
+  `sam@example.com`. `DELETE …/sign-in` ends one at once (its terminal gets `exit`) and forgets
+  it. The daemon's rules: the hub's owner only (its first person, `dev-device-token`'s; another
+  person, `dev-second-device-token`, gets 403 on every route and on a sign-in's terminal), the
+  hub's own machine only, one sign-in per CLI while it runs, 409 for OpenCode (not installed),
+  `device_code` for Codex only. It runs nothing.
 - **Editing tasks** (`PATCH /v1/tasks/{id-or-key}`): every rule in the contract (title, labels,
   workstream, `blocked_by` with cycles as 409, dates). `task_updated` carries only the fields that
   changed, and a patch that changes nothing emits nothing.
@@ -167,8 +179,8 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 
 ## What it does not do
 
-- It runs no agents and reads no real transcripts; replies, terminal screens and the scan's report
-  are canned.
+- It runs no agents and reads no real transcripts; replies, terminal screens, the scan's report and
+  machine setup's check, accounts and logins are canned.
 - Nothing is saved: restart the server to get the demo workspace back.
 - No back office, and no tracker sync on a timer (only when asked): briefs are only proposed by the fixture, dispatches never finish
   on their own, workstream health never changes by itself, and mentions do not create asks.
@@ -212,8 +224,8 @@ a single entry point.
 | `src/scan.ts` | The machine scan: its synthetic report and streamed frames. |
 | `src/integrations.ts` | GitHub and Jira integrations over `fixtures/*.fixture`, and the links' checks. |
 | `src/writes.ts` | Outward writes: proposals, approvals and the recorded answers. |
-| `src/machine-setup.ts` | Machine setup: the synthetic check, the accounts, and sign-in terminals. |
 | `fixtures/` | Recorded, synthetic GitHub and Jira answers (reads, and the writes' answers), shared with the daemon's tests and the conformance runner. |
+| `src/machine-setup.ts` | Machine setup: the synthetic check, the accounts, and sign-in terminals. |
 | `src/ws.ts` | A minimal WebSocket server (RFC 6455). |
 | `src/types.ts` | Wire types mirroring `crates/protocol`. |
 | `src/rules.ts` | `can_move` and date checks ported from `model.rs`. |

@@ -146,10 +146,18 @@ try {
     await writeFile(refused, 'Synthetic runtime refusal\n');
     // A dispatch starts its agent's CLI: stand-ins first on the daemon's PATH, never a real one.
     // Each writes nothing and waits until this run's folder is gone (the cleanup), so its
-    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle.
+    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle. They
+    // answer `--version` at once (a Claude Code new enough for onboarding.test.mjs's hooks), and
+    // for machine-setup.test.mjs their status commands too (not signed in); a sign-in's "login"
+    // waits like a session.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
-    const standIn = `#!/bin/sh\nif [ \"$1\" = --version ]; then echo 2.1.139; exit 0; fi\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
+    const standIn =
+      `#!/bin/sh\ncase "$1 $2" in\n` +
+      `  "--version ") echo 2.1.139; exit 0 ;;\n` +
+      `  "auth status"|"login status") echo "Not logged in" >&2; exit 1 ;;\n` +
+      `  "auth list") echo "0 credentials"; exit 0 ;;\n` +
+      `esac\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
     for (const cli of ['claude', 'codex', 'opencode'])
       await writeFile(join(bin, cli), standIn, { mode: 0o700 });
     // GitHub integrations read `gh auth token`: a stand-in that prints a synthetic credential,
