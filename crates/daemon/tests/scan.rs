@@ -353,8 +353,18 @@ fn a_scan_streams_progress_and_reports_the_fixtures() {
                 "session_count": 1,
                 "recent_30d": 1,
                 "recent_90d": 1,
+                // The default workstream first: the main checkout, named after the branch its
+                // session started on (this `.git` has no HEAD to read).
                 "workstreams": [{
+                    "id": path(repo),
+                    "kind": "main",
+                    "name": "main",
+                    "session_count": 1,
+                    "recent_30d": 1,
+                    "recent_90d": 1,
+                }, {
                     "id": path(&work.paper),
+                    "kind": "folder",
                     "name": "paper",
                     "session_count": 1,
                     "recent_30d": 1,
@@ -369,7 +379,14 @@ fn a_scan_streams_progress_and_reports_the_fixtures() {
                 "session_count": 1,
                 "recent_30d": 1,
                 "recent_90d": 1,
-                "workstreams": [],
+                "workstreams": [{
+                    "id": path(&work.runs),
+                    "kind": "main",
+                    "name": "Main",
+                    "session_count": 1,
+                    "recent_30d": 1,
+                    "recent_90d": 1,
+                }],
             },
             {
                 "id": path(&work.tools),
@@ -379,7 +396,15 @@ fn a_scan_streams_progress_and_reports_the_fixtures() {
                 "session_count": 1,
                 "recent_30d": 1,
                 "recent_90d": 1,
-                "workstreams": [],
+                // OpenCode records no branch, and this `.git` has no HEAD: named after the folder.
+                "workstreams": [{
+                    "id": path(&work.tools),
+                    "kind": "main",
+                    "name": "lab-tools",
+                    "session_count": 1,
+                    "recent_30d": 1,
+                    "recent_90d": 1,
+                }],
             },
         ]),
         "{report:#}"
