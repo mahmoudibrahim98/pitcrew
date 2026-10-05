@@ -59,7 +59,7 @@ const NEEDS: Record<StepId, readonly OnboardingCall[]> = {
   // Through the data layer, not `OnboardingApi`: `DraftStepProvider` offers it.
   draft: [],
   hooks: ['hooksDiff', 'installHooks'],
-  safety: ['saveSafety'],
+  safety: ['readSafety', 'saveSafety'],
   done: [],
 };
 

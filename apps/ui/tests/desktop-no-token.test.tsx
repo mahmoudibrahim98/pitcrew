@@ -154,7 +154,7 @@ describe('the desktop app holds no token', () => {
       expect(commands).toContain(cmd);
     }
     for (const cmd of commands) {
-      expect(['gateway_workspaces', 'gateway_request', 'gateway_socket_open', 'gateway_socket_send', 'gateway_socket_close']).toContain(cmd);
+      expect(['gateway_workspaces', 'gateway_request', 'gateway_socket_open', 'gateway_socket_send', 'gateway_socket_close', 'gateway_update_status']).toContain(cmd);
     }
     expect(gateway.sockets.map((s) => s.path)).toContain('/v1/stream');
 

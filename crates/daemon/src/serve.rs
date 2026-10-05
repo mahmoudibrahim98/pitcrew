@@ -582,6 +582,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         .device(Recaps::new(recaps).routes())
         .device(crate::scan::routes(Arc::clone(&work), homes.as_deref()))
         .device(crate::files::routes(Arc::clone(&work), state.root()))
+        .device(crate::onboarding::routes(Arc::clone(&work)))
         .device(pitcrew_api::terminal::routes(
             terminals,
             TerminalConfig::default(),

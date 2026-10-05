@@ -226,6 +226,7 @@ const boardDraft = object({
   rejected: list(integer),
 });
 const eventData = {
+  safety_changed: object({ settings: object({ permission_mode: enumeration("default", "plan", "accept_edits", "bypass_permissions"), back_office_enabled: bool, back_office_caps: object({ max_auto_accept_per_hour: integer }) }) }),
   cursor_moved: object({ scope: text, rev: integer }),
   machine_added: object({ machine }),
   member_added: object({ member }),

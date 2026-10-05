@@ -82,3 +82,7 @@ creates exactly the accepted items, labelled `drafted`, and nothing for the reje
 and the three events' shapes. On the daemon the draft's CLI is the stand-in `claude`, in the
 temporary home, as for a dispatch; it never proposes by itself (the suite's agent token does).
 
+Hook-install conformance writes agent configurations. It is disabled unless
+`PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed
+synthetic targets. Do not set it when pointing the suite at an existing hub.
+

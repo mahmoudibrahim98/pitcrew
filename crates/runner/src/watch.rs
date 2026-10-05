@@ -3301,6 +3301,8 @@ mod tests {
     fn only_unchanged_periodic_file_discovery_is_skipped() {
         let home = tempfile::tempdir().unwrap();
         let home = home.path().canonicalize().unwrap();
+        // A folder changed in the last seconds is never cached.
+        crate::discovery::settle(&[&home]);
         let state = tempfile::tempdir().unwrap();
         let adapter = Arc::new(Growing::default());
         let (mut w, _agents, _rx) =

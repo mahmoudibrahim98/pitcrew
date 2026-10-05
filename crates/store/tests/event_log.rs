@@ -391,6 +391,8 @@ fn other_bodies() -> Vec<EventBody> {
         json!({"type": "board_draft_reviewed", "data": {"draft": "01J00000000000000000000000",
             "workstream": demo.workstreams[0].id,
             "accepted": [{"item": 0, "task": demo.tasks[0].id}], "rejected": []}}),
+        json!({"type": "safety_changed", "data": {"settings": {"permission_mode": "plan",
+            "back_office_enabled": true, "back_office_caps": {"max_auto_accept_per_hour": 10}}}}),
     ];
     bodies
         .into_iter()
