@@ -6,8 +6,11 @@
 //! project, and applies the intents through `pitcrew_hub_work::SyncCommands` (the sync's own
 //! member, `Mover::Sync`). Conflicts become asks. Everything here runs on the blocking pool.
 //!
-//! - An issue no task mirrors is created only from its "opened" change, in a linked scope, and
-//!   not when it was already closed the first time it was seen. Its other changes are skipped.
+//! - An issue no task mirrors is created from its "opened" change, in a linked scope, and not
+//!   when it was already closed the first time it was seen. It is also created when a later read
+//!   moves it, open, into a milestone or epic (or under any parent) that routes to a workstream:
+//!   from the snapshot that read took ([`github_openings`], [`jira_openings`]), since the move
+//!   carries none of its fields. Its other changes are skipped.
 //! - A milestone or epic first seen closed in this read does not ship anything: only a close the
 //!   sync sees happen does.
 
@@ -329,8 +332,58 @@ impl Seen {
     }
 }
 
-/// Applies a GitHub sync's changes.
-pub fn apply_github(applier: &mut Applier<'_>, changes: &[pitcrew_sync_github::UpstreamChange]) {
+/// For each issue a GitHub read moved into a milestone, the issue as a first read would report
+/// it, from the state that read returned, when it is open: what [`apply_github`] creates a task
+/// from when no task mirrors the issue yet.
+#[must_use]
+pub fn github_openings(
+    changes: &[pitcrew_sync_github::UpstreamChange],
+    state: &pitcrew_sync_github::SyncState,
+) -> HashMap<String, pitcrew_sync_github::UpstreamChange> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            pitcrew_sync_github::UpstreamChange::IssueMilestoned {
+                source,
+                milestone: Some(milestone),
+                ..
+            } => state
+                .opened_from_snapshot(source, Some(milestone))
+                .map(|opened| (source.key.clone(), opened)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// For each issue a Jira read moved under an epic, the issue as a first read would report it,
+/// from the state that read returned, when it is not done: what [`apply_jira`] creates a task
+/// from when no task mirrors the issue yet.
+#[must_use]
+pub fn jira_openings(
+    changes: &[pitcrew_sync_jira::UpstreamChange],
+    state: &pitcrew_sync_jira::SyncState,
+) -> HashMap<String, pitcrew_sync_jira::UpstreamChange> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            pitcrew_sync_jira::UpstreamChange::IssueReparented {
+                source,
+                epic: Some(epic),
+                ..
+            } => state
+                .created_from_snapshot(source, Some(epic))
+                .map(|created| (source.key.clone(), created)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Applies a GitHub sync's changes. `openings` is [`github_openings`] of them.
+pub fn apply_github(
+    applier: &mut Applier<'_>,
+    changes: &[pitcrew_sync_github::UpstreamChange],
+    openings: &HashMap<String, pitcrew_sync_github::UpstreamChange>,
+) {
     use pitcrew_sync_github::UpstreamChange as C;
     applier.applied.counts.changes = u32::try_from(changes.len()).unwrap_or(u32::MAX);
     let mut seen = Seen::default();
@@ -410,13 +463,25 @@ pub fn apply_github(applier: &mut Applier<'_>, changes: &[pitcrew_sync_github::U
                 applier.intents(intents, &place);
             }
             _ => {
-                // Every other issue change: only for an issue a task mirrors.
+                // Every other issue change: only for an issue a task mirrors, or one moved, open,
+                // into a milestone that routes to a workstream (created from its snapshot).
                 if skipped_sources.contains(&source.key) {
                     applier.applied.counts.skipped += 1;
                     continue;
                 }
                 let Some(task) = applier.mirrored(source) else {
-                    applier.applied.counts.skipped += 1;
+                    if let C::IssueMilestoned {
+                        milestone: Some(milestone),
+                        ..
+                    } = change
+                        && let Some(opened) = openings.get(&source.key)
+                    {
+                        let place = applier.place(source, Some(milestone));
+                        let intents = pitcrew_sync_github::plan(opened, None);
+                        applier.intents(intents, &place);
+                    } else {
+                        applier.applied.counts.skipped += 1;
+                    }
                     continue;
                 };
                 let place = applier.place(source, None);
@@ -427,8 +492,12 @@ pub fn apply_github(applier: &mut Applier<'_>, changes: &[pitcrew_sync_github::U
     }
 }
 
-/// Applies a Jira sync's changes.
-pub fn apply_jira(applier: &mut Applier<'_>, changes: &[pitcrew_sync_jira::UpstreamChange]) {
+/// Applies a Jira sync's changes. `openings` is [`jira_openings`] of them.
+pub fn apply_jira(
+    applier: &mut Applier<'_>,
+    changes: &[pitcrew_sync_jira::UpstreamChange],
+    openings: &HashMap<String, pitcrew_sync_jira::UpstreamChange>,
+) {
     use pitcrew_sync_jira::UpstreamChange as C;
     applier.applied.counts.changes = u32::try_from(changes.len()).unwrap_or(u32::MAX);
     let mut seen = Seen::default();
@@ -496,7 +565,17 @@ pub fn apply_jira(applier: &mut Applier<'_>, changes: &[pitcrew_sync_jira::Upstr
                     continue;
                 }
                 let Some(task) = applier.mirrored(source) else {
-                    applier.applied.counts.skipped += 1;
+                    if let C::IssueReparented {
+                        epic: Some(epic), ..
+                    } = change
+                        && let Some(created) = openings.get(&source.key)
+                    {
+                        let place = applier.place(source, Some(epic));
+                        let intents = pitcrew_sync_jira::plan(created, None);
+                        applier.intents(intents, &place);
+                    } else {
+                        applier.applied.counts.skipped += 1;
+                    }
                     continue;
                 };
                 let place = applier.place(source, None);

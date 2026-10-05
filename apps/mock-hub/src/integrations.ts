@@ -2,16 +2,29 @@
 // in `apps/mock-hub/fixtures/` (the sync crates' format; `pitcrewd serve --integration-fixtures`
 // reads the same files). Device tokens only. Credentials stay in memory and are never returned.
 //
-// A sync runs at once, when an integration is added and on `POST …/sync`, with the daemon's rules:
-// open issues in a linked scope become tasks of the workstream that links their milestone or epic,
-// else their repository or project; issues closed before they were first seen are skipped;
-// upstream-owned fields (title, description, labels) are overwritten; moves follow the sync's
-// `can_move` (in-progress work is never touched: a conflict ask instead); a merged pull request is
-// noted on the task it closes. Everything a sync changes is authored by its own member, `@sync`.
+// A sync runs at once, when an integration is added and on `POST …/sync`, with the daemon's rules,
+// over a snapshot of what each sync read (as the sync crates keep one), so only what changed
+// upstream since the last read acts:
+// - open issues in a linked scope become tasks of the workstream that links their milestone or
+//   epic, else their repository or project; so does an open issue a later read moves under a
+//   milestone or epic that routes to a workstream; issues closed before they were first seen are
+//   skipped;
+// - upstream-owned fields (title, description, labels) are overwritten when upstream changes them;
+// - an upstream close or reopen moves the task, following the sync's `can_move` (in-progress work
+//   is never touched: a conflict ask instead); a task a person moved stays where they put it;
+// - a milestone or epic seen closing ships the workstreams that link it, unless one of their tasks
+//   is in progress (a conflict ask); one first seen closed ships nothing;
+// - a merged pull request is noted on the task it closes.
+// Everything a sync changes is authored by its integration's own member, `@sync` (an agent of the
+// person who added it; `@tracker-sync` when `@sync` is another person's).
 // Outward writes are `writes.ts`'s; what a sent one changed is laid over the fixtures here
 // (`changeUpstream`), so the next sync agrees with it.
+//
+// The fixtures are read again at each sync and test, from `fixtures/` or the folder `useFixtures`
+// names: a file whose name sorts first changes what "upstream" says (tests/conformance does).
 
 import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { canMove } from './rules.ts';
 import type { Hub } from './state.ts';
 import {
@@ -49,14 +62,14 @@ export interface Exchange {
   body: string;
 }
 
-let exchanges: Map<string, Exchange> | undefined;
-
-/** Every exchange in the fixtures, by method and URL (`GET https://…`). */
-function fixtures(): Map<string, Exchange> {
-  if (exchanges !== undefined) return exchanges;
-  exchanges = new Map();
-  for (const name of readdirSync(FIXTURES).filter((n) => n.endsWith('.fixture')).sort()) {
-    const text = readFileSync(new URL(name, FIXTURES), 'utf8');
+/**
+ * Every exchange in the fixtures of `dir`, by method and URL (`GET https://…`); the first of two for
+ * one method and URL, by file name, wins.
+ */
+function fixtures(dir: URL | string): Map<string, Exchange> {
+  const exchanges = new Map<string, Exchange>();
+  for (const name of readdirSync(dir).filter((n) => n.endsWith('.fixture')).sort()) {
+    const text = readFileSync(typeof dir === 'string' ? join(dir, name) : new URL(name, dir), 'utf8');
     for (const block of text.split(SEPARATOR).map((b) => b.trim()).filter(Boolean)) {
       const lines = block.split('\n');
       const [method = '', url = ''] = (lines[0] ?? '').split(' ');
@@ -80,13 +93,16 @@ function fixtures(): Map<string, Exchange> {
   return exchanges;
 }
 
-/** The recorded answer to `method url`, if the fixtures hold one. */
-export function exchange(method: string, url: string): Exchange | undefined {
-  return fixtures().get(`${method} ${url}`);
+/** What "upstream" answers now, for one sync, test or write, by method and URL. */
+type Upstream = Map<string, Exchange>;
+
+function upstreamOf(hub: Hub): Upstream {
+  return fixtures(state(hub).fixtures);
 }
 
-function read(url: string): Exchange | undefined {
-  return exchange('GET', url);
+/** The recorded answer to `method url`, if the fixtures hold one now. */
+export function exchange(hub: Hub, method: string, url: string): Exchange | undefined {
+  return upstreamOf(hub).get(`${method} ${url}`);
 }
 
 function json(exchange: Exchange | undefined): unknown {
@@ -100,19 +116,32 @@ function json(exchange: Exchange | undefined): unknown {
 
 // ─── State ──────────────────────────────────────────────────────────────────────────────────────
 
+/** An issue's upstream-owned fields as the last sync read them. */
+interface Snapshot {
+  title: string;
+  body: string;
+  labels: string[];
+  open: boolean;
+  parent: string | undefined;
+}
+
 interface Record {
   integration: Integration;
+  /** The member this integration's sync acts as. */
+  member: MemberId;
   secret: string | undefined;
   titles: Map<string, string>;
-  /** Issue keys seen upstream, for "closed before it was first seen". */
-  seen: Set<string>;
+  /** Issues as last read, by key: what a read diffs against ("closed before first seen" too). */
+  snapshots: Map<string, Snapshot>;
+  /** Milestones and epics as last read: open or not, by key. Never reset by a link change. */
+  parents: Map<string, boolean>;
   /** Link keys each scope was last synced with. */
   linked: Map<string, string>;
 }
 
 interface State {
-  syncMember: MemberId | undefined;
   records: Record[];
+  fixtures: URL | string;
 }
 
 const states = new WeakMap<Hub, State>();
@@ -120,10 +149,15 @@ const states = new WeakMap<Hub, State>();
 function state(hub: Hub): State {
   let s = states.get(hub);
   if (s === undefined) {
-    s = { syncMember: undefined, records: [] };
+    s = { records: [], fixtures: FIXTURES };
     states.set(hub, s);
   }
   return s;
+}
+
+/** Reads "upstream" from the fixtures in `dir` instead of `fixtures/` (tests). */
+export function useFixtures(hub: Hub, dir: string): void {
+  state(hub).fixtures = dir;
 }
 
 function record(hub: Hub, id: string): Record {
@@ -132,9 +166,14 @@ function record(hub: Hub, id: string): Record {
   return found;
 }
 
-/** The sync's member, once an integration was added. */
-export function syncMember(hub: Hub): MemberId | undefined {
-  return state(hub).syncMember;
+/** The member the integration `id`'s sync acts as, while it is connected. */
+export function syncMemberOf(hub: Hub, id: string): MemberId | undefined {
+  return state(hub).records.find((r) => r.integration.id === id)?.member;
+}
+
+/** Whether `member` is any connected integration's sync member. */
+export function isSyncMember(hub: Hub, member: MemberId): boolean {
+  return state(hub).records.some((r) => r.member === member);
 }
 
 /** The integration with this id, if it is still connected. */
@@ -197,7 +236,8 @@ function withOverlay(hub: Hub, item: Item): Item {
 /** One issue as upstream has it now (the fixtures, then what writes changed), if it is known. */
 export function upstreamIssue(hub: Hub, integration: Integration, key: string): Item | undefined {
   const settings = integration.settings;
-  const read = settings.kind === 'github' ? readGithub(settings) : readJira(settings);
+  const upstream = upstreamOf(hub);
+  const read = settings.kind === 'github' ? readGithub(upstream, settings) : readJira(upstream, settings);
   const item = read.items.find((i) => i.key === key);
   return item === undefined ? undefined : withOverlay(hub, item);
 }
@@ -318,7 +358,9 @@ function checkSettings(value: unknown, credential: string): IntegrationSettings 
       repos: distinct(value['repos'], 'repos', isRepo, 'owner/repo'),
     };
     if (value['api_base'] !== undefined && value['api_base'] !== null) {
-      settings.api_base = httpsRoot(value['api_base'], 'api_base');
+      const base = httpsRoot(value['api_base'], 'api_base');
+      // github.com's own API root is the default, kept as none (as the daemon does).
+      if (base.toLowerCase() !== GITHUB_API) settings.api_base = base;
     }
     return settings;
   }
@@ -357,10 +399,15 @@ function checkSettings(value: unknown, credential: string): IntegrationSettings 
   throw invalid('settings.kind must be github or jira.');
 }
 
+/**
+ * The scopes a connection syncs, without their host: links and task sources name a repository or
+ * an issue key without one, so the same repository or project on two hosts would move each
+ * other's tasks.
+ */
 function scopeKeys(settings: IntegrationSettings): string[] {
   return settings.kind === 'github'
-    ? settings.repos.map((r) => `github:${settings.api_base ?? GITHUB_API}:${r}`.toLowerCase())
-    : settings.projects.map((p) => `jira:${settings.site}:${p}`.toLowerCase());
+    ? settings.repos.map((r) => `github:${r}`.toLowerCase())
+    : settings.projects.map((p) => `jira:${p}`.toLowerCase());
 }
 
 // ─── Views ──────────────────────────────────────────────────────────────────────────────────────
@@ -414,8 +461,8 @@ export function get(hub: Hub, id: string): Reply {
   return { status: 200, body: view(hub, record(hub, id)) };
 }
 
+/** The sync's member for `owner`, found or added (`pitcrew_hub_work`'s `ensure_sync_member`). */
 function ensureSyncMember(hub: Hub, owner: MemberId): MemberId {
-  const s = state(hub);
   const person = hub.findMember(owner);
   if (person === undefined || person.kind !== 'human') {
     throw invalid(`${owner} is not a person of this workspace; only a person owns the tracker sync.`);
@@ -423,17 +470,13 @@ function ensureSyncMember(hub: Hub, owner: MemberId): MemberId {
   let free: string | undefined;
   for (const handle of [SYNC_HANDLE, SYNC_FALLBACK]) {
     const holder = hub.members.find((m) => m.handle === handle);
-    if (holder?.kind === 'agent' && holder.owner === owner) {
-      s.syncMember = holder.id;
-      return holder.id;
-    }
+    if (holder?.kind === 'agent' && holder.owner === owner) return holder.id;
     if (holder === undefined) free ??= handle;
   }
   if (free === undefined) throw conflict(`${SYNC_HANDLE} and ${SYNC_FALLBACK} are both other members' handles.`);
   const member: Member = { id: ulid(), kind: 'agent', handle: free, name: 'Tracker sync', owner };
   hub.members.push(member);
   hub.append(owner, { type: 'member_added', data: { member } });
-  s.syncMember = member.id;
   return member.id;
 }
 
@@ -454,9 +497,11 @@ export function add(hub: Hub, caller: MemberId, body: unknown): Reply {
   const settings = checkSettings(body['settings'], credential);
   const wanted = new Set(scopeKeys(settings));
   if (state(hub).records.some((r) => scopeKeys(r.integration.settings).some((k) => wanted.has(k)))) {
-    throw conflict('Another integration already syncs one of these repositories or projects.');
+    throw conflict(
+      'Another integration already syncs one of these repositories or projects, on this host or another: links and tasks name a repository or project without its host.',
+    );
   }
-  ensureSyncMember(hub, caller);
+  const member = ensureSyncMember(hub, caller);
   const now = Date.now();
   const rec: Record = {
     integration: {
@@ -470,9 +515,11 @@ export function add(hub: Hub, caller: MemberId, body: unknown): Reply {
       status: { running: false, problems: [], next_at: now },
       links: [],
     },
+    member,
     secret: undefined,
     titles: new Map(),
-    seen: new Set(),
+    snapshots: new Map(),
+    parents: new Map(),
     linked: new Map(),
   };
   state(hub).records.push(rec);
@@ -531,6 +578,8 @@ export function test(hub: Hub, id: string): Reply {
   const checks: ScopeCheck[] = [{ scope: '', ok: true, message: 'The credential works.' }];
   const warnings: string[] = [];
   const settings = rec.integration.settings;
+  const upstream = upstreamOf(hub);
+  const read = (url: string): Exchange | undefined => upstream.get(`GET ${url}`);
   if (settings.kind === 'github') {
     const base = settings.api_base ?? GITHUB_API;
     for (const repo of settings.repos) {
@@ -608,25 +657,31 @@ function adfText(node: unknown, out: string[] = []): string[] {
 interface Read {
   items: Item[];
   titles: Map<string, string>;
+  /** Milestones or epics, by key: whether each is open, and its link. */
+  parents: Map<string, { open: boolean; url: string | undefined }>;
   /** Pull requests merged upstream: the issue keys each closes, and its link. */
   merged: { url: string; closes: string[] }[];
   problems: SyncProblem[];
 }
 
-function readGithub(settings: Extract<IntegrationSettings, { kind: 'github' }>): Read {
+function readGithub(upstream: Upstream, settings: Extract<IntegrationSettings, { kind: 'github' }>): Read {
   const base = settings.api_base ?? GITHUB_API;
-  const out: Read = { items: [], titles: new Map(), merged: [], problems: [] };
+  const read = (url: string): unknown => json(upstream.get(`GET ${url}`));
+  const out: Read = { items: [], titles: new Map(), parents: new Map(), merged: [], problems: [] };
   for (const repo of settings.repos) {
     const api = `${base}/repos/${repo}`;
-    const milestones = json(read(`${api}/milestones?state=all&sort=due_on&direction=asc&per_page=100`));
-    const issues = json(read(`${api}/issues?state=all&sort=updated&direction=asc&per_page=100`));
-    const pulls = json(read(`${api}/pulls?state=all&sort=updated&direction=desc&per_page=100`));
+    const milestones = read(`${api}/milestones?state=all&sort=due_on&direction=asc&per_page=100`);
+    const issues = read(`${api}/issues?state=all&sort=updated&direction=asc&per_page=100`);
+    const pulls = read(`${api}/pulls?state=all&sort=updated&direction=desc&per_page=100`);
     if (!Array.isArray(milestones) || !Array.isArray(issues) || !Array.isArray(pulls)) {
       out.problems.push({ scope: repo, message: 'no recorded fixture matches this repository' });
       continue;
     }
     for (const m of milestones) {
-      if (isRecord(m) && typeof m['title'] === 'string') out.titles.set(`${repo}#milestone:${String(m['number'])}`, fit(m['title'], 512));
+      if (!isRecord(m) || typeof m['title'] !== 'string') continue;
+      const key = `${repo}#milestone:${String(m['number'])}`;
+      out.titles.set(key, fit(m['title'], 512));
+      out.parents.set(key, { open: m['state'] !== 'closed', url: typeof m['html_url'] === 'string' ? m['html_url'] : undefined });
     }
     for (const i of issues) {
       if (!isRecord(i) || i['pull_request'] !== undefined || typeof i['title'] !== 'string') continue;
@@ -653,15 +708,15 @@ function readGithub(settings: Extract<IntegrationSettings, { kind: 'github' }>):
   return out;
 }
 
-function readJira(settings: Extract<IntegrationSettings, { kind: 'jira' }>): Read {
-  const out: Read = { items: [], titles: new Map(), merged: [], problems: [] };
+function readJira(upstream: Upstream, settings: Extract<IntegrationSettings, { kind: 'jira' }>): Read {
+  const out: Read = { items: [], titles: new Map(), parents: new Map(), merged: [], problems: [] };
   const api = `${settings.site}/rest/api/${settings.deployment === 'cloud' ? 3 : 2}`;
   const fields = 'summary%2Cdescription%2Cstatus%2Cresolution%2Clabels%2Cassignee%2Cparent%2Cissuetype%2Cupdated';
   for (const project of settings.projects) {
     const jql = encodeURIComponent(`project in ("${project}") ORDER BY updated ASC, key ASC`).replace(/\(/g, '%28').replace(/\)/g, '%29');
     const path = settings.deployment === 'cloud' ? '/search/jql' : '/search';
     const paging = settings.deployment === 'cloud' ? '' : '&startAt=0';
-    const page = json(read(`${api}${path}?jql=${jql}${paging}&maxResults=100&fields=${fields}`));
+    const page = json(upstream.get(`GET ${api}${path}?jql=${jql}${paging}&maxResults=100&fields=${fields}`));
     if (!isRecord(page) || !Array.isArray(page['issues'])) {
       out.problems.push({ scope: project, message: 'no recorded fixture matches this project' });
       continue;
@@ -674,6 +729,7 @@ function readJira(settings: Extract<IntegrationSettings, { kind: 'jira' }>): Rea
       const epic = isRecord(f['issuetype']) && f['issuetype']['name'] === 'Epic';
       if (epic) {
         out.titles.set(issue['key'], fit(summary, 512));
+        out.parents.set(issue['key'], { open: category !== 'done', url: `${settings.site}/browse/${issue['key']}` });
         continue;
       }
       const description = typeof f['description'] === 'string' ? f['description'] : adfText(f['description']).join('');
@@ -704,27 +760,30 @@ function sync(hub: Hub, rec: Record): void {
     return;
   }
   const settings = rec.integration.settings;
-  const upstream = settings.kind === 'github' ? readGithub(settings) : readJira(settings);
-  upstream.items = upstream.items.map((item) => withOverlay(hub, item));
-  const counts: SyncCounts = { changes: upstream.items.length + upstream.merged.length, applied: 0, conflicts: 0, skipped: 0, malformed: 0 };
-  const member = state(hub).syncMember;
-  if (member === undefined) return;
+  const upstream = upstreamOf(hub);
+  const read = settings.kind === 'github' ? readGithub(upstream, settings) : readJira(upstream, settings);
+  read.items = read.items.map((item) => withOverlay(hub, item));
+  const counts: SyncCounts = { changes: read.items.length + read.merged.length, applied: 0, conflicts: 0, skipped: 0, malformed: 0 };
+  const member = rec.member;
   const owner = rec.integration.added_by;
   const system = settings.kind;
-  for (const [key, title] of upstream.titles) rec.titles.set(key, title);
+  const tracker = system === 'github' ? 'GitHub' : 'Jira';
+  for (const [key, title] of read.titles) rec.titles.set(key, title);
 
-  // A scope whose links changed is read as if for the first time.
+  // A scope whose links changed is read as if for the first time (its issues; not its milestones
+  // or epics, so one closed long ago ships nothing when it is linked).
   const links = linksOf(hub, rec);
   for (const container of settings.kind === 'github' ? settings.repos : settings.projects) {
     const keys = links.filter((l) => l.container === container).map((l) => l.link.key).sort().join('\n');
     if (rec.linked.get(container) !== keys) {
-      for (const seen of [...rec.seen]) {
-        const of = system === 'github' ? seen.split('#')[0] : seen.slice(0, seen.lastIndexOf('-'));
-        if (of?.toLowerCase() === container.toLowerCase()) rec.seen.delete(seen);
+      for (const key of [...rec.snapshots.keys()]) {
+        const of = system === 'github' ? key.split('#')[0] : key.slice(0, key.lastIndexOf('-'));
+        if (of?.toLowerCase() === container.toLowerCase()) rec.snapshots.delete(key);
       }
       rec.linked.set(container, keys);
     }
   }
+  /** The workstream that links the item's milestone or epic, else its repository or project. */
   const route = (item: Item): Workstream | undefined => {
     const byParent = links.find((l) => item.parent !== undefined && l.link.key === item.parent);
     if (byParent !== undefined) return byParent.workstream;
@@ -735,30 +794,30 @@ function sync(hub: Hub, rec: Record): void {
     })?.workstream;
   };
   const mirrored = (key: string): Task | undefined => hub.tasks.find((t) => t.source?.system === system && t.source.key === key);
-  const conflictAsk = (task: Task, item: Item, reason: string): void => {
-    const title = `${system === 'github' ? 'GitHub' : 'Jira'}: ${item.key} changed, but ${task.key} cannot follow`;
-    if (hub.asks.some((a) => a.state === 'open' && a.from === member && a.task === task.id && a.title === title)) return;
-    const ask: Ask = {
+  /** A `decision` ask to the person who added the integration, not raised twice while open. */
+  const ask = (task: Task | undefined, title: string, reason: string, url: string | undefined): void => {
+    if (hub.asks.some((a) => a.state === 'open' && a.from === member && a.task === task?.id && a.title === title)) return;
+    const raised: Ask = {
       id: ulid(),
       kind: 'decision',
       from: member,
       to: owner,
-      task: task.id,
       title,
-      body: `${reason}. Nothing was changed in PitCrew; decide what to do here.\n\n${item.url}`,
+      body: `${reason}. Nothing was changed in PitCrew; decide what to do here.${url === undefined ? '' : `\n\n${url}`}`,
       options: [],
       receipts: [],
       state: 'open',
       created: Date.now(),
     };
-    hub.asks.push(ask);
-    hub.append(member, { type: 'ask_raised', data: { ask } });
+    if (task !== undefined) raised.task = task.id;
+    hub.asks.push(raised);
+    hub.append(member, { type: 'ask_raised', data: { ask: raised } });
     counts.conflicts++;
   };
   const move = (task: Task, to: TaskStatus, item: Item): void => {
     if (task.status === to) return;
     if (!canMove(task.status, to, { kind: 'sync' })) {
-      conflictAsk(task, item, `${task.key} is ${task.status}, and a sync may not move it to ${to}`);
+      ask(task, `${tracker}: ${item.key} changed, but ${task.key} cannot follow`, `${task.key} is ${task.status}, and a sync may not move it to ${to}`, item.url);
       return;
     }
     const from = task.status;
@@ -766,56 +825,91 @@ function sync(hub: Hub, rec: Record): void {
     hub.append(member, { type: 'task_moved', data: { task: task.id, from, to, mover: { kind: 'sync' } } });
     counts.applied++;
   };
-  for (const item of upstream.items) {
-    const firstSeen = !rec.seen.has(item.key);
-    rec.seen.add(item.key);
-    let task = mirrored(item.key);
+  const create = (item: Item, workstream: Workstream): void => {
+    const project = hub.findProject(workstream.project);
+    if (project === undefined) return;
+    const number = Math.max(0, ...hub.tasks.filter((t) => t.key.startsWith(`${project.key}-`)).map((t) => Number(t.key.split('-')[1]))) + 1;
+    const task: Task = {
+      id: ulid(),
+      key: `${project.key}-${number}`,
+      project: project.id,
+      workstream: workstream.id,
+      title: fit(item.title, 500) || item.key,
+      description: item.body,
+      status: 'todo',
+      priority: 'none',
+      labels: fitLabels(item.labels),
+      blocked_by: [],
+      source: { system, key: item.key, url: item.url },
+      accept_auto: false,
+      subtasks: [],
+    };
+    hub.tasks.push(task);
+    hub.append(member, { type: 'task_created', data: { task } });
+    counts.applied++;
+  };
+
+  for (const item of read.items) {
+    const before = rec.snapshots.get(item.key);
+    rec.snapshots.set(item.key, { title: item.title, body: item.body, labels: item.labels, open: item.open, parent: item.parent });
+    const task = mirrored(item.key);
     if (task === undefined) {
-      const workstream = item.open || !firstSeen ? route(item) : undefined;
-      if (workstream === undefined || !item.open) {
-        counts.skipped++;
-        continue;
-      }
-      const project = hub.findProject(workstream.project);
-      if (project === undefined) continue;
-      const number = Math.max(0, ...hub.tasks.filter((t) => t.key.startsWith(`${project.key}-`)).map((t) => Number(t.key.split('-')[1]))) + 1;
-      task = {
-        id: ulid(),
-        key: `${project.key}-${number}`,
-        project: project.id,
-        workstream: workstream.id,
-        title: fit(item.title, 500) || item.key,
-        description: item.body,
-        status: 'todo',
-        priority: 'none',
-        labels: fitLabels(item.labels),
-        blocked_by: [],
-        source: { system, key: item.key, url: item.url },
-        accept_auto: false,
-        subtasks: [],
-      };
-      hub.tasks.push(task);
-      hub.append(member, { type: 'task_created', data: { task } });
-      counts.applied++;
+      // A task is made from a first read of an open issue, or from a later read that moves it,
+      // open, under a milestone or epic; either way only in a linked scope.
+      const moved = before !== undefined && before.parent !== item.parent && item.parent !== undefined;
+      const workstream = item.open && (before === undefined || moved) ? route(item) : undefined;
+      if (workstream === undefined) counts.skipped++;
+      else create(item, workstream);
       continue;
     }
+    // Upstream-owned fields, and the workstream its milestone or epic routes to: only what
+    // upstream changed since the last read (everything, on a first read).
     const patch: { title?: string; description?: string; labels?: string[]; workstream?: string } = {};
     const title = fit(item.title, 500) || item.key;
-    if (title !== task.title) patch.title = title;
-    if (item.body !== task.description) patch.description = item.body;
+    if ((before === undefined || before.title !== item.title) && title !== task.title) patch.title = title;
+    if ((before === undefined || before.body !== item.body) && item.body !== task.description) patch.description = item.body;
     const labels = fitLabels(item.labels);
-    if (JSON.stringify(labels) !== JSON.stringify(task.labels)) patch.labels = labels;
-    const target = item.parent === undefined ? undefined : links.find((l) => l.link.key === item.parent)?.workstream;
-    if (target !== undefined && target.project === task.project && target.id !== task.workstream) patch.workstream = target.id;
+    if ((before === undefined || JSON.stringify(before.labels) !== JSON.stringify(item.labels)) && JSON.stringify(labels) !== JSON.stringify(task.labels)) {
+      patch.labels = labels;
+    }
+    if (before === undefined || before.parent !== item.parent) {
+      const target = route(item);
+      if (target !== undefined && target.project === task.project && target.id !== task.workstream) patch.workstream = target.id;
+    }
     if (Object.keys(patch).length > 0) {
       Object.assign(task, patch);
       hub.append(member, { type: 'task_updated', data: { task: task.id, patch } });
       counts.applied++;
     }
-    if (!item.open) move(task, 'done', item);
-    else if (task.status === 'done') move(task, 'todo', item);
+    // Moves follow an upstream close or reopen, never the task's own status: a task a person
+    // reopened stays reopened until upstream changes again.
+    if (before === undefined ? !item.open : before.open !== item.open) move(task, item.open ? 'todo' : 'done', item);
   }
-  for (const pr of upstream.merged) {
+
+  // A milestone or epic seen closing ships the workstreams that link it; first seen closed, none.
+  for (const [key, { open, url }] of read.parents) {
+    const was = rec.parents.get(key);
+    rec.parents.set(key, open);
+    if (was !== true || open) continue;
+    for (const workstream of hub.workstreams.filter((w) => w.external.some((l) => l.system === system && l.key === key))) {
+      if (workstream.status === 'shipped' || workstream.status === 'dropped') continue;
+      if (hub.tasks.some((t) => t.workstream === workstream.id && t.status === 'in_progress')) {
+        const what = system === 'github' ? 'its milestone' : 'its epic';
+        ask(
+          undefined,
+          `${tracker}: ${key} needs a decision`,
+          `upstream closed ${what}, but "${workstream.name}" still has a task in progress, so a sync does not mark it shipped`,
+          url,
+        );
+        continue;
+      }
+      workstream.status = 'shipped';
+      hub.append(member, { type: 'workstream_changed', data: { workstream: workstream.id, status: 'shipped', health: workstream.health } });
+      counts.applied++;
+    }
+  }
+
+  for (const pr of read.merged) {
     for (const key of pr.closes) {
       const task = mirrored(key);
       if (task === undefined || pr.url === '') continue;
@@ -826,8 +920,8 @@ function sync(hub: Hub, rec: Record): void {
       counts.applied++;
     }
   }
-  status.problems = upstream.problems;
+  status.problems = read.problems;
   status.last_run = counts;
   delete status.rate_limited_until;
-  if (upstream.problems.length === 0) status.last_success_at = Date.now();
+  if (read.problems.length === 0) status.last_success_at = Date.now();
 }

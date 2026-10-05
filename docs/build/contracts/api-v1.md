@@ -562,7 +562,7 @@ arrive, so the data layer refetches them when the activity they cover changes:
 - Keys: `['recaps', 'blocks', filters]` and `['recaps', 'days', { workstream } | { project }, tz]`.
 - On each `events` frame, for each event:
   - `machine_added`, `machine_liveness`, `persona_saved`, `team_saved`, `project_created` and
-    `brief_proposed` are not activity: they change no recap.
+    `brief_proposed` and `safety_changed` are not activity: they change no recap.
   - `member_added` may rename someone a line names: invalidate every `['recaps']` key.
   - Any other event: find its scope as the activity route's filters would. That is the session,
     task, workstream and project it names, plus their parents from the cache (a session's task and
@@ -691,7 +691,7 @@ tokens only** (an agent token gets `403`, before anything else is checked). Type
 | `GET /v1/integrations` | → `Integration[]` | Oldest first. |
 | `POST /v1/integrations` | `NewIntegration` → `Integration` (201) | See below. |
 | `GET /v1/integrations/{id}` | → `Integration` | |
-| `DELETE /v1/integrations/{id}` | → 204 | Forgets the connection, its stored credential and its sync state. Links on workstreams stay, as plain links. |
+| `DELETE /v1/integrations/{id}` | → 204 | Forgets the connection, its stored credential and its sync state. Links on workstreams stay, as plain links. A sync of it under way applies nothing more and keeps no state. |
 | `POST /v1/integrations/{id}/test` | → `IntegrationCheck` | Reads upstream once with the credential (see below). Changes nothing. |
 | `POST /v1/integrations/{id}/sync` | → `Integration` (202) | Syncs now, in the background; `status.running` is `true` until it ends. |
 | `PUT /v1/integrations/{id}/credential` | `{ "secret": String }` → 204 | Stores the secret. See "Credentials". |
@@ -702,22 +702,27 @@ tokens only** (an agent token gets `403`, before anything else is checked). Type
 - `settings` is tagged by `kind`:
   - `{ "kind": "github", "repos": String[], "api_base"?: String }`: 1–50 distinct `owner/repo`
     (GitHub's characters, as for links). `api_base` is a GitHub Enterprise Server API root
-    (`https://ghe.example.com/api/v3`); absent means `https://api.github.com`.
+    (`https://ghe.example.com/api/v3`); absent means `https://api.github.com`, and that root given
+    explicitly is kept as absent.
   - `{ "kind": "jira", "deployment": "cloud" | "data_center", "site": String, "projects":
     String[], "email"?: String, "epic_link_field"?: String }`: `site` is the Jira root
     (`https://jira.example.com`, a path allowed for Data Center); 1–50 distinct project keys;
     `email` (1–254 characters with an `@`) is required for `cloud` and refused for
     `data_center`; `epic_link_field` is `customfield_<digits>` (Data Center's epic link).
   - Every URL is `https://`, at most 2 KiB, with no user name, password, query or fragment.
-- `credential`: `gh_cli` (GitHub only) reads `gh auth token` (with `--hostname` for Enterprise)
-  on the hub's machine at each sync and keeps nothing; `stored` waits for a secret
-  (`PUT …/credential`).
+- `credential`: `gh_cli` (GitHub only) reads `gh auth token --hostname <host>` on the hub's
+  machine at each sync and keeps nothing. The host is always named (`github.com`, or the
+  Enterprise server's), and `GH_HOST` is cleared for `gh`, so its default host never decides
+  which token is sent where. `stored` waits for a secret (`PUT …/credential`).
 - `interval_minutes` is 5–1440; default 15.
-- A repository, or a Jira site and project, already in another integration is `409 conflict`.
-  Anything else malformed is `400 invalid`.
-- The hub acts through a member of its own, `@sync` (an agent of the person who added the first
-  integration, named "Tracker sync"; `@tracker-sync` when `@sync` is taken), added with
-  `member_added` on the first `POST`. Everything a sync changes is authored by it.
+- A repository or Jira project already in another integration is `409 conflict`, on any host:
+  workstream links and task sources name a repository or an issue key without its host, so the
+  same one on two hosts (github.com and an Enterprise server, or two Jira sites) would move each
+  other's tasks. Anything else malformed is `400 invalid`.
+- Each integration acts through a member of its own, owned by the person who added it: `@sync` (an
+  agent of that person, named "Tracker sync"), or `@tracker-sync` when `@sync` is another person's,
+  added with `member_added` on that person's first `POST`. When both handles are other people's,
+  the `POST` is `409 conflict`. Everything a sync changes is authored by its integration's member.
 
 `Integration`: `{ "id", "name", "settings", "credential": { "source": "gh_cli" | "stored",
 "stored": bool }, "interval_minutes", "added_by": MemberId, "added_at": ms, "status":
@@ -756,15 +761,22 @@ passed.
 **What a sync does.** On a timer (`interval_minutes`, the first one soon after the hub starts or
 the integration is added) and on `POST …/sync`, one integration at a time:
 - It reads each scope incrementally (`ETag`s and `since` on GitHub, an `updated` cursor in JQL on
-  Jira), and stops at a rate limit until it lifts (`rate_limited_until`).
+  Jira), and stops at a rate limit until it lifts (`rate_limited_until`). Only what changed
+  upstream since the last read acts: a field, a move or a shipped workstream a person changed in
+  the hub stays as they left it until upstream changes again.
+- It reaches GitHub and Jira directly, or through the `http://` proxy `HTTPS_PROXY` names (not for
+  the hosts `NO_PROXY` names), with `CONNECT`: TLS stays end to end, so the proxy never sees a
+  credential.
 - **Issues become tasks only in a linked scope.** An open issue whose milestone (GitHub) or epic
   (Jira) a workstream links becomes a task in that workstream; otherwise one whose repository or
-  Jira project a workstream links. Issues in no linked scope, and issues already closed when first
-  seen, are skipped (`skipped`). The task's `source` is the issue, its status `todo`.
+  Jira project a workstream links. So does an open issue a later sync finds moved into a milestone
+  or under an epic that routes to a workstream this way. Issues in no linked scope, and issues
+  already closed when first seen, are skipped (`skipped`). The task's `source` is the issue, its
+  status `todo`.
 - **Field owners** (the tables are in "Outward writes"). Title, description and labels belong to
-  upstream: an upstream change overwrites them (`task_updated`). The assignee belongs to the hub.
-  A change of milestone or epic moves the task to the workstream that links the new one (in the
-  same project); otherwise it stays.
+  upstream: an upstream change overwrites them (`task_updated`). The assignee belongs to the hub. A
+  change of milestone or epic moves the task to the workstream that links the new one (in the same
+  project); otherwise it stays.
 - **Moves follow `can_move(.., sync)`.** An upstream close moves the task to `done`, a reopen moves
   a done task to `todo` (`task_moved`, mover `sync`). In-progress work is never touched: a move the
   rules refuse becomes an ask instead (a **conflict**, below).
@@ -788,10 +800,12 @@ the integration is added) and on `POST …/sync`, one integration at a time:
   choice never hides it. Those routes, like these, are device tokens only.
 
 **The mock** answers every route over the recorded fixtures in `apps/mock-hub/fixtures/`
-(`example-org/demo-repo` on GitHub, project `DEMO` on `https://jira.example.com`), syncs at once
-on `POST …/sync`, and keeps credentials in memory only. The daemon reads them the same way when
-started with the hidden `--integration-fixtures <dir>` (tests only; it then never reaches the
-network).
+(`example-org/demo-repo` on GitHub, project `DEMO` on `https://jira.example.com`), or the folder
+`startServer({ integrationFixtures })` names, syncs at once on `POST …/sync`, and keeps credentials
+in memory only. The daemon reads them the same way when started with the hidden
+`--integration-fixtures <dir>` (tests only; it then never reaches the network). Both read the
+folder again at each sync, so a test changes what upstream says by adding a file whose name sorts
+first.
 
 ### Outward writes: every one approved first
 
@@ -954,3 +968,53 @@ sent write changes the mock's copy of upstream, so its next sync agrees. The dae
   hub shutting down, 1011 failure, and 1009 a client message over 4 KiB.
 - The mock echoes input back and replays a short canned screen. It does not send WebSocket Pings
   yet, and its message limit is 1 MiB on both sockets.
+
+## Onboarding hooks and safety
+
+All routes below are **device only** (agents receive 403). Hook routes act on the hub's own
+machine (remote-hub onboarding is out of scope): an unknown machine is 404; another registered
+machine is 501 `unsupported`. They never access CLI logins or log configuration contents.
+
+- `POST /v1/machines/{id}/hooks/diff` → 200 `HooksDiff`: `{revision, files, engines}`.
+  Each file is `{path, before: string|null, after: string}`; each engine is
+  `{engine, status, detail}`. CLIs found on PATH or from their homes are planned, with the
+  same installer and automatic Claude hook-form selection as `pitcrew hooks install`.
+  Foreign Codex notify commands conflict; chaining is not enabled. No writes occur.
+- `POST /v1/machines/{id}/hooks/install` with `{revision}` → 200 `{installed: boolean, skipped: string[]}`.
+  The revision identifies a server-retained plan belonging to the requesting person, valid
+  for ten minutes. No paths or replacement text are accepted from the request. All files are
+  checked against the preview before applying; conflicting engines are skipped. A changed file, expired or
+  unknown revision is 409 `conflict`. Repeating a successful apply is a no-op while every file
+  still matches the installed result. Atomic writes and private timestamped backups use the
+  CLI installer. Multi-file application is not transactional: an I/O failure may leave a
+  partially installed plan; retry resumes unchanged/already-applied files, or request a new diff.
+  At most 32 previews and 16 MiB of retained configuration text are held at once; older previews
+  can be evicted. Config files larger than 1 MiB are refused for this API.
+- `GET /v1/safety` → 200 `SafetySettings`.
+- `PUT /v1/safety` with `SafetySettings` → 200 the saved settings. Shape:
+  `{permission_mode: "default"|"plan"|"accept_edits"|"bypass_permissions",
+  back_office_enabled: boolean, back_office_caps: {max_auto_accept_per_hour: integer 0..100}}`.
+  Defaults are `default`, `false`, and 20. Saving `bypass_permissions` is refused with 400
+  while the runner disallows it; the wizard shows this option disabled with the reason. Changes append `safety_changed {settings}`;
+  identical saves append nothing. A projection rebuild and daemon restart retain the settings.
+
+  New sessions without an explicit `permission_mode` use the saved workspace default.
+  Saving safety settings immediately limits back-office task completion and automatic brief
+  acceptance; other office actions retain their existing rules and caps. Before the first
+  explicit safety save, existing hubs retain their per-task automatic acceptance policy.
+  The hourly acceptance count is derived from the authored log and survives restarts. A capped
+  task completion is refused; a brief is still proposed for a person to accept.
+
+Safety uses `model::PermissionMode` on the wire. Saving `bypass_permissions` is
+currently refused with 400 because the runner does not allow it. Session starts
+and dispatches without a persona mode use the saved workspace default. Before
+the first save, GET safety adds `saved: false`: legacy per-task acceptance policy
+remains effective until an explicit policy is saved. Stored safety events accept
+unknown fields for forward replay; PUT requests reject unknown fields.
+
+Hook installation applies nonconflicting engine plans, returning
+`{installed: boolean, skipped: string[]}`; `installed` is false when the preview
+has no changes. Conflicting engines are excluded from preview files and skipped,
+with their status shown to the person. CLI homes also establish engine presence
+when a GUI process lacks CLI binaries on PATH. The desktop ships `pitcrew` beside
+`pitcrewd`, and the Hooks step disables Install when there are no file changes.

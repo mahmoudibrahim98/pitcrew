@@ -2,7 +2,7 @@
 # Builds the desktop installers for one OS with Tauri's bundler, carrying everything the app needs
 # to work out of the box:
 #
-# - pitcrewd, pitcrew-ptyd and pitcrew-askpass next to the app's executable (Tauri's
+# - pitcrewd, pitcrew, pitcrew-ptyd and pitcrew-askpass next to the app's executable (Tauri's
 #   `externalBin`: /usr/bin in the .deb and the AppImage, Contents/MacOS, the install folder);
 # - helpers/ in the app's resources: the remote helpers under their Platform::artefact() names
 #   and their manifest.json;
@@ -15,7 +15,7 @@
 #   TARGET        x86_64-unknown-linux-gnu (deb, rpm, AppImage), universal-apple-darwin (app, DMG) or
 #                 x86_64-pc-windows-msvc (NSIS). Run it on that OS.
 #   --dist        build-release.sh's output, from the same commit (default: dist). It holds
-#                 pitcrewd, pitcrew-ptyd and pitcrew-askpass for TARGET's OS (on Linux the static
+#                 pitcrewd, pitcrew, pitcrew-ptyd and pitcrew-askpass for TARGET's OS (on Linux the static
 #                 x86_64 musl builds), and the three helpers: pitcrewd-x86_64-unknown-linux-musl,
 #                 pitcrewd-aarch64-unknown-linux-musl and pitcrewd-universal-apple-darwin.
 #   --stage       Where the bundle's inputs go (default: dist/desktop-stage). It must be inside
@@ -69,7 +69,7 @@ case "$target" in
 esac
 bundles=${bundles:-$default_bundles}
 
-sidecars=(pitcrewd pitcrew-ptyd pitcrew-askpass)
+sidecars=(pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass)
 # pitcrew_remote::Platform::artefact(), in the order `sort` gives.
 helpers=(pitcrewd-aarch64-unknown-linux-musl pitcrewd-universal-apple-darwin
   pitcrewd-x86_64-unknown-linux-musl)
@@ -173,6 +173,7 @@ cat >"$stage/tauri.bundle.json" <<EOF
   "bundle": {
     "externalBin": [
       "$rel/bin/pitcrewd",
+      "$rel/bin/pitcrew",
       "$rel/bin/pitcrew-ptyd",
       "$rel/bin/pitcrew-askpass"
     ],
@@ -187,6 +188,8 @@ cat >"$stage/tauri.bundle.json" <<EOF
   }
 }
 EOF
+
+node packaging/updater-config.mjs "$stage/tauri.bundle.json"
 
 echo "staged in $stage: pitcrewd $version"
 echo "PITCREW_HELPERS_MANIFEST=$manifest"
@@ -264,4 +267,19 @@ done
 if [ "$found" -eq 0 ]; then
   echo "::error::Tauri produced no installer in $bundle_dir" >&2
   exit 1
+fi
+
+# Copy the macOS updater archive (the DMG is only the initial installer).
+for f in "$bundle_dir"/macos/*.app.tar.gz; do
+  [ -f "$f" ] || continue
+  cp "$f" "$out/"
+done
+# Sign the final bytes, AFTER AppImage mode repair. Never copy a pre-repair signature.
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  for f in "$out"/*.AppImage "$out"/*.app.tar.gz "$out"/*-setup.exe; do
+    [ -f "$f" ] || continue
+    update_version=$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1])).version" "$stage/tauri.bundle.json")
+    "${tauri[@]}" signer sign --app-version "$update_version" "$f"
+    [ -s "$f.sig" ] || { echo "::error::missing updater signature" >&2; exit 1; }
+  done
 fi

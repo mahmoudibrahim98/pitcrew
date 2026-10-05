@@ -553,6 +553,16 @@ async fn start(
             "a session starts in a folder that members of its group can change"
         );
     }
+    let permission_mode = match start.permission_mode {
+        Some(mode) => mode,
+        None => {
+            let work = Arc::clone(&sessions.work);
+            bounded(move || work.safety())
+                .await?
+                .map_err(work_error)?
+                .permission_mode
+        }
+    };
     let name = window_name(start.engine, &folder.path);
     // For an agent or a task, the hub stores the session first, and the CLI is started under it.
     let recorded = if start.agent.is_some() || start.task.is_some() {
@@ -580,7 +590,7 @@ async fn start(
         persona: start.persona,
         model: start.model,
         account: None,
-        permission_mode: start.permission_mode.unwrap_or_default(),
+        permission_mode,
         session: recorded.as_ref().map(|s| s.id),
     };
     if let Some(session) = recorded {

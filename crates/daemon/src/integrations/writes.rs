@@ -6,15 +6,17 @@
 //!   (`integrations.json`'s `writes_rev`; the log's end the first time). A `task_moved` across the
 //!   open/closed line, or a `task_updated` of a field upstream owns (the crates' ownership tables,
 //!   [`pitcrew_sync_github::outward`]), on a task that mirrors an issue an integration syncs, and
-//!   authored by anyone but the sync, becomes a proposal: an approval ask and `write_proposed`
-//!   (`SyncCommands::propose_write`, once per cause). `before` is upstream's value as the last
+//!   authored by anyone but a sync (any integration's own member), becomes a proposal: an approval
+//!   ask from that integration's member and `write_proposed` (`SyncCommands::propose_write`, once
+//!   per cause). `before` is upstream's value as the last
 //!   sync read it; nothing is proposed when upstream already has the value.
 //! - **Requests** ([`Integrations::request_write`]): a person asks to create an issue from a task,
 //!   or to comment on its issue. Also only a proposal.
 //! - **The executor** ([`Integrations::settle_writes`]) acts on answered approvals. A denied write
 //!   is recorded as not sent. An approved one (or a failed one a person retries) is checked
 //!   against the task as it is now, started (`write_started`, which hub-work allows only for the
-//!   sync's own approval ask answered "Send" by a person), sent once with the integration's
+//!   approval ask of the integration's own member, answered "Send" by a person), sent once with the
+//!   integration's
 //!   credential, and finished (`write_finished`). A write still `sending` when a pass begins was
 //!   cut off (the hub stopped): it is finished as failed and never sent again by itself.
 //!
@@ -467,18 +469,26 @@ impl Integrations {
     /// stopped.
     pub(super) async fn plan_writes(&self) {
         let Ok(work) = self.work() else { return };
-        let (records, member, from) = {
+        let (records, from) = {
             let saved = lock(&self.saved);
-            (
-                saved.integrations.clone(),
-                saved.sync_member,
-                saved.writes_rev,
-            )
+            (saved.integrations.clone(), saved.writes_rev)
         };
+        let mut members = HashMap::new();
+        for record in &records {
+            match self.member_of(record).await {
+                Ok(member) => {
+                    members.insert(record.id, member);
+                }
+                Err(problem) => {
+                    tracing::warn!(integration = %record.id, problem = %problem.message, "no sync member to propose writes as");
+                }
+            }
+        }
         let files = self.files.clone();
-        let planned =
-            tokio::task::spawn_blocking(move || plan_from(&work, &files, &records, member, from))
-                .await;
+        let planned = tokio::task::spawn_blocking(move || {
+            plan_from(&work, &files, &records, &members, from)
+        })
+        .await;
         let to = match planned {
             Ok(Ok(to)) => to,
             Ok(Err(e)) => {
@@ -499,9 +509,6 @@ impl Integrations {
     /// Acts on answered approvals and asked-for retries (see the [module docs](self)).
     pub(super) async fn settle_writes(&self) {
         let Ok(work) = self.work() else { return };
-        let Some(member) = lock(&self.saved).sync_member else {
-            return;
-        };
         let filter = WriteFilter {
             task: None,
             states: vec![
@@ -522,6 +529,9 @@ impl Integrations {
             }
         };
         for write in waiting {
+            let Some(member) = self.proposer(&work, &write).await else {
+                continue;
+            };
             match write.state {
                 WriteState::Sending => {
                     self.finish(
@@ -557,7 +567,7 @@ impl Integrations {
                     )
                     .await;
                 }
-                WriteState::Approved => self.send_write(&work, member, write).await,
+                WriteState::Approved => self.send_write(&work, write).await,
                 _ => {}
             }
         }
@@ -570,9 +580,24 @@ impl Integrations {
             if let Ok(Ok(write)) = found
                 && write.state == WriteState::Failed
             {
-                self.send_write(&work, member, write).await;
+                self.send_write(&work, write).await;
             }
         }
+    }
+
+    /// The member that proposed `write`: its integration's sync member while it is connected,
+    /// else the one its approval ask came from.
+    async fn proposer(&self, work: &Arc<WorkService>, write: &UpstreamWrite) -> Option<MemberId> {
+        if let Ok(record) = self.record(&write.proposal.integration) {
+            return self.member_of(&record).await.ok();
+        }
+        let work = Arc::clone(work);
+        let ask = write.proposal.ask;
+        tokio::task::spawn_blocking(move || work.ask(&ask))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|a| a.from)
     }
 
     async fn finish(
@@ -603,7 +628,12 @@ impl Integrations {
     }
 
     /// Sends one approved (or retried) write: checks it, starts it, sends it once, finishes it.
-    async fn send_write(&self, work: &Arc<WorkService>, member: MemberId, write: UpstreamWrite) {
+    /// It starts only as its integration's own sync member, so hub-work refuses an approval ask
+    /// any other member raised.
+    async fn send_write(&self, work: &Arc<WorkService>, write: UpstreamWrite) {
+        let Some(member) = self.proposer(work, &write).await else {
+            return;
+        };
         let ask = write.proposal.ask;
         let record = self.record(&write.proposal.integration).ok();
         let stale = {
@@ -707,10 +737,13 @@ impl Integrations {
         new: NewWrite,
     ) -> Result<UpstreamWrite, Refusal> {
         let work = self.work()?;
-        let (records, member) = {
-            let saved = lock(&self.saved);
-            (saved.integrations.clone(), saved.sync_member)
-        };
+        let records = lock(&self.saved).integrations.clone();
+        let mut members = HashMap::new();
+        for record in &records {
+            if let Ok(member) = self.member_of(record).await {
+                members.insert(record.id, member);
+            }
+        }
         let caller = *caller;
         tokio::task::spawn_blocking(move || -> Result<UpstreamWrite, Refusal> {
             let invalid = |m: String| Refusal::new(ErrorCode::Invalid, m);
@@ -828,7 +861,9 @@ impl Integrations {
                     ));
                 }
             };
-            let member = member.ok_or_else(|| conflict("No integration is connected."))?;
+            let member = *members
+                .get(&record.id)
+                .ok_or_else(|| conflict("The integration's sync member cannot be found."))?;
             let handle = work
                 .member(&caller.member)
                 .map_or_else(|_| "a person".to_owned(), |m| m.handle);
@@ -889,22 +924,23 @@ impl Integrations {
     }
 }
 
-/// Plans from the log after `from` (or starts at its end), returning where it got to.
+/// Plans from the log after `from` (or starts at its end), returning where it got to. `members`
+/// holds each integration's own sync member: their changes came from upstream, so none of them
+/// is ever proposed back.
 fn plan_from(
     work: &WorkService,
     files: &Files,
     records: &[Record],
-    member: Option<MemberId>,
+    members: &HashMap<IntegrationId, MemberId>,
     from: Option<u64>,
 ) -> pitcrew_hub_work::Result<u64> {
     let latest = work.store().latest_rev()?;
-    let (Some(from), Some(member)) = (from, member) else {
+    let Some(from) = from else {
         return Ok(latest);
     };
     if records.is_empty() {
         return Ok(latest);
     }
-    let commands = work.sync_commands(member)?;
     let mut states = States::default();
     let mut at = from;
     while at < latest {
@@ -914,7 +950,7 @@ fn plan_from(
         };
         for stored in page {
             let event = &stored.event;
-            if event.author == member {
+            if members.values().any(|m| *m == event.author) {
                 continue;
             }
             let task_id = match &event.body {
@@ -951,7 +987,13 @@ fn plan_from(
                 .map_or_else(|_| "someone".to_owned(), |m| m.handle);
             let why = because(&event.body, &handle, &task);
             let (title, body) = ask_text(&draft.write, &task.key.to_string(), &why);
-            if let Err(e) = commands.propose_write(draft.to, draft.write, &title, &body) {
+            let Some(member) = members.get(&record.id) else {
+                continue;
+            };
+            let proposed = work
+                .sync_commands(*member)
+                .and_then(|c| c.propose_write(draft.to, draft.write, &title, &body));
+            if let Err(e) = proposed {
                 tracing::warn!(error = %e, task = %task.key, "cannot propose an outward write");
             }
         }

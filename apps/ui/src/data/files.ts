@@ -24,3 +24,6 @@ export function fileClient(api: Api, workstream: string, location: number) {
     }),
   };
 }
+
+/** The files routes for one workstream location, as `fileClient` makes them. */
+export type FileClient = ReturnType<typeof fileClient>;

@@ -364,6 +364,7 @@ export interface Event {
 
 /** What happened. On the wire: `{"type": "task_moved", "data": {…}}`. */
 export type EventBody =
+  | { type: 'safety_changed'; data: { settings: import('./onboarding.ts').SafetySettings } }
   | { type: 'cursor_moved'; data: { scope: string; rev: number } }
   | { type: 'machine_liveness'; data: { machine: MachineId; liveness: Liveness } }
   | { type: 'session_discovered'; data: { session: Session } }

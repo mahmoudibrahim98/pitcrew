@@ -20,6 +20,7 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `virtual-list.tsx` | Lists over 60 items render through TanStack Virtual, and scroll to an item on request. |
 | `task-drawer.tsx` | `TaskDrawer` (Radix dialog) and `TaskDetail`: fields, subtasks (agent-plan lines read-only), agent run, dependencies, comments with @mentions, Work (the task's blocks of work, `WorkBlocks`), history. `TaskDetail`'s `combineHeading` shows "KEY · Title" as one heading, for the task page. |
 | `task-page.tsx`, `project-page.tsx`, `workstream-page.tsx` | The routed pages: a task on its own page (not a dialog — see "The task page" below), and a project/workstream with a header and tabs (state, not the URL). |
+| `files.tsx`, `file-viewer.tsx`, `highlight.ts`, `pdf-view.tsx` | The workstream page's Files tab, and its viewer and folder tree, shared with the console's workbench: coloured text, images, PDFs, edit and save. See "Files" below. |
 | `my-tasks.tsx`, `projects-list.tsx`, `members.tsx` | My tasks (the board filtered to me), the projects list, and members (people and agents, owners shown). |
 | `new-task.tsx` | `NewTaskDialog`: the "+ New" → "Task" item, replacing the shell's placeholder. |
 | `inbox.tsx` | `Inbox`: open asks to me by kind, answered in place with stream M's `QuestionCard` (`src/console`); receipts and the task link are the Inbox's own, shown alongside it. |
@@ -38,7 +39,7 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `timeline.tsx`, `scheduled-task.tsx`, `schedule.css` | Project Timeline: workstream rows on a shared week/month axis, exact due-date labels, a today line, undated tasks apart, and status symbols and borders. Scrolling stays in the timeline; task buttons open the drawer and regain focus when it closes. |
 | `people.tsx`, `ui.tsx` | Avatars; small shared pieces (candidates for `src/design`). |
 | `writes/` | Outward writes to GitHub and Jira (api-v1.md, "Outward writes"): `api.ts` (`writeClient`, `useTaskWrites`, `useWriteOf`, `useWriteActions`, `fieldRows`), `approval-card.tsx` (`ApprovalCard`, `WriteDiff`: an approval in the Inbox, field by field, with Send and Don't send) and `task-writes.tsx` (`TaskWrites`, the drawer's Upstream section). See "Outward writes" below. |
-| `integrations/` | GitHub and Jira (api-v1.md, "Integrations"; a sync only reads upstream): `api.ts` (the wire types, `integrationClient`, `useIntegrations`, `useIntegrationActions`), `integrations-page.tsx` (Settings › Integrations at `settings/integrations`: connect, credential, test, sync now, status and problems, linked workstreams, remove) and `workstream-links.tsx` (the workstream page's links upstream and their last sync, and the dialog that links or unlinks them). See "Integrations" below. |
+| `integrations/` | GitHub and Jira (api-v1.md, "Integrations"; read-only upstream): `api.ts` (the wire types, `integrationClient`, `useIntegrations`, `useIntegrationActions`, `useStoreCredential`, and the links' `githubWebRoot`, `scopesOf` and `narrowerScope`), `integrations-page.tsx` (Settings › Integrations at `settings/integrations`: connect, credential, test, sync now, status and problems, linked workstreams, remove) and `workstream-links.tsx` (the workstream page's links upstream and their last sync, and the dialog that links or unlinks them). See "Integrations" below. |
 
 ## Integrations
 
@@ -48,13 +49,17 @@ none of this folder lands in the initial bundle until a projects route is visite
   warnings about a credential that can do more than read. Connecting GitHub offers `gh auth token`
   on the hub's machine or a token entered next; Jira always takes a stored secret.
 - **Secrets.** The token field is an uncontrolled password input: on Save its value goes to
-  `integrationClient(api).storeCredential` once and the field is cleared, so no React state, query
-  cache or mutation result holds it (tested). In the desktop app the transport's
+  `integrationClient(api).storeCredential` once, through `useStoreCredential` (which keeps only
+  whether it is under way and its error, not a TanStack mutation, whose `variables` the mutation
+  cache would keep), and the field is cleared, so no React state, query or mutation cache holds it
+  (tested). In the desktop app the transport's
   `storeCredential` is the gateway's own command (`gateway_integration_credential`), never
   `gateway_request`; in a browser (development) it is `PUT …/credential`.
 - **Links.** A workstream's header shows its links (with the upstream title once synced) and its
   integration's last sync; "Edit links" picks a connected repository or Jira project, optionally
-  narrowed to a milestone number or an epic key, and `PATCH`es the full list. `workstream_linked`
+  narrowed to a milestone number or an epic key of that project (anything else is refused before
+  it is sent), and `PATCH`es the full list. Links point at the integration's own web host: an
+  Enterprise server's origin, not `github.com` (`githubWebRoot`). `workstream_linked`
   refreshes the workstream and the integrations. The list polls every 30 s (2 s while one syncs):
   a sync's status has no event of its own.
 
@@ -170,11 +175,32 @@ page (stream M's, which this stream does not edit).
 ## Files
 
 The workstream page's Files tab uses `src/data/files.ts` through the shared transport.
+Its viewer and folder tree are `file-viewer.tsx`, shared with the console's workbench
+(`index.ts` exports `FileViewer` and `FileTree` lazily).
 Folders load one level at a time; links stay closed, and capped listings are marked.
 Up/Down and Home/End move between folder controls; Left/Right close/open folders.
-Files show literal UTF-8 text with line numbers, PNG/JPEG images, or a byte count.
+Files show literal UTF-8 text with line numbers, PNG/JPEG images, PDFs, or a byte count.
 Images use local Blob object URLs, revoked when the preview changes or unmounts;
 SVG files stay binary.
+
+- **Colouring** (`highlight.ts`): a small tokenizer of our own, no dependency. Each language
+  is a list of sticky regular expressions; the tokens are kinds and text, rendered as React
+  text, so a file never becomes markup. The file's name picks the language (TypeScript and
+  JavaScript, JSON, Rust, Go, C and C++, Java and the like, Python, R, Julia, Ruby, Lua, shell,
+  TOML and INI, YAML, Markdown, TeX, CSS, HTML and XML, SQL, diffs, Dockerfiles, Makefiles);
+  anything else, or a file over 200,000 characters, stays plain. The colours are the tokens'
+  (`accent-text`, `ok`, `warn`, `risk`, `ink-2`) on the card background, 4.5:1 or better in
+  both themes. Over 2,000 lines only the lines in view are drawn.
+- **PDFs** (`pdf-view.tsx`, a lazy chunk): pdf.js's legacy build (`pdfjs-dist`; the modern
+  build needs newer JavaScript than our webviews have) draws each page on a canvas as it comes
+  into view, with zoom. Only pages are drawn: no annotation, form or link layer, so nothing in
+  a file can navigate, run script or reach the network. It fits the desktop CSP as it is: pdf.js
+  parses in a worker where one may run, and the same bundled script on the page under the
+  desktop's `worker-src 'none'`; WebAssembly is off (`useWasm: false`), so JPEG 2000 and JBIG2
+  images, rare outside scans, do not show; fonts load from the file's bytes, never a URL.
+- **Edits kept elsewhere.** `FileViewer` keeps its own unsaved edit, or takes one from its caller
+  (`draft`, `onDraftChange`) with the revision it was read at, so the workbench can unmount a tab
+  without losing it; the save still sends that revision.
 Text edits send the revision read. Conflicts keep the draft: Reload discards it after
 confirmation, while Overwrite reads the latest revision before trying another write.
 Unsaved edits ask before changing files, locations or workstream tabs, and warn on
@@ -182,7 +208,9 @@ route navigation and browser unload. A write in progress prevents switches and
 route navigation, and warns on unload. Remote locations show
 the API's unsupported state. No file contents enter the shared query cache.
 
-`tests/files.test.tsx` covers lazy folders, safe viewers, errors and revisions.
+`tests/files.test.tsx` covers lazy folders, safe viewers, errors and revisions;
+`tests/file-viewer.test.tsx` colouring, long files, PDFs (pdf.js mocked) and kept edits;
+`tests/highlight.test.ts` the tokenizer (every character kept, the common constructs coloured).
 `tests/e2e/files.spec.ts` seeds an image through the mock API, then browses, edits,
 saves and resolves a conflict, with keyboard and axe checks in both themes.
 

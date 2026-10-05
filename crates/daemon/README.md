@@ -68,7 +68,7 @@ in the log when used (see "Terminals"):
 | `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `agents/<agent id>.token` | An agent token for each agent whose CLI the runner started (a dispatch's, or `POST /v1/sessions` with `agent`), bound to that agent and its owner, `pca_…`. The CLI is given its path (`PITCREW_TOKEN_FILE`), never the token. Minted once, reused while it verifies as exactly that. The folder is 0700, each file 0600. |
-| `integrations.json` | The GitHub and Jira connections (never a secret), the tracker sync's member (`@sync`), each connection's last sync status, the upstream titles of linked milestones and epics, and how far the outward-write planner has read the log (`writes_rev`). Private. |
+| `integrations.json` | The GitHub and Jira connections (never a secret), each connection's sync member (`@sync` or `@tracker-sync`, an agent of the person who added it) and last sync status, the upstream titles of linked milestones and epics, and how far the outward-write planner has read the log (`writes_rev`). Private. |
 | `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream; never in the event log) and its stored secret, when it has one. The folder is 0700 (an owner-only DACL on Windows), each file 0600. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
@@ -1109,12 +1109,14 @@ and handed back, not kept, once it has.
 GitHub and Jira (api-v1.md, "Integrations" and "Outward writes"; `src/integrations/`). A sync only
 reads; a write goes upstream only after a person approves it:
 
-- **Connections** live in `integrations.json`, never in the event log. The first one adds the
-  tracker sync's member (`@sync`, an agent of the person; hub-work's `ensure_sync_member`), which
-  authors everything a sync changes.
-- **Credentials**: `gh auth token` (with `--hostname` for Enterprise), found on the daemon's
-  `PATH` (absolute folders only), checked with `pitcrew_trust::check_trusted`, run without a
-  terminal and read at each sync, never kept; or a secret stored by `PUT …/credential` in
+- **Connections** live in `integrations.json`, never in the event log, each with its own sync
+  member: `@sync` (or `@tracker-sync`), an agent of the person who added it (hub-work's
+  `ensure_sync_member`), which authors everything that connection's sync changes. A repository
+  or Jira project is in one connection at most, on any host (`validate::scope_keys`).
+- **Credentials**: `gh auth token --hostname <host>` (always named, `github.com` included, with
+  `GH_HOST` cleared), found on the daemon's `PATH` (absolute folders only), checked with
+  `pitcrew_trust::check_trusted`, run without a terminal and read at each sync, never kept; or a
+  secret stored by `PUT …/credential` in
   `integrations/<id>.secret` (`secret.rs`). A `Secret` prints as `Secret(***)`; no route returns
   one and nothing logs one (`tests/integrations.rs` checks every answer, the log at debug and the
   saved files).
@@ -1122,19 +1124,23 @@ reads; a write goes upstream only after a person approves it:
   at once when added) and on `POST …/sync`, one at a time. It reads upstream with
   `pitcrew-sync-github` / `pitcrew-sync-jira` over `http.rs`'s transport: HTTP/1.1 over rustls
   (`ring`, this machine's certificates), `https://` only, a 6 MiB body cap, 20 s to connect and 60 s
-  per request, a `User-Agent`, no proxy. `apply.rs` then applies the changes through hub-work's
-  `SyncCommands`: issues become tasks only in a linked scope (a workstream's link to the
-  milestone or epic, else the repository or project), issues closed before they were first seen
-  are skipped, upstream-owned fields are overwritten, moves follow `can_move(.., sync)`, a merged
-  pull request is noted on its task, a closed milestone or epic ships its workstreams, and every
-  refusal is a conflict ask. The sync state is saved after the changes are applied, so a stop in
-  between reads them again next time (every command is idempotent). A rate limit waits until it
-  lifts.
+  per request, a `User-Agent`; behind `HTTPS_PROXY` (an `http://` proxy) it tunnels with
+  `CONNECT`, except for the hosts `NO_PROXY` names (`proxy.rs`). `apply.rs` then applies the
+  changes through hub-work's `SyncCommands`: issues become tasks only in a linked scope (a
+  workstream's link to the milestone or epic, else the repository or project), when first read
+  open or when a later read moves them, open, into a linked milestone or epic (from that read's
+  snapshot); issues closed before they were first seen are skipped, upstream-owned fields are
+  overwritten, moves follow `can_move(.., sync)`, a merged pull request is noted on its task, a
+  closed milestone or epic ships its workstreams, and every refusal is a conflict ask. The sync
+  state is saved after the changes are applied, so a stop in between reads them again next time
+  (every command is idempotent). A connection removed during its sync applies nothing more, and
+  its state is not written back. A rate limit waits until it lifts.
 - When a repository's or project's links change, its issues (and, on GitHub, pull requests) are
   read again from the start at the next sync.
-- `--integration-fixtures <dir>` swaps the transport for recorded exchanges, answered by method
-  and URL (a `since=` cursor ignored), for tests: `tests/integrations.rs` and the conformance
-  runner. Writes are answered from the same files.
+- `--integration-fixtures <dir>` swaps the transport for recorded exchanges, answered by URL (a
+  `since=` cursor ignored) and read again for each request, for tests: `tests/integrations.rs`
+  and the conformance runner, which changes what upstream says by adding a file that sorts first.
+  Writes are answered from the same files.
 - **Outward writes** (`writes.rs`), on the same loop, before the syncs, woken by every append to
   the log:
   - the **planner** reads the log from `integrations.json`'s `writes_rev` (the log's end the first
@@ -1180,10 +1186,10 @@ reads; a write goes upstream only after a person approves it:
 - `--demo` through the setup path (the demo still seeds its own person, machine and name).
 - Remote machines (the desktop's side of the tunnel, and a supervisor of the local daemon), the
   Tauri shell, auto-start and installers.
-- Integrations: no HTTP proxy (`HTTPS_PROXY` is not read), no HTTP/2 or connection reuse.
-  Removing a connection keeps its workstream links as plain links; an approved write of a removed
-  connection is recorded as not sent. An approval that turns stale stays open in the Inbox until
-  answered (asks have no withdrawal event).
+- Integrations: no `https://` or SOCKS proxy and no `ALL_PROXY` (only an `http://` proxy from
+  `HTTPS_PROXY`), no HTTP/2 or connection reuse. Removing a connection keeps its workstream links
+  as plain links; an approved write of a removed connection is recorded as not sent. An approval
+  that turns stale stays open in the Inbox until answered (asks have no withdrawal event).
 - Scanning another machine of the workspace (`POST /v1/machines/{id}/scan` is `409` for one), and
   stopping a scan part-way: `pitcrew_ingest::scan` takes no cancel, so a scan whose client went
   away runs to its end. A cancel flag in its `ScanOptions` (stream A) would let the route stop it.
@@ -1210,3 +1216,14 @@ file-backups: private bounded originals before replacement (runner README, Works
 Responses use no-store and nosniff, and failures log counts and fixed reasons without paths.
 
 `import.json` holds the durable session inclusion choice, scoped to this state directory. `GET /v1/import`, `POST /v1/import/dry-run`, and `PUT /v1/import` are device-only. The runner keeps reading in place; the API visibility adapter hides excluded session events, and transcript/terminal reads return 404 for them.
+
+## Onboarding hooks and safety
+
+Device-only `POST /v1/machines/{id}/hooks/diff` previews hooks using the CLI installer for supported CLIs on PATH. `hooks/install` confirms that exact revision with stale-file checks and existing backups. Previews are person/machine-bound, expire after ten minutes, and are lost on restart. Config contents are never logged. Only this hub’s own machine is supported; other machines return 501. The installed `pitcrew` executable must be beside `pitcrewd` or on its PATH. `GET`/`PUT /v1/safety` persist workspace preferences; new sessions use the saved permission mode unless explicitly overridden.
+
+Onboarding review: hook previews detect supported CLIs on PATH or through their
+homes, skip conflicting engines while applying other changes, and report the
+skipped engines. No-change previews cannot set the wizard's installed flag.
+Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
+wire fields and the shared PermissionMode enum; bypass defaults are currently
+refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.

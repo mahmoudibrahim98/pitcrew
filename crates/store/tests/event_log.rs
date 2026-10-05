@@ -393,6 +393,8 @@ fn other_bodies() -> Vec<EventBody> {
         json!({"type": "write_finished", "data": {"ask": demo.asks[1].id,
             "task": demo.tasks[4].id, "result": {"outcome": "failed", "message": "Not Found",
             "status": 404}}}),
+        json!({"type": "safety_changed", "data": {"settings": {"permission_mode": "plan",
+            "back_office_enabled": true, "back_office_caps": {"max_auto_accept_per_hour": 10}}}}),
     ];
     bodies
         .into_iter()

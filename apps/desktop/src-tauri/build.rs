@@ -20,6 +20,11 @@ fn main() {
         "gateway_workspace_retry",
         "gateway_workspace_remove",
         "gateway_prompt_reply",
+        "gateway_update_status",
+        "gateway_update_check",
+        "gateway_update_channel",
+        "gateway_update_install",
+        "gateway_update_notes",
     ]);
     let attributes = tauri_build::Attributes::new().app_manifest(manifest);
     if let Err(e) = tauri_build::try_build(attributes) {

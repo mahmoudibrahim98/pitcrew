@@ -13,6 +13,10 @@ after a person approved it (`crates/daemon/src/integrations/`). The sync only se
   that links it (`MILESTONE_FIELD_OWNERSHIP`): the hub owns the name, and a closed milestone
   proposes `shipped` unless a task of the workstream is in progress (a conflict ask). This closes
   the earlier "milestones → workstreams" gap.
+- `SyncState::opened_from_snapshot(source, milestone)`: an open issue as a first read would report
+  it (`IssueOpened`), from the snapshot the last read kept. An `IssueMilestoned` change carries none
+  of the issue's fields, so this is how `pitcrewd` makes a task of an issue moved into a milestone
+  it follows.
 - `probe::probe(transport, config)`: `GET /repos/{owner}/{repo}` for each repository, reporting
   whether it is readable and whether the credential could write (push or admin rights, a classic
   token's broad scopes).

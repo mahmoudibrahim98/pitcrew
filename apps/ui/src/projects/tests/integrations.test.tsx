@@ -6,7 +6,7 @@ import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import axe from 'axe-core';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { createApi, useWorkstream, type Transport, type Workstream } from '../../data/index.ts';
-import { integrationClient, type Integration } from '../integrations/api.ts';
+import { githubWebRoot, integrationClient, narrowerScope, scopesOf, type Integration } from '../integrations/api.ts';
 import { IntegrationsPage, syncState } from '../integrations/integrations-page.tsx';
 import { LinkEditor, WorkstreamLinks } from '../integrations/workstream-links.tsx';
 import { Dialog, DialogContent } from '../../design/index.ts';
@@ -68,8 +68,15 @@ it('hands a Jira secret over once and never keeps or shows it', async () => {
   const one = (await integrationClient(otherClient(hub)).list()).find((i) => i.id === added.id);
   expect(one?.credential).toEqual({ source: 'stored', stored: true });
   expect(document.body.innerHTML).not.toContain(SECRET);
-  expect(JSON.stringify(view.queryClient.getQueryCache().getAll().map((q) => q.state.data))).not.toContain(SECRET);
-  expect(JSON.stringify(view.queryClient.getMutationCache().getAll().map((m) => m.state.data))).not.toContain(SECRET);
+  // Nothing in either cache holds it: no query's key or data, and no mutation's variables, data,
+  // error or context (a mutation keeps its variables until it is garbage-collected).
+  const queries = view.queryClient.getQueryCache().getAll().map((q) => ({ key: q.queryKey, state: q.state }));
+  expect(JSON.stringify(queries)).not.toContain(SECRET);
+  const mutations = view.queryClient
+    .getMutationCache()
+    .getAll()
+    .map((m) => ({ key: m.options.mutationKey, state: m.state }));
+  expect(JSON.stringify(mutations)).not.toContain(SECRET);
 });
 
 it('sends a secret through the transport’s own credential call when it has one', async () => {
@@ -117,6 +124,92 @@ it('links a workstream to a milestone and shows its last sync', async () => {
   fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
   await screen.findByRole('link', { name: /GitHub milestone 1 of example-org\/demo-repo/ });
   await screen.findByText(/last sync/);
+});
+
+it('links an Enterprise milestone on its own host and checks an epic’s project', async () => {
+  const client = integrationClient(otherClient(hub));
+  await client.add({
+    name: 'Enterprise',
+    settings: { kind: 'github', repos: ['example-org/ghe-repo'], api_base: 'https://ghe.example.com/api/v3' },
+    credential: 'gh_cli',
+  });
+  await client.add({
+    name: 'Demo Jira',
+    settings: { kind: 'jira', deployment: 'data_center', site: 'https://jira.example.com', projects: ['DEMO'] },
+    credential: 'stored',
+  });
+  renderWithHub(<LiveLinks id={demo.submission} />, hub);
+  fireEvent.click(await screen.findByRole('button', { name: 'Edit links' }));
+  const dialog = await screen.findByRole('dialog');
+  await within(dialog).findByRole('option', { name: 'GitHub repository example-org/ghe-repo' });
+  const narrower = () => within(dialog).getByRole('textbox');
+  fireEvent.change(narrower(), { target: { value: '3' } });
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Link' }));
+  await waitFor(async () => {
+    const after: Workstream = await otherClient(hub).workstream(demo.submission);
+    expect(after.external).toEqual([
+      { system: 'github', key: 'example-org/ghe-repo#milestone:3', url: 'https://ghe.example.com/example-org/ghe-repo/milestone/3' },
+    ]);
+  });
+
+  // An epic must be an issue of the chosen project: refused here, before anything is sent.
+  const jiraOption = within(dialog).getByRole('option', { name: 'Jira project DEMO' }) as HTMLOptionElement;
+  fireEvent.change(within(dialog).getByRole('combobox'), { target: { value: jiraOption.value } });
+  fireEvent.change(narrower(), { target: { value: 'OTHER-5' } });
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Link' }));
+  expect((await within(dialog).findByRole('alert')).textContent).toContain('An epic of DEMO is one of its issue keys, such as DEMO-5.');
+  expect((await otherClient(hub).workstream(demo.submission)).external).toHaveLength(1);
+  await within(dialog).findByText('GitHub milestone 3 of example-org/ghe-repo');
+  fireEvent.change(narrower(), { target: { value: 'demo-5' } });
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Link' }));
+  await waitFor(async () => {
+    const after: Workstream = await otherClient(hub).workstream(demo.submission);
+    expect(after.external.map((l) => [l.key, l.url])).toEqual([
+      ['example-org/ghe-repo#milestone:3', 'https://ghe.example.com/example-org/ghe-repo/milestone/3'],
+      ['DEMO-5', 'https://jira.example.com/browse/DEMO-5'],
+    ]);
+  });
+  // The links on the page point at the Enterprise server, not github.com.
+  fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
+  const shown = await screen.findByRole('link', { name: /GitHub milestone 3 of example-org\/ghe-repo/ });
+  expect(shown.getAttribute('href')).toBe('https://ghe.example.com/example-org/ghe-repo/milestone/3');
+});
+
+it('builds links from the integration’s own web host', () => {
+  expect(githubWebRoot(undefined)).toBe('https://github.com');
+  expect(githubWebRoot('https://api.github.com')).toBe('https://github.com');
+  expect(githubWebRoot('https://ghe.example.com/api/v3')).toBe('https://ghe.example.com');
+  expect(githubWebRoot('https://ghe.example.com:8443/api/v3')).toBe('https://ghe.example.com:8443');
+  const enterprise: Integration = {
+    id: 'i',
+    name: 'n',
+    settings: { kind: 'github', repos: ['example-org/demo-repo'], api_base: 'https://ghe.example.com/api/v3' },
+    credential: { source: 'gh_cli', stored: false },
+    interval_minutes: 15,
+    added_by: demo.sam,
+    added_at: 0,
+    status: { running: false, problems: [] },
+    links: [],
+  };
+  const [repo] = scopesOf(enterprise);
+  if (repo === undefined) throw new Error('no repository scope');
+  expect(repo.url).toBe('https://ghe.example.com/example-org/demo-repo');
+  expect(narrowerScope(enterprise, repo, '12')).toEqual({
+    system: 'github',
+    key: 'example-org/demo-repo#milestone:12',
+    url: 'https://ghe.example.com/example-org/demo-repo/milestone/12',
+  });
+  expect(typeof narrowerScope(enterprise, repo, 'v1')).toBe('string');
+  const jira: Integration = {
+    ...enterprise,
+    settings: { kind: 'jira', deployment: 'cloud', site: 'https://jira.example.com', projects: ['DEMO'], email: 'sam@example.com' },
+  };
+  const [project] = scopesOf(jira);
+  if (project === undefined) throw new Error('no project scope');
+  expect(narrowerScope(jira, project, 'DEMO-5')).toEqual({ system: 'jira', key: 'DEMO-5', url: 'https://jira.example.com/browse/DEMO-5' });
+  for (const bad of ['DEMOX-5', 'OTHER-5', 'DEMO-', 'DEMO-0', 'DEMO-5/../x']) {
+    expect(typeof narrowerScope(jira, project, bad), bad).toBe('string');
+  }
 });
 
 it('names a sync’s state', () => {

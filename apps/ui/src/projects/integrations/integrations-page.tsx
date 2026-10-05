@@ -11,6 +11,7 @@ import {
   describeScope,
   useIntegrationActions,
   useIntegrations,
+  useStoreCredential,
   type Integration,
   type IntegrationCheck,
   type JiraDeployment,
@@ -128,20 +129,20 @@ function ConnectJira({ onDone }: { onDone(): void }) {
 
 /**
  * The secret's field. Uncontrolled: the value lives in the input until it is sent, then the input
- * is cleared; no React state, cache or log ever holds it.
+ * is cleared; no React state, query or mutation cache, or log ever holds it.
  */
 function CredentialForm({ integration }: { integration: Integration }) {
-  const { storeCredential } = useIntegrationActions();
+  const storeCredential = useStoreCredential();
   const input = useRef<HTMLInputElement>(null);
   const [saved, setSaved] = useState(false);
   const submit = (e: FormEvent) => {
     e.preventDefault();
     const field = input.current;
-    if (field === null || field.value.trim() === '') return;
+    if (field === null || field.value.trim() === '' || storeCredential.isPending) return;
     const secret = field.value;
     field.value = '';
     setSaved(false);
-    storeCredential.mutate({ id: integration.id, secret }, { onSuccess: () => setSaved(true) });
+    void storeCredential.store(integration.id, secret).then(setSaved);
   };
   const what = integration.settings.kind === 'github' ? 'Token' : integration.settings.deployment === 'cloud' ? 'API token' : 'Personal access token';
   return (

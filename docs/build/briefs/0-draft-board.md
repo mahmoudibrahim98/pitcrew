@@ -3,6 +3,7 @@
 - **Stream:** 0 · Composition root (dispatch, work model, onboarding UI).
   **Branch:** `integrator/draft-board`.
   **Paths:** `crates/daemon/**`, `crates/hub-work/**`, `crates/office/**` (prompts as files),
+  `crates/cli/**` (the verb the drafting agent uses to submit its proposal),
   `crates/protocol/**` (regenerate `packages/protocol-ts`), `apps/ui/src/onboarding/**` and
   `apps/ui/src/projects/**`, `docs/build/contracts/api-v1.md`, `apps/mock-hub/**`,
   `tests/conformance/**`, the threat model, and the READMEs of what you touch.

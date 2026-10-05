@@ -128,3 +128,21 @@ export const CommandIcon = icon(
   'Command',
   <path d="M6 6V4.5A1.5 1.5 0 1 0 4.5 6H6Zm0 0h4m-4 0v4m4-4V4.5A1.5 1.5 0 1 1 11.5 6H10Zm0 0v4m0 0h1.5A1.5 1.5 0 1 1 10 11.5V10Zm0 0H6m0 0v1.5A1.5 1.5 0 1 1 4.5 10H6Z" />,
 );
+
+/** Split the pane to the right: a frame cut down the middle. */
+export const SplitRightIcon = icon(
+  'SplitRight',
+  <>
+    <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
+    <path d="M8 2.5v11" />
+  </>,
+);
+
+/** Split the pane down: a frame cut across the middle. */
+export const SplitDownIcon = icon(
+  'SplitDown',
+  <>
+    <rect x="2" y="2.5" width="12" height="11" rx="1.5" />
+    <path d="M2 8h12" />
+  </>,
+);

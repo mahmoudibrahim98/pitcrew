@@ -499,7 +499,7 @@ async fn stale_cut_off_and_crafted_approvals_send_nothing() {
 
     // A write cut off while being sent (the hub stopped): failed, and not sent again by itself.
     hub.answer(&edits[1].proposal.ask, 0);
-    let member = lock(&hub.integrations.saved).sync_member.unwrap();
+    let member = lock(&hub.integrations.saved).integrations[0].sync_member.unwrap();
     hub.work
         .sync_commands(member)
         .unwrap()

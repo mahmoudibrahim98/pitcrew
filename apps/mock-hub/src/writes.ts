@@ -244,15 +244,15 @@ function planChange(
 /** Proposes what the changes since the last pass imply. */
 function plan(hub: Hub): void {
   const s = state(hub);
-  const member = integrations.syncMember(hub);
-  if (s.cursor === undefined || member === undefined) {
+  if (s.cursor === undefined) {
     s.cursor = hub.rev;
     return;
   }
   const events = hub.eventsAfter(s.cursor);
   s.cursor = hub.rev;
   for (const event of events) {
-    if (event.author === member) continue;
+    // A sync's own changes come from upstream: never sent back, whichever integration made them.
+    if (integrations.isSyncMember(hub, event.author)) continue;
     const body = event.body;
     if (body.type !== 'task_moved' && body.type !== 'task_updated') continue;
     const task = hub.findTaskById(body.data.task);
@@ -260,7 +260,8 @@ function plan(hub: Hub): void {
     if (task === undefined || source === undefined) continue;
     const container = containerOf(source);
     const found = container === undefined ? undefined : integrations.integrationFor(hub, source.system, container);
-    if (found === undefined) continue;
+    const member = found === undefined ? undefined : integrations.syncMemberOf(hub, found.integration.id);
+    if (found === undefined || member === undefined) continue;
     const seen = integrations.upstreamIssue(hub, found.integration, source.key);
     const planned = planChange(hub, body, found.integration, found.container, seen);
     if (planned === undefined) continue;
@@ -355,7 +356,7 @@ function refusalMessage(system: string, status: number, body: string): string {
 /** Sends one request: the fixtures answer it, or nothing does. */
 function send(hub: Hub, method: string, url: string, body?: unknown): integrations.Exchange | undefined {
   state(hub).sent.push(body === undefined ? { method, url } : { method, url, body });
-  return integrations.exchange(method, url);
+  return integrations.exchange(hub, method, url);
 }
 
 const unreachable = (url: string): WriteResult => ({
@@ -486,8 +487,13 @@ function deliver(hub: Hub, integration: Integration, write: WriteProposal): Writ
   return { outcome: 'sent', url: browse(write.target?.key ?? '') };
 }
 
+/** The member that proposed `write`: its integration's sync member, as its approval ask says. */
+function proposer(hub: Hub, write: UpstreamWrite): MemberId | undefined {
+  return hub.findAsk(write.proposal.ask)?.from;
+}
+
 function finish(hub: Hub, write: UpstreamWrite, result: WriteResult): void {
-  const member = integrations.syncMember(hub);
+  const member = proposer(hub, write);
   if (member === undefined) return;
   const event = hub.append(member, {
     type: 'write_finished',
@@ -499,7 +505,7 @@ function finish(hub: Hub, write: UpstreamWrite, result: WriteResult): void {
 }
 
 function sendWrite(hub: Hub, write: UpstreamWrite): void {
-  const member = integrations.syncMember(hub);
+  const member = proposer(hub, write);
   if (member === undefined) return;
   const stale = staleReason(hub, write.proposal);
   const integration = integrations.integrationById(hub, write.proposal.integration);
@@ -611,7 +617,6 @@ export function request(hub: Hub, caller: MemberId, body: unknown): Reply {
   }
   const task = hub.findTaskById(taskId);
   if (task === undefined) throw invalid(`task: no task ${taskId}.`);
-  const member = integrations.syncMember(hub);
   let write: WriteProposal;
   let to: MemberId;
   if (operation === 'create_issue') {
@@ -652,6 +657,7 @@ export function request(hub: Hub, caller: MemberId, body: unknown): Reply {
   } else {
     throw invalid('operation must be create_issue or comment; the hub proposes the others itself.');
   }
+  const member = integrations.syncMemberOf(hub, write.integration);
   if (member === undefined) throw conflict('No integration is connected.');
   const handle = hub.findMember(caller)?.handle ?? 'a person';
   const proposed = propose(hub, member, to, write, task.key, `Asked for by ${handle}.`);

@@ -16,6 +16,8 @@ const NAME_CHARS: usize = 80;
 const URL_BYTES: usize = 2048;
 /// The longest e-mail, in characters.
 const EMAIL_CHARS: usize = 254;
+/// github.com's API root, which `api_base` leaves out.
+const GITHUB_API: &str = "https://api.github.com";
 
 /// A checked [`NewIntegration`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,9 +102,12 @@ pub fn check(new: NewIntegration) -> Result<Checked, String> {
     let settings = match new.settings {
         IntegrationSettings::Github { repos, api_base } => IntegrationSettings::Github {
             repos: distinct(&repos, "repos", is_github_repo, "owner/repo")?,
+            // github.com's own API root is the default: kept as none, so its web host and the
+            // host `gh` is asked about stay `github.com`.
             api_base: api_base
                 .map(|base| https_root(&base, "api_base", true))
-                .transpose()?,
+                .transpose()?
+                .filter(|base| !base.eq_ignore_ascii_case(GITHUB_API)),
         },
         IntegrationSettings::Jira {
             deployment,
@@ -176,21 +181,20 @@ pub fn check(new: NewIntegration) -> Result<Checked, String> {
     })
 }
 
-/// The scopes `settings` syncs, for telling two connections apart: `github:<api base>:<owner/repo>`
-/// or `jira:<site>:<KEY>`, lower-cased.
+/// The scopes `settings` syncs, for telling two connections apart: `github:<owner/repo>` or
+/// `jira:<KEY>`, lower-cased. The host is left out on purpose: workstream links and task sources
+/// name a repository or an issue key without a host, so the same repository or project on two
+/// hosts (github.com and an Enterprise server, two Jira sites) would move each other's tasks.
 #[must_use]
 pub fn scope_keys(settings: &IntegrationSettings) -> Vec<String> {
     match settings {
-        IntegrationSettings::Github { repos, api_base } => {
-            let base = api_base.as_deref().unwrap_or("https://api.github.com");
-            repos
-                .iter()
-                .map(|r| format!("github:{base}:{r}").to_ascii_lowercase())
-                .collect()
-        }
-        IntegrationSettings::Jira { site, projects, .. } => projects
+        IntegrationSettings::Github { repos, .. } => repos
             .iter()
-            .map(|p| format!("jira:{site}:{p}").to_ascii_lowercase())
+            .map(|r| format!("github:{r}").to_ascii_lowercase())
+            .collect(),
+        IntegrationSettings::Jira { projects, .. } => projects
+            .iter()
+            .map(|p| format!("jira:{p}").to_ascii_lowercase())
             .collect(),
     }
 }
@@ -304,7 +308,41 @@ mod tests {
         let a = check(github(&["example-org/demo-repo"], None)).unwrap();
         assert_eq!(
             scope_keys(&a.settings),
-            vec!["github:https://api.github.com:example-org/demo-repo".to_string()]
+            vec!["github:example-org/demo-repo".to_string()]
         );
+        // The same repository on an Enterprise server, or a Jira project on another site, is the
+        // same key: links and task sources name no host.
+        let ghe = check(github(
+            &["Example-Org/Demo-Repo"],
+            Some("https://ghe.example.com/api/v3"),
+        ))
+        .unwrap();
+        assert_eq!(scope_keys(&ghe.settings), scope_keys(&a.settings));
+        let mut other_site = jira(JiraDeployment::DataCenter, None);
+        if let IntegrationSettings::Jira { site, .. } = &mut other_site.settings {
+            *site = "https://jira-b.example.com".into();
+        }
+        assert_eq!(
+            scope_keys(&check(other_site).unwrap().settings),
+            scope_keys(
+                &check(jira(JiraDeployment::DataCenter, None))
+                    .unwrap()
+                    .settings
+            )
+        );
+    }
+
+    #[test]
+    fn githubs_own_api_root_is_the_default() {
+        for base in ["https://api.github.com", "https://API.github.com/"] {
+            let checked = check(github(&["example-org/demo-repo"], Some(base))).unwrap();
+            assert!(
+                matches!(
+                    checked.settings,
+                    IntegrationSettings::Github { api_base: None, .. }
+                ),
+                "{base}"
+            );
+        }
     }
 }

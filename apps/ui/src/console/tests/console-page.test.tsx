@@ -55,6 +55,8 @@ import { createAppRouter } from '../../shell/routes.tsx';
 import { initialShellState, useShell } from '../../shell/store.ts';
 import { feature } from '../index.ts';
 import { initialPanes, NARROW_BELOW, PANE_WIDTH, usePanes } from '../panes.ts';
+import { clearDrafts } from '../workbench/drafts.ts';
+import { resetWorkbenchStores } from '../workbench/store.ts';
 import { eventually, ID, renderWithHub, startHub, stubLayout, unmountAndSettle, type HubProcess } from './harness.tsx';
 
 const WS = '01JB000000000000000WSP0001';
@@ -80,6 +82,9 @@ afterEach(async () => {
   await unmountAndSettle();
   unstub();
   localStorage.clear();
+  // The workbench keeps one layout per workspace for the page's life; each test starts afresh.
+  resetWorkbenchStores();
+  clearDrafts();
   usePanes.setState(initialPanes);
   useShell.setState(initialShellState);
 });

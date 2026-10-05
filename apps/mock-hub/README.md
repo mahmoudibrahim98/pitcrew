@@ -134,16 +134,21 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **Integrations** (`/v1/integrations…`, `src/integrations.ts`): GitHub and Jira connections over
   the recorded exchanges in `fixtures/` (`github.fixture` for `example-org/demo-repo`,
   `jira.fixture` for project `DEMO` on `https://jira.example.com`; the sync crates' format, which
-  `pitcrewd serve --integration-fixtures` reads too). The checks are the daemon's. Adding one adds
-  `@sync` (an agent of the caller) and syncs at once, and so do `POST …/sync` and storing a
-  credential: open issues in a linked scope become tasks (`PATCH /v1/workstreams/{id}` with
-  `external` links a workstream and emits `workstream_linked`), upstream-owned fields are
-  overwritten, moves follow the sync's `can_move` with conflicts as asks, and a merged pull request
-  is noted on its task. Credentials stay in memory and are never returned. `gh_cli` connections
-  always have a credential here.
+  `pitcrewd serve --integration-fixtures` reads too), or the folder `startServer`'s
+  `integrationFixtures` names, read again at each sync. The checks are the daemon's. Adding one
+  finds or adds the caller's own sync member (`@sync`, or `@tracker-sync` when `@sync` is another
+  person's) and syncs at once, and so do `POST …/sync` and storing a credential. Each sync diffs
+  what it reads against the last read, as the daemon's crates do, so only upstream changes act:
+  open issues in a linked scope become tasks (`PATCH /v1/workstreams/{id}` with `external` links a
+  workstream and emits `workstream_linked`), and so does an open issue moved into a linked
+  milestone or epic; upstream-owned fields are overwritten when upstream changes them; an upstream
+  close or reopen moves the task by the sync's `can_move`, with conflicts as asks; a milestone or
+  epic seen closing ships its workstreams; and a merged pull request is noted on its task.
+  Credentials stay in memory and are never returned. `gh_cli` connections always have a
+  credential here.
 - **Outward writes** (`/v1/writes…`, `src/writes.ts`), by the daemon's rules: after every request
   that may change something, a pass proposes what a person's change implies upstream (an
-  `approval` ask with `write_proposed`), records a denial as not sent, and "sends" an approved or
+  `approval` ask from the integration's own sync member, with `write_proposed`), records a denial as not sent, and "sends" an approved or
   retried write once. The fixtures' answer to its method and URL decides it (2xx sent, else failed
   with that status; no exchange at all is a failure too). A sent write changes the mock's copy of
   upstream, so the next sync agrees; a created issue becomes the task's source. Every request
@@ -218,3 +223,5 @@ They enforce revisions, exclusive creation, path rules and body/file/list caps; 
 only in memory. Remote and WSL locations return 501. No filesystem paths are opened.
 
 Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
+
+Onboarding hooks use synthetic in-memory configuration text, person/machine-bound previews, stale refusal and idempotent confirmation. The mock never opens agent homes. Device-only safety read/save validates the same settings as the daemon and appends `safety_changed` on change.

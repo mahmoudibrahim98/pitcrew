@@ -238,28 +238,16 @@ impl GhCli {
 
     /// The token `gh` holds for `host` (`github.com`, or an Enterprise host).
     ///
+    /// `--hostname` is always passed, `github.com` included, and `GH_HOST` is cleared: without
+    /// them `gh` answers for its default host, which may be an Enterprise server, and that
+    /// server's token would then be sent to `api.github.com`.
+    ///
     /// # Errors
     /// See [`GhError`].
     pub async fn token(&self, host: &str) -> Result<Secret, GhError> {
         let program = self.find().ok_or(GhError::Missing)?;
         pitcrew_trust::check_trusted(&program).map_err(GhError::Untrusted)?;
-        let mut command = tokio::process::Command::new(&program);
-        command.args(["auth", "token"]);
-        if host != "github.com" {
-            command.args(["--hostname", host]);
-        }
-        command
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("NO_COLOR", "1")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        #[cfg(windows)]
-        {
-            // CREATE_NO_WINDOW: no console flashes up for a daemon without one.
-            command.creation_flags(0x0800_0000);
-        }
+        let mut command = token_command(&program, host);
         let output = tokio::time::timeout(GH_TIMEOUT, command.output())
             .await
             .map_err(|_| GhError::Failed("it did not answer in time".into()))?
@@ -275,6 +263,27 @@ impl GhCli {
         let text = String::from_utf8(output.stdout).unwrap_or_default();
         Secret::new(&text).ok_or(GhError::SignedOut(host_note))
     }
+}
+
+/// `gh auth token --hostname <host>`: no terminal, no prompt, `GH_HOST` cleared, nothing on
+/// stderr kept.
+fn token_command(program: &Path, host: &str) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(program);
+    command
+        .args(["auth", "token", "--hostname", host])
+        .env_remove("GH_HOST")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW: no console flashes up for a daemon without one.
+        command.creation_flags(0x0800_0000);
+    }
+    command
 }
 
 #[cfg(test)]
@@ -356,12 +365,55 @@ mod tests {
         );
         assert_eq!(
             gh.token("github.com").await.unwrap().expose(),
-            "synthetic-github"
+            "synthetic-github.com"
         );
         assert_eq!(
             gh.token("ghe.example.com").await.unwrap().expose(),
             "synthetic-ghe.example.com"
         );
+    }
+
+    /// A person signed in to `gh` on an Enterprise server only: asked for `github.com`, `gh` must
+    /// say it has nothing rather than hand over the Enterprise token, which would then be sent to
+    /// `api.github.com`. The stand-in answers like `gh`: for the host `--hostname` names, else
+    /// for `GH_HOST`, else for its default host, here the Enterprise one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gh_is_asked_for_the_connections_own_host_whatever_its_default() {
+        let (_dir, gh) = stand_in(
+            "#!/bin/sh\n[ \"$1 $2\" = 'auth token' ] || exit 3\n\
+             host=\"${GH_HOST:-ghe.example.com}\"\n\
+             [ \"$3\" = --hostname ] && host=\"$4\"\n\
+             [ \"$host\" = ghe.example.com ] || exit 1\n\
+             echo synthetic-enterprise-token\n",
+        );
+        assert_eq!(
+            gh.token("github.com").await.unwrap_err(),
+            GhError::SignedOut(String::new())
+        );
+        assert_eq!(
+            gh.token("ghe.example.com").await.unwrap().expose(),
+            "synthetic-enterprise-token"
+        );
+    }
+
+    /// `GH_HOST` in the hub's own environment never reaches `gh`: it would pick the host
+    /// `--hostname` did not name.
+    #[test]
+    fn gh_runs_with_the_host_named_and_without_gh_host() {
+        let command = token_command(Path::new("/synthetic/bin/gh"), "github.com");
+        let command = command.as_std();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["auth", "token", "--hostname", "github.com"]);
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(
+            envs.contains(&(std::ffi::OsStr::new("GH_HOST"), None)),
+            "{envs:?}"
+        );
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("GH_PROMPT_DISABLED"),
+            Some(std::ffi::OsStr::new("1"))
+        )));
     }
 
     #[cfg(unix)]

@@ -96,6 +96,7 @@ function Frame() {
   const unavailable = gateway?.state === 'unreachable' || gateway?.state === 'needs_pairing' ? gateway : undefined;
   // The first-run wizard's own routes: exempt from the redirect below, and shown bare.
   const setupRoute = useRouterState({ select: (s) => s.matches.some((m) => m.staticData?.setup === true) });
+  const settingsRoute = useRouterState({ select: (s) => s.matches.some((m) => m.staticData?.title === 'Settings') });
   const setLastWorkspace = useShell((s) => s.setLastWorkspace);
   // `/` reopens the last workspace: not one still waiting for setup (it would land in the wizard
   // every time), but one the gateway cannot reach is remembered (it comes back).
@@ -113,7 +114,7 @@ function Frame() {
   }
   // A hub with no person yet goes through setup first. No loop: the wizard's routes are exempt,
   // and a finished setup turns `setup_needed` off in the cache before anything navigates.
-  if (info?.setup_needed === true && !setupRoute) {
+  if (info?.setup_needed === true && !setupRoute && !settingsRoute) {
     return (
       <>
         <Redirect href={paths.setup(ws)} />
@@ -131,7 +132,7 @@ function Frame() {
       </div>
     );
   }
-  return <FullFrame unavailable={unavailable} />;
+  return <FullFrame unavailable={settingsRoute ? undefined : unavailable} />;
 }
 
 /**

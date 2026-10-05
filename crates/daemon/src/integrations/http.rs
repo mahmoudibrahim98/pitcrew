@@ -4,13 +4,18 @@
 //!   this machine's own trusted certificates), one connection per request, `https://` only, with
 //!   time limits and a cap on the response body. It adds `User-Agent` (GitHub refuses requests
 //!   without one) and `Host`, and sends the crates' method, headers and body as they are: `GET`
-//!   for the sync, and an approved outward write's one `POST`, `PATCH` or `PUT` (`writes.rs`). It
-//!   never logs a header or a body, and never follows a redirect or retries.
+//!   for the sync, and an approved outward write's one `POST`, `PATCH`, `PUT` or `DELETE`
+//!   (`writes.rs`). It never logs a header or a body, and never follows a redirect or retries.
+//!   Behind a corporate proxy it tunnels through `HTTPS_PROXY` with `CONNECT`, except for the
+//!   hosts `NO_PROXY` names (`proxy.rs`); TLS stays end to end. Writes take the same way.
 //! - [`FixtureTransport`]: recorded exchanges from a folder of `*.fixture` files (the sync crates'
 //!   format), answered by method and URL, as often as asked; for tests only (`serve
-//!   --integration-fixtures`). It never reaches the network. In unit tests it keeps every request
-//!   it was sent (`FixtureTransport::sent`), so they can show what was, and was not, written.
+//!   --integration-fixtures`). The folder is read again for each request, so a test changes
+//!   "upstream" between two syncs by adding a file whose name sorts first. It never reaches the
+//!   network. In unit tests it keeps every request it was sent (`FixtureTransport::sent`), so they
+//!   can show what was, and was not, written.
 
+use super::proxy::Proxy;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full, Limited};
 use hyper_util::rt::TokioIo;
@@ -46,22 +51,27 @@ fn failed(url: &str, reason: impl Into<String>) -> TransportError {
 pub struct HttpsTransport {
     tls: tokio_rustls::TlsConnector,
     user_agent: String,
+    proxy: Proxy,
 }
 
 impl std::fmt::Debug for HttpsTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpsTransport")
             .field("user_agent", &self.user_agent)
+            .field("proxy", &self.proxy)
             .finish_non_exhaustive()
     }
 }
 
 impl HttpsTransport {
-    /// A transport trusting this machine's certificates.
+    /// A transport trusting this machine's certificates, through the proxy this process's
+    /// environment names (`HTTPS_PROXY`, `NO_PROXY`; see `proxy.rs`).
     ///
     /// # Errors
-    /// No certificate could be loaded, or TLS cannot be set up.
+    /// No certificate could be loaded, TLS cannot be set up, or `HTTPS_PROXY` is not an `http://`
+    /// proxy.
     pub fn new() -> anyhow::Result<Self> {
+        let proxy = Proxy::from_env()?;
         let mut roots = rustls::RootCertStore::empty();
         let found = rustls_native_certs::load_native_certs();
         let (added, _ignored) = roots.add_parsable_certificates(found.certs);
@@ -76,6 +86,7 @@ impl HttpsTransport {
         Ok(Self {
             tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
             user_agent: format!("pitcrewd/{}", env!("CARGO_PKG_VERSION")),
+            proxy,
         })
     }
 
@@ -96,9 +107,11 @@ impl HttpsTransport {
         )
         .map_err(|_| failed(&request.url, "a bad host name"))?;
         let connect = async {
-            let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+            let tcp = self
+                .proxy
+                .connect(&host, port)
                 .await
-                .map_err(|e| failed(&request.url, format!("cannot connect: {}", e.kind())))?;
+                .map_err(|why| failed(&request.url, why))?;
             self.tls
                 .connect(server, tcp)
                 .await
@@ -178,39 +191,27 @@ impl Transport for HttpsTransport {
     }
 }
 
+type Exchanges = HashMap<(String, String), RecordedExchange>;
+
 /// Recorded exchanges, answered by method and URL (tests only). See the [module docs](self).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FixtureTransport {
-    exchanges: Arc<HashMap<(String, String), RecordedExchange>>,
+    dir: Arc<std::path::PathBuf>,
     /// Every request sent, in order (clones share it). Kept for unit tests only.
     #[cfg(test)]
     sent: Arc<Mutex<Vec<Request>>>,
 }
 
 impl FixtureTransport {
-    /// Every exchange in the `*.fixture` files of `dir`; the first of two for one method and URL
-    /// wins.
+    /// The exchanges in the `*.fixture` files of `dir`, read now (to fail early) and again for
+    /// each request.
     ///
     /// # Errors
     /// The folder or a file cannot be read, or a file is not in the fixture format.
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
-        let mut names: Vec<_> = std::fs::read_dir(dir)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "fixture"))
-            .collect();
-        names.sort();
-        let mut exchanges = HashMap::new();
-        for path in names {
-            let text = std::fs::read_to_string(&path)?;
-            for exchange in parse_fixture(&text)? {
-                exchanges
-                    .entry((exchange.method.clone(), exchange.url.clone()))
-                    .or_insert(exchange);
-            }
-        }
+        read_exchanges(dir)?;
         Ok(Self {
-            exchanges: Arc::new(exchanges),
+            dir: Arc::new(dir.to_path_buf()),
             #[cfg(test)]
             sent: Arc::default(),
         })
@@ -225,27 +226,48 @@ impl FixtureTransport {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+}
 
-    /// The exchange for `request`: its URL, else its URL without a `since=` parameter (a fixture
-    /// for a first read answers later incremental ones too, as if nothing changed upstream).
-    fn find(&self, request: &Request) -> Option<&RecordedExchange> {
-        let method = request.method.as_str().to_owned();
-        self.exchanges
-            .get(&(method.clone(), request.url.clone()))
-            .or_else(|| {
-                let (base, query) = request.url.split_once('?')?;
-                let kept: Vec<&str> = query
-                    .split('&')
-                    .filter(|pair| !pair.starts_with("since="))
-                    .collect();
-                let url = if kept.is_empty() {
-                    base.to_owned()
-                } else {
-                    format!("{base}?{}", kept.join("&"))
-                };
-                self.exchanges.get(&(method, url))
-            })
+/// Every exchange in the `*.fixture` files of `dir`, by name; the first of two for one method and
+/// URL wins.
+fn read_exchanges(dir: &Path) -> anyhow::Result<Exchanges> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "fixture"))
+        .collect();
+    names.sort();
+    let mut exchanges = HashMap::new();
+    for path in names {
+        let text = std::fs::read_to_string(&path)?;
+        for exchange in parse_fixture(&text)? {
+            exchanges
+                .entry((exchange.method.clone(), exchange.url.clone()))
+                .or_insert(exchange);
+        }
     }
+    Ok(exchanges)
+}
+
+/// The exchange for `request`: its URL, else its URL without a `since=` parameter (a fixture for
+/// a first read answers later incremental ones too, as if nothing changed upstream).
+fn find<'a>(exchanges: &'a Exchanges, request: &Request) -> Option<&'a RecordedExchange> {
+    let method = request.method.as_str().to_owned();
+    exchanges
+        .get(&(method.clone(), request.url.clone()))
+        .or_else(|| {
+            let (base, query) = request.url.split_once('?')?;
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|pair| !pair.starts_with("since="))
+                .collect();
+            let url = if kept.is_empty() {
+                base.to_owned()
+            } else {
+                format!("{base}?{}", kept.join("&"))
+            };
+            exchanges.get(&(method, url))
+        })
 }
 
 impl Transport for FixtureTransport {
@@ -255,7 +277,9 @@ impl Transport for FixtureTransport {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(request.clone());
-        match self.find(&request) {
+        let exchanges = read_exchanges(&self.dir)
+            .map_err(|_| failed(&request.url, "the recorded fixtures cannot be read"))?;
+        match find(&exchanges, &request) {
             Some(exchange) => Ok(Response {
                 status: exchange.status,
                 headers: exchange.response_headers.clone(),
@@ -291,6 +315,7 @@ impl Transport for Upstream {
 mod tests {
     use super::*;
     use pitcrew_sync_github::transport::Method;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     fn get(url: &str) -> Request {
         Request {
@@ -332,11 +357,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!missing.to_string().contains("token=x"));
+
+        // The folder is read again for each request: a file whose name sorts first changes what
+        // "upstream" says from then on.
+        std::fs::write(
+            dir.path().join("0-later.fixture"),
+            "GET https://api.github.com/repos/example-org/demo-repo/issues?state=all&per_page=100 HTTP/1.1\n\n\
+             HTTP/1.1 200\nETag: \"e2\"\n\n[{}]\n",
+        )
+        .unwrap();
+        let later = fixtures
+            .send(get(
+                "https://api.github.com/repos/example-org/demo-repo/issues?state=all&per_page=100",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            (later.header("etag"), later.body.as_slice()),
+            (Some("\"e2\""), &b"[{}]"[..])
+        );
     }
 
-    #[tokio::test]
-    async fn https_refuses_other_schemes_and_user_info_before_connecting() {
-        let https = HttpsTransport {
+    /// A transport that trusts no certificate: TLS never completes, which these tests do not need.
+    fn untrusting(proxy: Proxy) -> HttpsTransport {
+        HttpsTransport {
             tls: tokio_rustls::TlsConnector::from(Arc::new(
                 rustls::ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
@@ -347,7 +391,13 @@ mod tests {
                 .with_no_client_auth(),
             )),
             user_agent: "pitcrewd/test".into(),
-        };
+            proxy,
+        }
+    }
+
+    #[tokio::test]
+    async fn https_refuses_other_schemes_and_user_info_before_connecting() {
+        let https = untrusting(Proxy::default());
         for url in [
             "http://api.github.com/repos/example-org/demo-repo",
             "https://user:pass@api.github.com/repos/example-org/demo-repo",
@@ -356,5 +406,132 @@ mod tests {
         ] {
             assert!(https.send(get(url)).await.is_err(), "{url}");
         }
+    }
+
+    /// What a stand-in on 127.0.0.1 received: as a proxy, the head up to its blank line, then,
+    /// after it answers `reply`, the first bytes sent through; as a server (`reply` `None`), only
+    /// the first bytes.
+    struct Seen {
+        head: String,
+        after: Vec<u8>,
+    }
+
+    async fn stand_in(reply: Option<&'static str>) -> (u16, tokio::task::JoinHandle<Seen>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            if let Some(reply) = reply {
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+                    match socket.read_u8().await {
+                        Ok(byte) => head.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+            let mut after = vec![0_u8; 5];
+            let read = socket.read(&mut after).await.unwrap_or(0);
+            after.truncate(read);
+            Seen {
+                head: String::from_utf8_lossy(&head).into_owned(),
+                after,
+            }
+        });
+        (port, task)
+    }
+
+    #[tokio::test]
+    async fn https_tunnels_through_the_proxy_and_the_token_never_reaches_it() {
+        // The proxy opens the tunnel: what follows it is the TLS handshake, end to end.
+        let (port, proxy) = stand_in(Some("HTTP/1.1 200 Connection established\r\n\r\n")).await;
+        let https = untrusting(
+            Proxy::parse(
+                Some(&format!(
+                    "http://synthetic-user:synthetic-pass@127.0.0.1:{port}"
+                )),
+                Some("localhost"),
+            )
+            .unwrap(),
+        );
+        let err = https
+            .send(get("https://api.github.com/repos/example-org/demo-repo"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TLS failed"), "{err}");
+        assert!(!err.contains("synthetic-pass"), "{err}");
+        let seen = proxy.await.unwrap();
+        assert!(
+            seen.head
+                .starts_with("CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n"),
+            "{}",
+            seen.head
+        );
+        let credentials = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "synthetic-user:synthetic-pass",
+        );
+        assert!(
+            seen.head
+                .contains(&format!("Proxy-Authorization: Basic {credentials}\r\n")),
+            "{}",
+            seen.head
+        );
+        assert!(
+            !seen.head.contains("Bearer"),
+            "the token went to the proxy in clear"
+        );
+        assert_eq!(
+            seen.after.first(),
+            Some(&0x16),
+            "a TLS handshake goes through"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_refuses_the_tunnel_is_reported() {
+        let (port, proxy) =
+            stand_in(Some("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")).await;
+        let https = untrusting(Proxy::parse(Some(&format!("127.0.0.1:{port}")), None).unwrap());
+        let err = https
+            .send(get("https://jira.example.com/rest/api/3/myself"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the proxy refused the tunnel (403)"), "{err}");
+        let seen = proxy.await.unwrap();
+        assert!(
+            seen.head
+                .starts_with("CONNECT jira.example.com:443 HTTP/1.1\r\n")
+        );
+        assert!(!seen.head.contains("Proxy-Authorization"));
+    }
+
+    #[tokio::test]
+    async fn no_proxy_hosts_are_reached_directly() {
+        // The proxy would refuse; the server, named in NO_PROXY, is reached without it.
+        let (proxy_port, proxy) = stand_in(Some("HTTP/1.1 403 Forbidden\r\n\r\n")).await;
+        let (server_port, server) = stand_in(None).await;
+        let https = untrusting(
+            Proxy::parse(
+                Some(&format!("http://127.0.0.1:{proxy_port}")),
+                Some("example.org, 127.0.0.1"),
+            )
+            .unwrap(),
+        );
+        let err = https
+            .send(get(&format!(
+                "https://127.0.0.1:{server_port}/rest/api/2/myself"
+            )))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("proxy"), "{err}");
+        let seen = server.await.unwrap();
+        // No CONNECT: the first bytes are the TLS handshake itself.
+        assert_eq!(seen.after.first(), Some(&0x16), "{:?}", seen.after);
+        proxy.abort();
     }
 }

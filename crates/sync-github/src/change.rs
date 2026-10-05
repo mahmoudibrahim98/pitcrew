@@ -6,7 +6,7 @@ use crate::bounds::{
     strip_hidden,
 };
 use crate::links::linked_issues;
-use crate::state::{CloseReason, IssueSnapshot, MilestoneSnapshot, PullSnapshot};
+use crate::state::{CloseReason, IssueSnapshot, MilestoneSnapshot, PullSnapshot, SyncState};
 use crate::time::GithubTimestamp;
 use crate::wire::{WireIssue, WireMilestone, WirePullRequest};
 use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
@@ -289,6 +289,40 @@ impl UpstreamChange {
             | UpstreamChange::PullRequestMerged { source, .. }
             | UpstreamChange::PullRequestClosed { source, .. } => source,
         }
+    }
+}
+
+impl SyncState {
+    /// The open issue `source` (`owner/repo#<n>`) as a first read would report it, built from its
+    /// last snapshot: an [`UpstreamChange::IssueOpened`] in `milestone`. For a caller that starts
+    /// mirroring an issue it did not mirror before, because a later read moved it into a milestone
+    /// the caller follows ([`UpstreamChange::IssueMilestoned`]): the move alone carries none of
+    /// the issue's fields. `None` when this state has no snapshot of the issue, or it is closed.
+    ///
+    /// Call it on the state a sync returned, so the snapshot is the one that read just took.
+    #[must_use]
+    pub fn opened_from_snapshot(
+        &self,
+        source: &ExternalRef,
+        milestone: Option<&ExternalRef>,
+    ) -> Option<UpstreamChange> {
+        let (repo, number) = source.key.rsplit_once('#')?;
+        let number: u64 = number.parse().ok()?;
+        let repo_state = self.repos.get(repo).or_else(|| {
+            self.repos
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(repo))
+                .map(|(_, state)| state)
+        })?;
+        let snapshot = repo_state.issue_snapshots.get(&number)?;
+        snapshot.open.then(|| UpstreamChange::IssueOpened {
+            source: source.clone(),
+            at: snapshot.updated_at.clone(),
+            title: snapshot.title.clone(),
+            body: snapshot.body.clone(),
+            labels: snapshot.labels.clone(),
+            milestone: milestone.cloned(),
+        })
     }
 }
 
@@ -615,6 +649,76 @@ mod malformed_timestamp_tests {
             host: "github.com".to_string(),
             port: 443,
         }
+    }
+
+    #[test]
+    fn an_issue_milestoned_later_is_opened_from_its_snapshot() {
+        let mut malformed_fields = 0u32;
+        let mut wire = issue("2026-01-01T00:00:00Z");
+        wire.number = 4;
+        wire.body = Some("Body".to_string());
+        wire.labels = vec![crate::wire::WireLabel {
+            name: "docs".to_string(),
+        }];
+        let (_, snapshot) = diff_issue(
+            "example-org/demo-repo",
+            &wire,
+            None,
+            &github_com(),
+            &mut malformed_fields,
+        )
+        .unwrap();
+        let mut state = SyncState::new();
+        state
+            .repos
+            .entry("example-org/demo-repo".to_string())
+            .or_default()
+            .issue_snapshots
+            .insert(4, snapshot.clone());
+        let source = ExternalRef {
+            system: ExternalSystem::Github,
+            key: "Example-Org/Demo-Repo#4".to_string(),
+            url: Some("https://github.com/example-org/demo-repo/issues/4".to_string()),
+        };
+        let milestone = ExternalRef {
+            system: ExternalSystem::Github,
+            key: "example-org/demo-repo#milestone:1".to_string(),
+            url: None,
+        };
+        assert_eq!(
+            state.opened_from_snapshot(&source, Some(&milestone)),
+            Some(UpstreamChange::IssueOpened {
+                source: source.clone(),
+                at: GithubTimestamp::new("2026-01-01T00:00:00Z"),
+                title: "Title".to_string(),
+                body: "Body".to_string(),
+                labels: vec!["docs".to_string()],
+                milestone: Some(milestone.clone()),
+            })
+        );
+        // Unknown issues, and closed ones, give nothing.
+        let other = ExternalRef {
+            key: "example-org/demo-repo#5".to_string(),
+            ..source.clone()
+        };
+        assert_eq!(state.opened_from_snapshot(&other, None), None);
+        let bad = ExternalRef {
+            key: "example-org/demo-repo".to_string(),
+            ..source.clone()
+        };
+        assert_eq!(state.opened_from_snapshot(&bad, None), None);
+        let closed = IssueSnapshot {
+            open: false,
+            close_reason: Some(CloseReason::Completed),
+            ..snapshot
+        };
+        state
+            .repos
+            .get_mut("example-org/demo-repo")
+            .unwrap()
+            .issue_snapshots
+            .insert(4, closed);
+        assert_eq!(state.opened_from_snapshot(&source, Some(&milestone)), None);
     }
 
     #[test]

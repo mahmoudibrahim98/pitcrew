@@ -1,8 +1,12 @@
-// API v1 "Integrations" and "Linking a workstream upstream", on both targets. The daemon reads
-// the recorded fixtures in apps/mock-hub/fixtures (`--integration-fixtures`) and a stand-in `gh`
-// first on its PATH; the mock reads the same fixtures. Nothing reaches GitHub or Jira.
+// API v1 "Integrations" and "Linking a workstream upstream", on both targets. Both read the
+// runner's copy of the recorded fixtures in apps/mock-hub/fixtures (PITCREW_CONFORMANCE_FIXTURES;
+// the daemon through `--integration-fixtures`, with a stand-in `gh` first on its PATH), again at
+// each sync, so this test changes what upstream says by adding a file that sorts first. Nothing
+// reaches GitHub or Jira.
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -11,7 +15,8 @@ import { list, schemas } from './schema.mjs';
 const base = process.env.PITCREW_CONFORMANCE_URL;
 const person = process.env.PITCREW_CONFORMANCE_PERSON;
 const agent = process.env.PITCREW_CONFORMANCE_AGENT;
-assert.ok(base && person && agent, 'Set PITCREW_CONFORMANCE_URL, _PERSON and _AGENT');
+const fixtures = process.env.PITCREW_CONFORMANCE_FIXTURES;
+assert.ok(base && person && agent && fixtures, 'Set PITCREW_CONFORMANCE_URL, _PERSON, _AGENT and _FIXTURES');
 const missing = '01J00000000000000000000000';
 const SECRET = 'synthetic-conformance-secret';
 
@@ -127,6 +132,36 @@ function namesSession(value, session) {
   if (value === null || typeof value !== 'object') return false;
   return Object.entries(value).some(([key, v]) =>
     (key === 'session' && (v === session || v?.id === session)) || namesSession(v, session));
+}
+
+const ISSUES = 'https://api.github.com/repos/example-org/demo-repo/issues?state=all&sort=updated&direction=asc&per_page=100';
+const MILESTONES = 'https://api.github.com/repos/example-org/demo-repo/milestones?state=all&sort=due_on&direction=asc&per_page=100';
+const changed = [];
+
+/** The recorded answer's body for `url`, as JSON. */
+function recorded(url) {
+  const block = readFileSync(join(fixtures, 'github.fixture'), 'utf8')
+    .split('### pitcrew-github-fixture ###')
+    .find((b) => b.trim().startsWith(`GET ${url} `));
+  assert.ok(block, url);
+  return JSON.parse(block.trim().split('\n\n').slice(2).join('\n\n'));
+}
+
+/** From now on, upstream answers `body` for `url`: a fixture file that sorts first, written whole. */
+function upstreamSays(url, body) {
+  const name = join(fixtures, url.includes('/milestones') ? '0-milestones.fixture' : '0-issues.fixture');
+  writeFileSync(`${name}.tmp`, `GET ${url} HTTP/1.1\nAccept: application/vnd.github+json\n\nHTTP/1.1 200\n\n${JSON.stringify(body)}\n`);
+  renameSync(`${name}.tmp`, name);
+  changed.push(name);
+}
+
+/** `issues` with `change` made to issue `number`, updated later than recorded. */
+function issuesWith(issues, number, change) {
+  const copy = structuredClone(issues);
+  const issue = copy.find((i) => i.number === number);
+  change(issue);
+  issue.updated_at = '2026-01-03T09:00:00Z';
+  return copy;
 }
 
 const jira = {
@@ -281,6 +316,53 @@ test('integrations: device-only routes, checks, credentials, links and a sync', 
     await expect(200, '/v1/import', { method: 'PUT', body: { mode: 'all' } });
   }
   await expect(200, `/v1/sessions/${excluded}`);
+
+  // Upstream changes, applied alike by both targets ("What a sync does"): only a change acts.
+  /** Syncs now and waits for that sync to end. */
+  const syncNow = async () => {
+    const asked = Date.now();
+    await expect(202, `/v1/integrations/${added.id}/sync`, { method: 'POST' });
+    for (const until = Date.now() + 60000; Date.now() < until; await delay(100)) {
+      const now = await expect(200, `/v1/integrations/${added.id}`);
+      if (!now.status.running && (now.status.last_attempt_at ?? 0) >= asked) {
+        assert.deepEqual(now.status.problems, []);
+        return;
+      }
+    }
+    throw new Error('the sync did not end');
+  };
+  const byKey = async () => new Map((await expect(200, `/v1/tasks?workstream=${workstream.id}`)).map((t) => [t.source?.key, t]));
+  try {
+    // An open issue moved into the linked milestone becomes a task there; a closed one does not.
+    const milestone = { number: 1, title: 'v1 launch', state: 'open', html_url: 'https://github.com/example-org/demo-repo/milestone/1' };
+    let issues = issuesWith(recorded(ISSUES), 4, (i) => (i.milestone = milestone));
+    issues = issuesWith(issues, 2, (i) => (i.milestone = milestone));
+    upstreamSays(ISSUES, issues);
+    await syncNow();
+    let mirrored = await byKey();
+    assert.deepEqual([...mirrored.keys()].sort(), ['example-org/demo-repo#1', 'example-org/demo-repo#4']);
+    assert.equal(mirrored.get('example-org/demo-repo#4').title, 'Write the release notes');
+    assert.equal(mirrored.get('example-org/demo-repo#4').status, 'todo');
+
+    // Upstream closes #1 and the milestone: the task is done and the workstream ships.
+    upstreamSays(ISSUES, issuesWith(issues, 1, (i) => {
+      i.state = 'closed';
+      i.state_reason = 'completed';
+    }));
+    upstreamSays(MILESTONES, recorded(MILESTONES).map((m) => (m.number === 1 ? { ...m, state: 'closed' } : m)));
+    await syncNow();
+    mirrored = await byKey();
+    const one = mirrored.get('example-org/demo-repo#1');
+    assert.equal(one.status, 'done');
+    assert.equal((await expect(200, `/v1/workstreams/${workstream.id}`)).status, 'shipped');
+
+    // A person reopens the task: with nothing new upstream, the next sync leaves it there.
+    await expect(200, `/v1/tasks/${one.id}/move`, { method: 'POST', body: { to: 'todo' } });
+    await syncNow();
+    assert.equal((await byKey()).get('example-org/demo-repo#1').status, 'todo');
+  } finally {
+    for (const name of changed) rmSync(name, { force: true });
+  }
 
   // A test reads once, and warns that this credential could write.
   const check = await expect(200, `/v1/integrations/${added.id}/test`, { method: 'POST' });

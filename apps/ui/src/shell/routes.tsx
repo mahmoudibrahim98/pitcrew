@@ -16,16 +16,20 @@ import { shellFeature } from './core.tsx';
 import type { Feature } from './feature.ts';
 import { WorkspaceFrame } from './frame.tsx';
 import { useGatewayNavigation } from './gateway-navigate.ts';
+import { lazy, Suspense } from 'react';
+import { isDesktop } from '../data/transport.ts';
 import { Notice } from './notice.tsx';
 import { NotFoundPage, RootNotFound } from './pages/not-found.tsx';
 import { OpenLayout, OpenWorkspace } from './pages/open.tsx';
 import { GatewayPrompts } from './prompts.tsx';
 import { composeFeatures, servedPaths, withLayout } from './registry.ts';
 
+const DesktopUpdates = lazy(() => import('./updates.tsx').then((m) => ({ default: m.DesktopUpdates })));
+
 function Root() {
   useApplyTheme();
   useGatewayNavigation();
-  return (
+  const content = (
     <>
       <Notice />
       <Outlet />
@@ -33,6 +37,7 @@ function Root() {
       <GatewayPrompts />
     </>
   );
+  return isDesktop() ? <Suspense fallback={null}><DesktopUpdates>{content}</DesktopUpdates></Suspense> : content;
 }
 
 function createShellRoot() {

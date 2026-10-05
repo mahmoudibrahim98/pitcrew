@@ -66,6 +66,11 @@ impl Event {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventBody {
+    /// Workspace safety preferences changed by a person.
+    SafetyChanged {
+        /// Validated preferences.
+        settings: crate::onboarding::SafetySettings,
+    },
     /// The author read through this revision in this scope.
     CursorMoved {
         /// `workspace`, `project:<id>` or `workstream:<id>`.

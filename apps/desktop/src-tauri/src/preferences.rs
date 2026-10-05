@@ -29,6 +29,8 @@ pub struct Preferences {
     pub quit_on_close: bool,
     /// The person was told, once, that closing the window keeps the app in the tray.
     pub tray_hint_shown: bool,
+    /// Include signed pre-releases in update checks (off by default).
+    pub update_prereleases: bool,
 }
 
 impl Default for Preferences {
@@ -37,6 +39,7 @@ impl Default for Preferences {
             notifications: true,
             quit_on_close: false,
             tray_hint_shown: false,
+            update_prereleases: false,
         }
     }
 }
@@ -140,6 +143,7 @@ mod tests {
             .update(|p| {
                 p.notifications = false;
                 p.tray_hint_shown = true;
+                p.update_prereleases = true;
             })
             .unwrap();
         assert!(!updated.notifications);
@@ -147,7 +151,7 @@ mod tests {
         let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             saved,
-            serde_json::json!({ "notifications": false, "quitOnClose": false, "trayHintShown": true })
+            serde_json::json!({ "notifications": false, "quitOnClose": false, "trayHintShown": true, "updatePrereleases": true })
         );
         assert_eq!(PreferenceStore::load(tmp.path()).get(), updated);
     }
@@ -158,7 +162,7 @@ mod tests {
         let file = tmp.path().join(FILE_NAME);
         std::fs::write(&file, r#"{ "quitOnClose": true, "later": 1 }"#).unwrap();
         let p = PreferenceStore::load(tmp.path()).get();
-        assert!(p.quit_on_close && p.notifications && !p.tray_hint_shown);
+        assert!(p.quit_on_close && p.notifications && !p.tray_hint_shown && !p.update_prereleases);
         std::fs::write(&file, "not json").unwrap();
         assert_eq!(
             PreferenceStore::load(tmp.path()).get(),
