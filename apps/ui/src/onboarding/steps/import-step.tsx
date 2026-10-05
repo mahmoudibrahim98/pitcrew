@@ -10,6 +10,7 @@ import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
 
 const ENGINES: Engine[] = ['claude', 'codex', 'opencode'];
+const ENGINE_NAMES = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode' };
 
 const MODE_LABEL: Record<ImportMode, string> = {
   all: 'Import all sessions',
@@ -106,12 +107,14 @@ export function ImportStep() {
               className="h-7 w-40 rounded-sm border border-line-2 bg-card px-2 text-sm text-ink"
             />
           </div>
-          <div className="flex flex-col gap-1">
-            <label htmlFor="import-folders" className="text-xs font-medium text-ink-2">Folders (one per line)</label>
-            <textarea id="import-folders" value={state.importFolders.join('\n')}
-              onChange={(e) => patch({ importFolders: e.target.value.split('\n') })}
-              className="rounded-sm border border-line-2 bg-card px-2 text-sm text-ink" />
-          </div>
+          <fieldset className="flex max-h-48 flex-col gap-2 overflow-y-auto">
+            <legend className="text-xs font-medium text-ink-2">Scanned folders</legend>
+            {(state.scanResult?.counts.byFolder ?? []).map(({ path, count }) => <label key={path} className="flex items-start gap-2 text-sm text-ink">
+              <input type="checkbox" checked={state.importFolders.includes(path)} onChange={(event) => patch({ importFolders: event.target.checked ? [...state.importFolders, path] : state.importFolders.filter((folder) => folder !== path) })} />
+              <span className="min-w-0 break-all">{path} <span className="text-xs text-ink-2">({count} {count === 1 ? 'session' : 'sessions'})</span></span>
+            </label>)}
+            <p className="text-xs text-ink-2">{state.scanResult === undefined ? 'No scan available. ' : ''}Leave all folders unticked to include every folder.</p>
+          </fieldset>
           <div className="flex flex-col gap-1">
             <span className="text-xs font-medium text-ink-2">Engines</span>
             <div className="flex gap-3">
@@ -122,7 +125,7 @@ export function ImportStep() {
                     checked={state.importEngines.includes(engine)}
                     onChange={() => toggleEngine(engine)}
                   />
-                  {engine}
+                  {ENGINE_NAMES[engine]}
                 </label>
               ))}
             </div>

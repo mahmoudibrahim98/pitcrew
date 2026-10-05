@@ -3,11 +3,14 @@
 // never sends it again. A `409` because the workspace was set up meanwhile goes Home.
 
 import { useRouter } from '@tanstack/react-router';
+import { useEffect } from 'react';
+import { isDesktop } from '../../data/transport.ts';
 import { paths, useWorkspaceId } from '../../shell/index.ts';
 import { useOnboardingApi } from '../api-context.tsx';
 import { SetupForm } from '../setup-form.tsx';
 import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
+import { DEFAULT_MACHINE_NAME } from '../wizard-state.ts';
 
 export function WorkspaceStep() {
   const { state, patch, next, machineLabel } = useWizard();
@@ -15,6 +18,17 @@ export function WorkspaceStep() {
   const router = useRouter();
   const ws = useWorkspaceId();
   const done = state.setupResult;
+
+  useEffect(() => {
+    if (!isDesktop() || machineLabel !== 'This machine’s name' || done !== undefined) return;
+    let active = true;
+    void import('@tauri-apps/api/core').then(({ invoke }) => invoke<{ name: string }>('gateway_local_host'))
+      .then(({ name }) => {
+        if (active && name.trim() !== '') patch((current) => current.setup.machineName === DEFAULT_MACHINE_NAME
+          ? { setup: { ...current.setup, machineName: name } } : {});
+      }).catch(() => { /* The editable fallback still works when the gateway is unavailable. */ });
+    return () => { active = false; };
+  }, [machineLabel, done, patch]);
 
   if (done !== undefined) {
     return (

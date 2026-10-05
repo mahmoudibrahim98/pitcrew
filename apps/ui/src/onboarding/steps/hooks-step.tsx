@@ -7,6 +7,13 @@ import { useEffect, useState } from 'react';
 import { useOnboardingApi } from '../api-context.tsx';
 import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
+import { ENGINE_NAMES } from '../../design/index.ts';
+
+const SUMMARIES: Record<string, string> = {
+  claude: 'Adds 5 hooks to Claude Code: session start, prompt submitted, response finished, session end and notifications.',
+  codex: 'Adds a notification hook to Codex when a response finishes.',
+  opencode: 'Adds an OpenCode plugin to report session activity to PitCrew.',
+};
 
 export function HooksStep() {
   const { state, patch, next, skip } = useWizard();
@@ -57,13 +64,18 @@ export function HooksStep() {
       {state.hooksDiff?.engines.filter((engine) => engine.status === 'conflicting').map((engine) => <p role="alert" key={engine.engine}>{engine.engine}: {engine.detail}</p>)}
       {state.hooksDiff?.engines.length === 0 && <p>No supported agent CLIs were found on this hub.</p>}
       {state.hooksDiff === undefined && <p className="text-sm text-ink-2">Preparing the diff…</p>}
+      {state.hooksDiff?.engines.filter((engine) => engine.status !== 'conflicting').map((engine) => <p key={engine.engine} className="mb-3 text-sm text-ink-2">{engine.status === 'installed'
+        ? `${ENGINE_NAMES[engine.engine as keyof typeof ENGINE_NAMES] ?? engine.engine} hooks are already installed.`
+        : SUMMARIES[engine.engine] ?? engine.detail}</p>)}
       <ul className="flex flex-col gap-3">
         {state.hooksDiff?.files.map((file) => (
           <li key={file.path} className="rounded-sm border border-line p-3">
-            <p className="text-sm font-medium text-ink">{file.path}</p>
+            <details>
+            <summary className="cursor-pointer break-all text-sm font-medium text-ink">Review changes: <span>{file.path}</span></summary>
             <pre tabIndex={0} aria-label={`Diff: ${file.path}`} className="mt-1.5 overflow-auto rounded-sm bg-card p-2 text-xs text-ink">
               {hookDiff(file.path, file.before, file.after)}
             </pre>
+            </details>
           </li>
         ))}
       </ul>

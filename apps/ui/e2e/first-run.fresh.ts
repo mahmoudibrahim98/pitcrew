@@ -124,7 +124,7 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await expect(page.getByText('/home/sam/.claude/settings.json', {exact: true})).toBeVisible();
   await expectNoAxeViolations(page, 'hooks');
   await page.getByRole('button', {name: 'Install hooks'}).click();
-  await expect(page.getByLabel('Let the back office accept low-risk actions automatically')).toBeVisible();
+  await expect(page.getByLabel('Accept low-risk agent requests automatically')).toBeVisible();
   await expectNoAxeViolations(page, 'safety');
   await page.getByRole('button', {name: 'Continue'}).click();
   await expect(heading(page, "You're set up")).toBeVisible();

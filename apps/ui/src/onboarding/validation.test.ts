@@ -57,7 +57,7 @@ describe('setup', () => {
     ['@sam rivera', 'A handle is "@" and 1 to 32 lower-case letters, digits, "_" or "-".'],
     [' @sam', 'A handle is "@" and 1 to 32 lower-case letters, digits, "_" or "-".'],
     [`@${'a'.repeat(33)}`, 'A handle is "@" and 1 to 32 lower-case letters, digits, "_" or "-".'],
-    ['@office', '@office is the back office’s handle. Choose another.'],
+    ['@office', '@office is reserved for automatic request handling. Choose another.'],
   ])('checks the handle %j', (handle, message) => {
     expect(checkHandle(handle)).toBe(message);
   });

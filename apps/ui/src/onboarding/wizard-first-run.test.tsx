@@ -109,11 +109,11 @@ describe('the first-run wizard', () => {
     await screen.findByText('~/.claude/settings.json');
     fireEvent.click(screen.getByRole('button', { name: 'Install hooks' }));
 
-    // 11. Safety: the back-office cap only shows once it is enabled.
+    // 11. Safety: the hourly cap keeps its place, and only enables after opting in.
     await heading('Safety settings');
-    expect(screen.queryByLabelText('Up to')).toBeNull();
-    fireEvent.click(screen.getByRole('checkbox', { name: /back office/i }));
-    expect(await screen.findByLabelText('Up to')).toBeTruthy();
+    expect(await screen.findByLabelText('Up to')).toHaveProperty('disabled', true);
+    fireEvent.click(screen.getByRole('checkbox', { name: /low-risk agent requests/i }));
+    expect(await screen.findByLabelText('Up to')).toHaveProperty('disabled', false);
     fireEvent.click(continueButton());
 
     // 12. Done: summarises the run and links Home.

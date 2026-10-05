@@ -17,6 +17,10 @@ it('only confirms the displayed revision and refreshes after stale refusal', asy
   const api = { ...createFakeOnboardingApi({ speed: 0 }), hooksDiff, installHooks };
   render(<OnboardingApiProvider api={api}><WizardProvider><HooksStep /></WizardProvider></OnboardingApiProvider>);
   await screen.findByText('/home/sam/.codex/config.toml');
+  const disclosure = screen.getByText('/home/sam/.codex/config.toml').closest('details');
+  expect(disclosure).toHaveProperty('open', false);
+  fireEvent.click(disclosure?.querySelector('summary') as HTMLElement);
+  expect(screen.getByLabelText('Diff: /home/sam/.codex/config.toml').textContent).toContain('+after');
   expect(installHooks).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole('button', { name: 'Install hooks' }));
   await screen.findByRole('alert');
