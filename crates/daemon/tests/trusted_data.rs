@@ -433,13 +433,17 @@ fn the_audit_homes_give_three_projects_ten_sessions_and_nothing_unsorted() {
         } else {
             "synthetic-claude"
         };
-        assert_eq!(session["model"], model, "{session:#}");
+        assert_eq!(session["recorded"]["model"], model, "{session:#}");
         let account = if session["engine"] == "codex" {
             Path::new("~").join(".codex")
         } else {
             Path::new("~").join(".claude")
         };
-        assert_eq!(session["account"], text(&account), "{session:#}");
+        assert_eq!(
+            session["recorded"]["account"],
+            text(&account),
+            "{session:#}"
+        );
     }
     // "Agents now" lists sessions without a parent: no sub-agent is an agent.
     let agents_now: Vec<&Value> = sessions

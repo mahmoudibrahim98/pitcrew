@@ -226,10 +226,11 @@ export interface Session {
    * its parent's, and it is never an agent of its own (see `sessions.ts`).
    */
   parent?: SessionId;
-  /** The model the transcript last recorded. */
-  model?: string;
-  /** The CLI account home its transcript is in (`~/.claude`): which account ran it. */
-  account?: string;
+  /**
+   * What its transcript records: the model it last recorded, and the CLI account home it is in
+   * (`~/.claude`), which says which account ran it.
+   */
+  recorded?: { model?: string; account?: string };
 }
 
 // ─── Transcripts (`crates/protocol/src/transcript.rs`) and session control (`runner.rs`) ─────────

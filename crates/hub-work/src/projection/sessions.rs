@@ -209,8 +209,8 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
             opt_text(s.parent.as_ref()),
             keep_link,
             enum_text(&SessionState::Ended)?,
-            s.model,
-            s.account,
+            s.recorded.as_ref().and_then(|r| r.model.as_deref()),
+            s.recorded.as_ref().and_then(|r| r.account.as_deref()),
         ],
     )?;
     Ok(())

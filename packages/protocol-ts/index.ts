@@ -107,6 +107,7 @@ export type { ProjectStatus } from './bindings/ProjectStatus.ts';
 export type { ReadCursor } from './bindings/ReadCursor.ts';
 export type { RecapBlock } from './bindings/RecapBlock.ts';
 export type { Receipt } from './bindings/Receipt.ts';
+export type { Recorded } from './bindings/Recorded.ts';
 export type { RunnerCommand } from './bindings/RunnerCommand.ts';
 export type { RunnerToHub } from './bindings/RunnerToHub.ts';
 export type { SafetySettings } from './bindings/SafetySettings.ts';

@@ -43,7 +43,7 @@ use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MachineId, MemberId, SessionId, TerminalId, WorkspaceId};
-use pitcrew_protocol::model::{Engine, LinkBasis, Session, SessionState, TimestampMs};
+use pitcrew_protocol::model::{Engine, LinkBasis, Recorded, Session, SessionState, TimestampMs};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -2944,8 +2944,7 @@ fn session_of(
         last_activity,
         terminal,
         parent,
-        model: meta.model,
-        account,
+        recorded: Recorded::of(meta.model, account),
     }
 }
 

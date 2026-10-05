@@ -12,7 +12,8 @@ use pitcrew_protocol::ids::{
 };
 use pitcrew_protocol::model::{
     Ask, AskState, Brief, BriefProposal, BriefTarget, Date, Dispatch, Location, Machine, Member,
-    MemberKind, Persona, Project, Session, SessionState, Task, TaskStatus, Team, Workstream,
+    MemberKind, Persona, Project, Recorded, Session, SessionState, Task, TaskStatus, Team,
+    Workstream,
 };
 use pitcrew_store::sql::types::{Type, Value};
 use pitcrew_store::sql::{self, Connection, OptionalExtension, Row, params, params_from_iter};
@@ -680,8 +681,7 @@ fn session_row(r: &Row<'_>) -> sql::Result<Session> {
         last_activity: r.get(14)?,
         terminal: opt_col(r, 15)?,
         parent: opt_col(r, 16)?,
-        model: r.get(17)?,
-        account: r.get(18)?,
+        recorded: Recorded::of(r.get(17)?, r.get(18)?),
     })
 }
 

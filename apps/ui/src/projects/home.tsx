@@ -146,7 +146,10 @@ function SinceLastLooked() {
   const sessions = useSessions();
   const page = activity.data;
   const all = page === undefined ? [] : withRevisions(page).filter(({ event }) => event.body.type !== 'cursor_moved');
-  const fresh = cursors.data === undefined ? [] : all.filter((e) => e.rev > lastSeen);
+  // Until the cursor, and who "me" is, are known, nothing is new: the person's own actions are
+  // left out, so a list shown before `me` would flash them.
+  const known = cursors.data !== undefined && !me.isPending;
+  const fresh = known ? all.filter((e) => e.rev > lastSeen) : [];
   const lines = changesSince(fresh, sessionsById(sessions.data ?? []), names, me.data?.id);
   // Marking read reaches the newest revision in the window, the person's own included.
   const newestShown = fresh.length === 0 ? undefined : Math.max(...fresh.map((e) => e.rev));
@@ -165,7 +168,7 @@ function SinceLastLooked() {
       {activity.error !== null && <ErrorNote error={activity.error} what="load what changed" />}
       {cursors.error !== null && <ErrorNote error={cursors.error} what="load your read cursor" />}
       {move.error !== null && <ErrorNote error={move.error} what="mark changes as read" />}
-      {page !== undefined && cursors.data !== undefined && lines.length === 0 && (
+      {page !== undefined && known && lines.length === 0 && (
         <p className="text-sm text-ink-2">Nothing new since you last looked.</p>
       )}
       {lines.length > 0 && (

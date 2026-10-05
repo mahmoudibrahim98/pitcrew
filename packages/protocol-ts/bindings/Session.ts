@@ -3,6 +3,7 @@ import type { Engine } from "./Engine.ts";
 import type { LinkBasis } from "./LinkBasis.ts";
 import type { MachineId } from "./MachineId.ts";
 import type { MemberId } from "./MemberId.ts";
+import type { Recorded } from "./Recorded.ts";
 import type { SessionId } from "./SessionId.ts";
 import type { SessionState } from "./SessionState.ts";
 import type { TaskId } from "./TaskId.ts";
@@ -84,13 +85,7 @@ terminal?: TerminalId,
  */
 parent?: SessionId, 
 /**
- * The model, as the transcript last recorded it (e.g. `claude-sonnet-4-5`). Absent until the
- * transcript records one.
+ * What its transcript records about it, once the runner has read it: the model and the
+ * account home. Boxed, since every `session_discovered` carries a whole session.
  */
-model?: string, 
-/**
- * The CLI account home its transcript is in (`~/.claude`, or a `CLAUDE_CONFIG_DIR`,
- * `CODEX_HOME` or OpenCode data folder): which account ran it, where a machine has several.
- * `~` stands for the machine user's home. Absent for a session the runner has not read.
- */
-account?: string, };
+recorded?: Recorded, };

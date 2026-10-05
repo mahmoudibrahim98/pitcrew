@@ -283,10 +283,8 @@ export interface Session {
   terminal?: TerminalId;
   /** For a sub-agent, the session that started it: it is nested there, never an agent of its own. */
   parent?: SessionId;
-  /** The model the transcript last recorded. */
-  model?: string;
-  /** The CLI account home its transcript is in (`~/.claude`). */
-  account?: string;
+  /** What its transcript records: the model, and the CLI account home it is in (`~/.claude`). */
+  recorded?: { model?: string; account?: string };
 }
 
 export interface Dispatch {

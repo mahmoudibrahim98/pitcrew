@@ -247,8 +247,7 @@ pub fn session(id: SessionId, agent: MemberId, task: Option<TaskId>) -> Session 
         last_activity: 0,
         terminal: None,
         parent: None,
-        model: None,
-        account: None,
+        recorded: None,
     }
 }
 

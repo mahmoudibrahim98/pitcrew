@@ -92,7 +92,7 @@ function SessionDetails({
   const persona = agent?.persona === undefined ? undefined : personas.data?.find((p) => p.id === agent.persona);
   // What the transcript records first; else an agent's persona may name its model.
   const model =
-    s.model ?? persona?.model ?? (persona !== undefined ? `The CLI's default (${persona.name})` : 'Not recorded yet');
+    s.recorded?.model ?? persona?.model ?? (persona !== undefined ? `The CLI's default (${persona.name})` : 'Not recorded yet');
   const linkedTask = task.data;
   const linkedWorkstream = workstream.data;
   const taskHref = linkedTask === undefined ? undefined : paths.task(ws, linkedTask.key);
@@ -130,11 +130,11 @@ function SessionDetails({
         </Row>
         <Row term="Model">{model}</Row>
         <Row term="Account">
-          {s.account === undefined ? (
+          {s.recorded?.account === undefined ? (
             <span className="text-ink-2">Not reported</span>
           ) : (
             <span className="font-mono text-xs" title="The CLI account home its transcript is in">
-              {s.account}
+              {s.recorded.account}
             </span>
           )}
         </Row>

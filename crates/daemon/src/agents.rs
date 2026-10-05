@@ -214,8 +214,7 @@ mod tests {
                     last_activity: 1,
                     terminal: None,
                     parent,
-                    model: None,
-                    account: None,
+                    recorded: None,
                 },
             });
         }

@@ -140,6 +140,7 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     model::Receipt::export_all(&config)?;
     model::Scheduler::export_all(&config)?;
     model::Session::export_all(&config)?;
+    model::Recorded::export_all(&config)?;
     model::SessionState::export_all(&config)?;
     model::Subtask::export_all(&config)?;
     model::SubtaskSource::export_all(&config)?;

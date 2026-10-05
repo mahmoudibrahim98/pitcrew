@@ -106,7 +106,8 @@ it('Home reaches unread changes behind a metadata-only tail and marks their actu
   }
   renderWithHub(<Home />, hub);
   const region = await screen.findByRole('region', { name: 'Since you last looked' });
-  await within(region).findByText('15 new changes');
+  // The demo's fifteen, @sam's own four left out and each session one line: eleven.
+  await within(region).findByText('11 new changes');
   expect(within(region).queryByText('Nothing new since you last looked.')).toBeNull();
   within(region).getByRole('button', { name: 'Mark all as read' }).click();
   await within(region).findByText('Nothing new since you last looked.');

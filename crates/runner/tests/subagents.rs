@@ -113,9 +113,13 @@ fn an_older_sidechain_file_names_its_parent_by_session_id() {
     assert_eq!(c.parent, Some(p.id));
     assert_eq!(p.parent, None);
     // What the transcript records: the model, and the account home it is in.
-    assert_eq!(p.model.as_deref(), Some("synthetic-model-1"));
-    assert_eq!(c.model.as_deref(), Some("synthetic-model-2"));
-    assert!(p.account.is_some(), "{p:?}");
+    let model = |s: &Session| s.recorded.as_ref().and_then(|r| r.model.clone());
+    assert_eq!(model(p).as_deref(), Some("synthetic-model-1"));
+    assert_eq!(model(c).as_deref(), Some("synthetic-model-2"));
+    assert!(
+        p.recorded.as_ref().is_some_and(|r| r.account.is_some()),
+        "{p:?}"
+    );
 }
 
 /// A sidechain transcript naming a parent outside its folder (`../x`) names none.
@@ -177,7 +181,13 @@ fn a_model_recorded_later_is_a_session_update() {
     )
     .unwrap();
     assert!(eventually(WAIT, || discovered(&sink.events()).len() == 1));
-    assert_eq!(discovered(&sink.events())[0].model, None);
+    assert_eq!(
+        discovered(&sink.events())[0]
+            .recorded
+            .as_ref()
+            .and_then(|r| r.model.clone()),
+        None
+    );
     common::append(&path, reply.as_bytes());
     let updated = || {
         sink.events().iter().find_map(|e| match &e.body {
@@ -264,7 +274,10 @@ fn a_codex_sub_agent_names_its_parent_thread() {
     assert_eq!(by_native(&sessions, review_id).parent, None);
     assert_eq!(by_native(&sessions, exec_id).parent, None);
     assert_eq!(p.parent, None);
-    assert_eq!(p.model.as_deref(), Some("synthetic-codex"));
+    assert_eq!(
+        p.recorded.as_ref().and_then(|r| r.model.as_deref()),
+        Some("synthetic-codex")
+    );
 }
 
 /// An OpenCode child session names its parent by `parent_id`, in the same store.

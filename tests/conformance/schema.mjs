@@ -136,8 +136,7 @@ const session = object({
   last_activity: integer,
   'terminal?': id,
   'parent?': id,
-  'model?': text,
-  'account?': text,
+  'recorded?': object({ 'model?': text, 'account?': text }),
 });
 const answer = object({ by: id, 'option?': integer, 'text?': text, at: integer });
 const ask = object({

@@ -207,10 +207,10 @@ before the dispatch's CLI starts.
 ## What a session says about itself
 
 `session_discovered` states a session as its transcript has it so far: its folder, branch, title,
-start, the parent a sub-agent names (above), the **model** the transcript last recorded, and the
-**account**: the home it was found in, as configured, with `~` for the user's home (`USERPROFILE`
-first on Windows, else `HOME`; links are resolved on both sides when the configured spelling is
-not inside it). When a later read changes the title, branch or model (a custom title written
+start, the parent a sub-agent names (above), and in `recorded` the **model** the transcript last
+recorded and the **account**: the home it was found in, as configured, with `~` for the user's
+home (`USERPROFILE` first on Windows, else `HOME`; links are resolved on both sides when the
+configured spelling is not inside it). When a later read changes the title, branch or model (a custom title written
 after the first prompt, the model of the first reply), the runner sends `session_updated` with
 the values that changed, never one that went away. Its id hashes the session, the reading's
 generation and a count kept with the row (`Facts::updates`), and its time is the session's last

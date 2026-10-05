@@ -1317,8 +1317,9 @@ What the hub shows matches what happened (brief `0-trusted-data`; api-v1.md, "Se
 - **Every session is linked.** Creating from the scan always makes each project's `main`
   workstream, so folder linking (the deepest location wins) puts a worktree's session in its
   worktree's workstream and every other one in the default, and nothing is unsorted.
-- **Sessions say what their transcript records:** the model (updated by `session_updated`) and
-  the account home they were found in. `work.sessions` (version 5) keeps both (migration 0212).
+- **Sessions say what their transcript records** (`recorded`): the model (updated by
+  `session_updated`) and the account home they were found in. `work.sessions` (version 5) keeps
+  both (migration 0212).
 - **Who did it.** The runner's events are stamped with the workspace's person, but clients name
   the session's agent or the session itself (engine and name); a person started a session only
   when it has a terminal of PitCrew's and no agent. Clients order activity by `at`.

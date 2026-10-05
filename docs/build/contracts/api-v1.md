@@ -358,10 +358,12 @@ the project's root).
   it among sessions) and fold its activity into its parent's. A sub-agent whose parent is not
   found (its transcript names none, as a Codex review sub-agent's does not, or the parent's
   transcript is gone) has no `parent`, and is a session of its own.
-- `model`: the model the transcript last recorded; it changes with `session_updated`.
-- `account`: the account home its transcript is in (`~/.claude`, `~/.codex`, OpenCode's data
-  folder, or the folder a `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `XDG_DATA_HOME` names), with `~`
-  for the machine user's home: which account ran it, where a machine has several.
+- `recorded`: what its transcript records about it, once the runner has read it:
+  `{ "model"?, "account"? }`. `model` is the model the transcript last recorded (it changes with
+  `session_updated`); `account` the account home its transcript is in (`~/.claude`, `~/.codex`,
+  OpenCode's data folder, or the folder a `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `XDG_DATA_HOME`
+  names), with `~` for the machine user's home: which account ran it, where a machine has
+  several.
 - `terminal`: set only for a session PitCrew started (it owns the terminal the CLI runs in). A
   session the runner found on disk has none, and an agent of its own only when it is a dispatch's
   or was started for that agent.
