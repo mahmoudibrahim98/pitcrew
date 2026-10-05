@@ -65,14 +65,18 @@ pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
 
 /// The routes to serve behind authentication, split by who may call them.
 ///
-/// - `agent` routes accept both scopes (the routes marked **agent** in `api-v1.md`).
-/// - `device` routes accept only device tokens; agents get `403 forbidden`.
+/// - `agent` routes accept every scope (the routes marked **agent** in `api-v1.md`).
+/// - `read` routes accept device and reader tokens (the routes marked **read**); agents get
+///   `403 forbidden`.
+/// - `device` routes accept only device tokens; agents and readers get `403 forbidden`.
 ///
-/// Routes are device-only unless added with [`RouterParts::agent`], so forgetting to mark a
-/// route fails closed.
+/// A reader token reaches any route only with a `GET` or `HEAD` (see `auth`), so only reads go in
+/// `read`. Routes are device-only unless added with [`RouterParts::agent`] or
+/// [`RouterParts::read`], so forgetting to mark a route fails closed.
 #[derive(Debug, Default)]
 pub struct RouterParts {
     agent: Router,
+    read: Router,
     device: Router,
 }
 
@@ -87,6 +91,13 @@ impl RouterParts {
     #[must_use]
     pub fn agent(mut self, routes: Router) -> Self {
         self.agent = self.agent.merge(routes);
+        self
+    }
+
+    /// Adds reads that a reader token may make too: `GET` routes only.
+    #[must_use]
+    pub fn read(mut self, routes: Router) -> Self {
+        self.read = self.read.merge(routes);
         self
     }
 
@@ -109,6 +120,7 @@ pub fn router(host_info: HostInfo, tokens: Arc<dyn TokenStore>, parts: RouterPar
     let host_info = Arc::new(host_info);
     let authenticated = parts
         .agent
+        .merge(pitcrew_auth::readable(parts.read))
         .merge(pitcrew_auth::device_only(parts.device))
         .layer(middleware::from_fn_with_state(tokens, auth::authenticate));
     Router::new()

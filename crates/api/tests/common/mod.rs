@@ -1,4 +1,5 @@
-//! A small app for the API tests: one agent route, one device route, one device WebSocket.
+//! A small app for the API tests: agent routes (a read and a write), a read route, a device
+//! route, and a device WebSocket.
 
 #![allow(dead_code)]
 
@@ -8,7 +9,7 @@ use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message, WebSocketUpgrade};
 use axum::http::Request;
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use pitcrew_api::{RouterParts, local_host_info};
 use pitcrew_auth::{Authenticated, FileTokenStore, TokenStore, WS_PROTOCOL};
 use pitcrew_protocol::MemberId;
@@ -20,8 +21,11 @@ pub struct Fixture {
     pub tokens: Arc<FileTokenStore>,
     pub person: Caller,
     pub agent: Caller,
+    /// The agent, as a reader: a token that may only read.
+    pub reader: Caller,
     pub device_token: String,
     pub agent_token: String,
+    pub reader_token: String,
 }
 
 impl Fixture {
@@ -37,19 +41,27 @@ impl Fixture {
             scope: TokenScope::Agent,
             on_behalf_of: Some(person.member),
         };
+        let reader = Caller {
+            scope: TokenScope::Reader,
+            ..agent
+        };
         let (_, device_token) = tokens.mint(person).unwrap();
         let (_, agent_token) = tokens.mint(agent).unwrap();
+        let (_, reader_token) = tokens.mint(reader).unwrap();
         Self {
             tokens,
             person,
             agent,
+            reader,
             device_token: device_token.into_string(),
             agent_token: agent_token.into_string(),
+            reader_token: reader_token.into_string(),
         }
     }
 
     pub fn app(&self) -> Router {
         let whoami = get(|Authenticated(caller): Authenticated| async move { Json(caller) });
+        let write = post(|Authenticated(caller): Authenticated| async move { Json(caller) });
         // Nested routers with their own fallbacks, like a file server would have.
         let nested = |name: &'static str| {
             Router::new()
@@ -60,11 +72,14 @@ impl Fixture {
             .agent(
                 Router::new()
                     .route("/v1/me", whoami.clone())
+                    .route("/v1/agent-write", write.clone())
                     .nest("/v1/agent-files", nested("agent fallback")),
             )
+            .read(Router::new().route("/v1/read", whoami.clone()))
             .device(
                 Router::new()
-                    .route("/v1/device-only", whoami)
+                    .route("/v1/device-only", whoami.clone())
+                    .route("/v1/device-write", write)
                     .route("/v1/ws", get(ws_whoami))
                     .nest("/v1/files", nested("device fallback")),
             );

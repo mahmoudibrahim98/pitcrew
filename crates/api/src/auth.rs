@@ -7,10 +7,14 @@
 //!
 //! After a token is accepted it is removed from the request's headers, so nothing downstream can
 //! log it.
+//!
+//! A reader token (`TokenScope::Reader`, the Orchestrator's CLI) may only read: any request of
+//! one but a `GET` or `HEAD`, and any WebSocket upgrade, is `403 forbidden` here, before a route
+//! sees it or its body is read.
 
 use axum::extract::{Request, State};
 use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL, UPGRADE};
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::{HeaderMap, HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use pitcrew_auth::{ErrorResponse, TokenStore, WS_BEARER_PREFIX};
@@ -45,9 +49,24 @@ pub(crate) async fn authenticate(
         tracing::debug!(method = %request.method(), path = request.uri().path(), "rejected: unknown token");
         return ErrorResponse::unauthorized("Unknown or revoked token.").into_response();
     };
+    if caller.reads_only() && !is_read(request.method(), request.headers()) {
+        tracing::debug!(method = %request.method(), path = request.uri().path(), "refused: a reader token only reads");
+        return ErrorResponse::forbidden(format!(
+            "{} {} is refused: this token may only read.",
+            request.method(),
+            request.uri().path()
+        ))
+        .into_response();
+    }
     scrub(request.headers_mut());
     request.extensions_mut().insert(caller);
     next.run(request).await
+}
+
+/// Whether a request only reads: a `GET` or `HEAD` that is not a WebSocket upgrade (a socket
+/// carries input, such as a terminal's).
+fn is_read(method: &Method, headers: &HeaderMap) -> bool {
+    (method == Method::GET || method == Method::HEAD) && !is_websocket_upgrade(headers)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<String, Missing> {
@@ -193,6 +212,25 @@ mod tests {
             ),
         ]);
         assert_eq!(bearer_token(&map), Err(Missing::Ambiguous));
+    }
+
+    #[test]
+    fn only_plain_gets_are_reads() {
+        assert!(is_read(&Method::GET, &headers(&[])));
+        assert!(is_read(&Method::HEAD, &headers(&[])));
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ] {
+            assert!(!is_read(&method, &headers(&[])), "{method}");
+        }
+        assert!(!is_read(
+            &Method::GET,
+            &headers(&[("upgrade", "websocket")])
+        ));
     }
 
     #[test]

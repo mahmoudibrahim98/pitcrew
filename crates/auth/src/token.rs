@@ -1,7 +1,7 @@
 //! Raw tokens, their ids and their hashes.
 //!
-//! A token is `pcd_` (device) or `pca_` (agent) followed by 32 random bytes in unpadded
-//! base64url. The prefix makes a leaked token easy to spot and to grep for. Only the SHA-256 of
+//! A token is `pcd_` (device), `pca_` (agent) or `pcr_` (reader: an agent that may only read)
+//! followed by 32 random bytes in unpadded base64url. The prefix makes a leaked token easy to spot and to grep for. Only the SHA-256 of
 //! a token is ever stored.
 
 use base64::Engine as _;
@@ -19,6 +19,8 @@ pub const TOKEN_BYTES: usize = 32;
 pub const DEVICE_PREFIX: &str = "pcd_";
 /// Prefix of agent tokens.
 pub const AGENT_PREFIX: &str = "pca_";
+/// Prefix of reader tokens.
+pub const READER_PREFIX: &str = "pcr_";
 
 /// The prefix for a scope.
 #[must_use]
@@ -26,16 +28,16 @@ pub const fn prefix(scope: TokenScope) -> &'static str {
     match scope {
         TokenScope::Device => DEVICE_PREFIX,
         TokenScope::Agent => AGENT_PREFIX,
+        TokenScope::Reader => READER_PREFIX,
     }
 }
 
 /// The scope a token claims by its prefix, if it is well formed. Says nothing about validity.
 #[must_use]
 pub fn claimed_scope(token: &str) -> Option<TokenScope> {
-    let (scope, body) = match token.strip_prefix(DEVICE_PREFIX) {
-        Some(body) => (TokenScope::Device, body),
-        None => (TokenScope::Agent, token.strip_prefix(AGENT_PREFIX)?),
-    };
+    let (scope, body) = [TokenScope::Device, TokenScope::Agent, TokenScope::Reader]
+        .into_iter()
+        .find_map(|scope| Some((scope, token.strip_prefix(prefix(scope))?)))?;
     let bytes = URL_SAFE_NO_PAD.decode(body).ok()?;
     (bytes.len() == TOKEN_BYTES).then_some(scope)
 }
@@ -172,10 +174,13 @@ mod tests {
     fn generated_tokens_have_their_scope_prefix_and_256_bits() {
         let device = SecretToken::generate(TokenScope::Device).unwrap();
         let agent = SecretToken::generate(TokenScope::Agent).unwrap();
+        let reader = SecretToken::generate(TokenScope::Reader).unwrap();
         assert!(device.expose().starts_with("pcd_"));
         assert!(agent.expose().starts_with("pca_"));
+        assert!(reader.expose().starts_with("pcr_"));
         assert_eq!(claimed_scope(device.expose()), Some(TokenScope::Device));
         assert_eq!(claimed_scope(agent.expose()), Some(TokenScope::Agent));
+        assert_eq!(claimed_scope(reader.expose()), Some(TokenScope::Reader));
         assert_ne!(
             device.expose(),
             SecretToken::generate(TokenScope::Device).unwrap().expose()
@@ -188,6 +193,8 @@ mod tests {
         assert_eq!(claimed_scope("dev-device-token"), None);
         assert_eq!(claimed_scope("pcd_short"), None);
         assert_eq!(claimed_scope("pcd_!!!"), None);
+        assert_eq!(claimed_scope("pcr_short"), None);
+        assert_eq!(claimed_scope("pcx_AAAA"), None);
     }
 
     #[test]

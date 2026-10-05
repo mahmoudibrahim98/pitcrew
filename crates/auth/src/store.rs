@@ -33,7 +33,10 @@ pub struct TokenInfo {
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
     /// An agent token needs an owner, and a device token must not have one.
-    #[error("an agent token needs an owner (on_behalf_of), and a device token must not have one")]
+    #[error(
+        "an agent or reader token needs an owner (on_behalf_of), and a device token must not have \
+         one"
+    )]
     InvalidCaller,
     /// No token has this id.
     #[error("no token {0}")]
@@ -278,7 +281,7 @@ impl TokenStore for FileTokenStore {
 
 fn check_caller(caller: &Caller) -> Result<(), TokenError> {
     match (caller.scope, caller.on_behalf_of) {
-        (TokenScope::Device, None) | (TokenScope::Agent, Some(_)) => Ok(()),
+        (TokenScope::Device, None) | (TokenScope::Agent | TokenScope::Reader, Some(_)) => Ok(()),
         _ => Err(TokenError::InvalidCaller),
     }
 }
@@ -442,6 +445,16 @@ mod tests {
         let (_, token) = store.mint(person()).unwrap();
         let swapped = token.expose().replacen("pcd_", "pca_", 1);
         assert_eq!(store.verify(&swapped), None);
+        // A reader's token never passes for the agent's own, nor the other way round.
+        let reader = Caller {
+            scope: TokenScope::Reader,
+            ..agent(MemberId::new())
+        };
+        let (_, read) = store.mint(reader).unwrap();
+        assert!(read.expose().starts_with("pcr_"));
+        assert_eq!(store.verify(read.expose()), Some(reader));
+        let swapped = read.expose().replacen("pcr_", "pca_", 1);
+        assert_eq!(store.verify(&swapped), None);
     }
 
     #[test]
@@ -451,8 +464,16 @@ mod tests {
         bad_agent.on_behalf_of = None;
         let mut bad_device = person();
         bad_device.on_behalf_of = Some(MemberId::new());
+        let bad_reader = Caller {
+            scope: TokenScope::Reader,
+            ..bad_agent
+        };
         assert!(matches!(
             store.mint(bad_agent),
+            Err(TokenError::InvalidCaller)
+        ));
+        assert!(matches!(
+            store.mint(bad_reader),
             Err(TokenError::InvalidCaller)
         ));
         assert!(matches!(

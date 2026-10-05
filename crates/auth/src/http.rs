@@ -120,6 +120,59 @@ fn needs_device(method: &str, path: &str) -> ErrorResponse {
     ErrorResponse::forbidden(format!("{method} {path} needs a device token."))
 }
 
+/// Extracts the caller and requires a device token or a reader token (an agent that may only
+/// read, which the API layer lets make only `GET`s); an agent gets `403 forbidden`. For the reads
+/// marked **read** in api-v1.md; for whole routers use [`readable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reading(pub Caller);
+
+impl<S: Send + Sync> FromRequestParts<S> for Reading {
+    type Rejection = ErrorResponse;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let caller = parts
+            .extensions
+            .get::<Caller>()
+            .copied()
+            .ok_or_else(missing_caller)?;
+        if caller.is_person() || caller.reads_only() {
+            Ok(Self(caller))
+        } else {
+            Err(needs_device_or_reader(
+                parts.method.as_str(),
+                parts.uri.path(),
+            ))
+        }
+    }
+}
+
+fn needs_device_or_reader(method: &str, path: &str) -> ErrorResponse {
+    ErrorResponse::forbidden(format!(
+        "{method} {path} needs a device token or a reader token."
+    ))
+}
+
+/// Middleware that lets only device and reader tokens through. Agents get `403 forbidden`. A
+/// reader reaches a route only with a `GET`: the API layer refuses its other requests first.
+pub async fn require_device_or_reader(request: Request, next: Next) -> Response {
+    match request.extensions().get::<Caller>() {
+        Some(caller) if caller.is_person() || caller.reads_only() => next.run(request).await,
+        Some(_) => {
+            needs_device_or_reader(request.method().as_str(), request.uri().path()).into_response()
+        }
+        None => missing_caller().into_response(),
+    }
+}
+
+/// Marks every route already in `router` as readable by a person's device or a reader token (see
+/// [`require_device_or_reader`]), including the fallbacks of routers nested in it.
+pub fn readable<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(middleware::from_fn(require_device_or_reader))
+}
+
 /// Middleware that lets only device tokens through. Agents get `403 forbidden`.
 ///
 /// ```ignore
@@ -157,7 +210,7 @@ mod tests {
         Caller {
             member: MemberId::new(),
             scope,
-            on_behalf_of: (scope == TokenScope::Agent).then(MemberId::new),
+            on_behalf_of: (scope != TokenScope::Device).then(MemberId::new),
         }
     }
 
@@ -177,16 +230,25 @@ mod tests {
             "/layer",
             get(|Authenticated(c): Authenticated| async move { Json(c) }),
         ));
+        let read = readable(Router::new().route(
+            "/read-layer",
+            get(|Authenticated(c): Authenticated| async move { Json(c) }),
+        ));
         Router::new()
             .route(
                 "/extractor",
                 get(|Person(c): Person| async move { Json(c) }),
             )
             .route(
+                "/read-extractor",
+                get(|Reading(c): Reading| async move { Json(c) }),
+            )
+            .route(
                 "/any",
                 get(|Authenticated(c): Authenticated| async move { Json(c) }),
             )
             .merge(device)
+            .merge(read)
     }
 
     #[tokio::test]
@@ -205,6 +267,32 @@ mod tests {
         let (status, body) = call(app(), Some(agent), "/any").await;
         assert_eq!(status, 200);
         assert_eq!(body, serde_json::to_value(agent).unwrap());
+        // A reader is no person.
+        let reader = caller(TokenScope::Reader);
+        for path in ["/layer", "/extractor"] {
+            let (status, body) = call(app(), Some(reader), path).await;
+            assert_eq!(status, 403, "{path}");
+            assert_eq!(body["code"], "forbidden");
+        }
+    }
+
+    #[tokio::test]
+    async fn readable_routes_take_devices_and_readers_only() {
+        let person = caller(TokenScope::Device);
+        let reader = caller(TokenScope::Reader);
+        let agent = caller(TokenScope::Agent);
+        for path in ["/read-layer", "/read-extractor"] {
+            for who in [person, reader] {
+                let (status, body) = call(app(), Some(who), path).await;
+                assert_eq!(status, 200, "{path}");
+                assert_eq!(body, serde_json::to_value(who).unwrap());
+            }
+            let (status, body) = call(app(), Some(agent), path).await;
+            assert_eq!(status, 403, "{path}");
+            assert_eq!(body["code"], "forbidden");
+            let (status, _) = call(app(), None, path).await;
+            assert_eq!(status, 401, "{path}");
+        }
     }
 
     #[tokio::test]
