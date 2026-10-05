@@ -143,10 +143,10 @@ function Appearance() {
   return <><h3>Theme</h3><ThemeToggle /><label className="block">Density<select className={FIELD} value={density} onChange={(e) => setDensity(e.target.value as typeof density)}><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></label><p>Theme and density apply immediately and are saved on this device.</p></>;
 }
 function About() {
-  const api = useApi(); const info = useLiveQuery({ queryKey: ['settings'], queryFn: ({ signal }) => api.settings(signal) });
+  const api = useApi(); const info = useLiveQuery({ queryKey: ['settings-about'], queryFn: ({ signal }) => api.request<{ version: string; protocol: number }>('GET', '/v1/host/info', { signal }) });
   const app = useLiveQuery({ queryKey: ['app-version'], queryFn: async () => isDesktop() ? (await import('@tauri-apps/api/app')).getVersion() : `${uiVersion} (browser development build)` });
   return <><p>App: {app.data ?? 'Loading…'}</p>{app.error && <p role="alert">{message(app.error)}</p>}
-    {info.data && <><p>Daemon: {info.data.daemon_version}</p><p>Protocol: {info.data.protocol_version}</p><p>Logs: {info.data.logs}</p></>}
+    {info.data && <><p>Daemon: {info.data.version}</p><p>Protocol: {info.data.protocol}</p><p>Logs: Daemon logs go to stderr; the launcher captures them.</p></>}
     {info.error && <p role="alert">{message(info.error)}</p>}
   </>;
 }
