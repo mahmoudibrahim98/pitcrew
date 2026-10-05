@@ -156,7 +156,7 @@ impl Verb<'_, '_> {
         if sessions.is_empty() {
             return self.print("No sessions.\n");
         }
-        sessions.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
         let names = self.workstream_names()?;
         let keys = self.task_keys()?;
         let mut rows = vec![[

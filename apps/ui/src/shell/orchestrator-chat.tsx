@@ -516,6 +516,8 @@ function Composer({
             ? <span className="text-risk">{messageOf(ask.error)}</span>
             : full
               ? 'This conversation is full: start a new one.'
+              : anyAnswering && !busy
+                ? 'Another conversation is answering: one answer at a time.'
               : length > max
                 ? `${length} of ${max} characters`
                 : `Answers with ${ENGINE_NAMES[engine]}, which can only read.`}

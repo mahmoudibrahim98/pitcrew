@@ -85,9 +85,19 @@ pub fn scratch_folder(root: &Path, name: &str) -> Result<PathBuf, String> {
         serde_json::from_str(CLAUDE_SETTINGS).map_err(|e| format!("the settings: {e}"))?;
     crate::state::write_json(&settings, &value)
         .map_err(|e| format!("cannot write {}: {e}", settings.display()))?;
-    folder
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve {}: {e}", folder.display()))
+    // Resolved as the CLI will see its working folder (macOS's `/var` is `/private/var`), so a
+    // transcript found by folder matches. Not on Windows, where that would be a `\\?\` path,
+    // which a `.cmd` CLI's `cmd.exe` refuses as its folder.
+    #[cfg(unix)]
+    let folder = folder.canonicalize();
+    #[cfg(not(unix))]
+    let folder = std::path::absolute(&folder);
+    folder.map_err(|e| {
+        format!(
+            "cannot resolve the scratch folder under {}: {e}",
+            root.display()
+        )
+    })
 }
 
 /// The program each engine runs, as the runner starts it.
@@ -138,11 +148,14 @@ mod tests {
         let root = tmp.path().join("scratch");
         let folder = scratch_folder(&root, "orchestrator-01JB000000000000000MEM0001").unwrap();
         assert_eq!(
-            folder,
+            folder.canonicalize().unwrap(),
             root.join("orchestrator-01JB000000000000000MEM0001")
                 .canonicalize()
                 .unwrap()
         );
+        assert!(folder.is_absolute());
+        // Never a verbatim path, which a CLI started through `cmd.exe` cannot run in.
+        assert!(!folder.to_string_lossy().starts_with(r"\\?\"));
         let settings: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(folder.join(".claude/settings.json")).unwrap(),
         )

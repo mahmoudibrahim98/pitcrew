@@ -822,8 +822,11 @@ impl WorkService {
                 .iter()
                 .flat_map(|p| {
                     p.conversations.iter().flat_map(move |c| {
-                        c.turns.iter().enumerate().filter_map(move |(index, t)| {
-                            (t.turn.state == TurnState::Answering).then(|| Look {
+                        c.turns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, t)| t.turn.state == TurnState::Answering)
+                            .map(move |(index, t)| Look {
                                 member: p.member,
                                 conversation: c.id,
                                 index,
@@ -832,7 +835,6 @@ impl WorkService {
                                 after: t.after,
                                 typed: t.typed.clone(),
                             })
-                        })
                     })
                 })
                 .collect()

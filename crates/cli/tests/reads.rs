@@ -126,8 +126,7 @@ fn session_list_shows_ids_states_names_and_filters() {
     let asked = server
         .api_requests()
         .into_iter()
-        .filter(|r| r.route() == "GET /v1/sessions")
-        .last()
+        .rfind(|r| r.route() == "GET /v1/sessions")
         .unwrap();
     assert_eq!(
         asked.target,
