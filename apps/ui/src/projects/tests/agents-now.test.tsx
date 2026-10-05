@@ -20,12 +20,15 @@ afterEach(async () => {
   await stopHub(hub);
 });
 
-/** Answers `GET /v1/sessions` with `sessions`; passes everything else on to the hub. */
+/** Answers `GET /v1/sessions` with `sessions` (as the hub filters them); passes everything else on to the hub. */
 function serving(sessions: Session[]): typeof fetch {
   return (async (input, init) => {
     const href = typeof input === 'string' ? input : input instanceof Request ? input.url : input.toString();
-    if (new URL(href).pathname === '/v1/sessions') {
-      return new Response(JSON.stringify(sessions), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    const url = new URL(href);
+    if (url.pathname === '/v1/sessions') {
+      const workstream = url.searchParams.get('workstream');
+      const listed = workstream === null ? sessions : sessions.filter((s) => s.workstream === workstream);
+      return new Response(JSON.stringify(listed), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
     return fetch(input, init);
   }) as typeof fetch;
@@ -70,4 +73,27 @@ it('lists no sub-agent as an agent, active sessions first, a few recent ones, th
   expect(listed().some((id) => id !== null && subagents.has(id))).toBe(false);
   fireEvent.click(screen.getByRole('button', { name: 'Show fewer' }));
   expect(listed()).toHaveLength(active.length + RECENT_SHOWN);
+});
+
+it('lists no sub-agent in a worktree’s agents whose parent works in the main checkout', async () => {
+  const { sessions, parents } = auditSessions();
+  const main = '01JB000000000000000WST0001';
+  const worktree = '01JB000000000000000WST0002';
+  // The parent is linked to the main checkout's workstream; one of its sub-agents ran in the
+  // worktree's folder, and is linked there.
+  const sub = sessions.find((s) => s.parent === parents.atlas.id);
+  if (sub === undefined) throw new Error('no sub-agent');
+  const linked = sessions.map((s) =>
+    s.id === sub.id
+      ? { ...s, workstream: worktree, state: 'working' as const }
+      : s.id === parents.search.id
+        ? { ...s, workstream: worktree, state: 'working' as const }
+        : { ...s, workstream: main },
+  );
+  renderWithHub(<AgentsNow workstream={worktree} title="Agents" />, hub, { fetch: serving(linked) });
+  const list = await screen.findByRole('list', { name: 'Agents' });
+  const listed = within(list)
+    .getAllByRole('listitem')
+    .map((li) => li.getAttribute('data-session'));
+  expect(listed).toEqual([parents.search.id]);
 });

@@ -52,4 +52,27 @@ describe('import counts', () => {
       assert.deepEqual(none.body, { imported: 0, subagents: 0 });
       assert.equal((await call(server, 'GET', `/v1/sessions/${sub.id}`, { token: DEVICE })).status, 404);
     }));
+
+  it('count a child whose chain of parents ends nowhere the hub knows as a session', () =>
+    withServer(async (server) => {
+      const dry = async () =>
+        (await call<DryRun>(server, 'POST', '/v1/import/dry-run', { token: DEVICE, json: { mode: 'all' } })).body;
+      const before = await dry();
+      const parent = server.hub.sessions.find((s) => s.id === ID.ses1);
+      assert.ok(parent);
+      const stray = (id: string, named: string): Session => ({
+        ...parent,
+        id,
+        native_id: `stray-${id}`,
+        parent: named,
+        terminal: undefined,
+      });
+      // One naming a parent the hub never saw, and two naming each other.
+      server.hub.sessions.push(
+        stray('01JB000000000000000SES0097', '01JB000000000000000SES0090'),
+        stray('01JB000000000000000SES0095', '01JB000000000000000SES0096'),
+        stray('01JB000000000000000SES0096', '01JB000000000000000SES0095'),
+      );
+      assert.deepEqual(await dry(), { count: before.count + 3, subagents: before.subagents });
+    }));
 });

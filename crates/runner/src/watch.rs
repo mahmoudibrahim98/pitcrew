@@ -997,8 +997,134 @@ impl Watcher {
             self.serve_due()?;
             self.check(id)?;
         }
+        self.reparent()?;
         let all: Vec<usize> = (0..self.homes.len()).collect();
         self.rediscover(&all, true)
+    }
+
+    /// Sub-agents stated with no parent before the runner kept the parents their transcripts name
+    /// (Codex's, OpenCode's, Claude's older top-level sidechains; migration 0006 lists them): once
+    /// each, at start, the head is read again as the machine scan reads it
+    /// (`SourceAdapter::lineage`), the parent is looked up as at discovery, and a sub-agent that
+    /// has one is stated again (`session_discovered`, with an id of its own, `Cause::Lineage`),
+    /// so the hub nests it. Nothing is read again from the start of a transcript.
+    ///
+    /// One leaves the list once that is settled: no parent found, or, at a later start, the
+    /// re-statement saved with its row (a crash before that states it again, with the same id). A
+    /// lookup that fails now is tried at the next start.
+    fn reparent(&mut self) -> Result<(), Hangup> {
+        let pending = match self.store_lock().lineage_pending() {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot list the sub-agents whose parents are to be looked up; tried at the next start");
+                return Ok(());
+            }
+        };
+        for session in pending {
+            if self.shared.stopping() {
+                return Err(Hangup);
+            }
+            let Some(id) = self.by_session.get(&session).copied() else {
+                continue;
+            };
+            if self.reparent_one(id)?
+                && let Err(e) = self.store_lock().lineage_done(session)
+            {
+                tracing::warn!(%session, error = %e, "cannot mark a sub-agent's parent as looked up; looked up again at the next start");
+            }
+        }
+        Ok(())
+    }
+
+    /// One sub-agent of [`Self::reparent`]: whether it is settled.
+    fn reparent_one(&mut self, id: u64) -> Result<bool, Hangup> {
+        let (workspace, owner, machine) = (self.workspace, self.owner, self.machine);
+        if !self.load(id) {
+            return Ok(false);
+        }
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return Ok(false);
+        };
+        let (engine, path, home) = (t.engine, Arc::clone(&t.path), t.home);
+        let inner = t.inner_id.clone();
+        let Some(row) = t.row() else {
+            return Ok(false);
+        };
+        match row.facts.parent {
+            // Stated again at an earlier start, and saved.
+            Some(Parent::Session(_)) => return Ok(true),
+            Some(Parent::None) | None => {}
+        }
+        let tref = TranscriptRef {
+            engine,
+            path: path.to_path_buf(),
+            inner_id: inner.as_deref().map(str::to_owned),
+            size: 0,
+            modified: 0,
+        };
+        let adapter = Arc::clone(&self.homes[home].adapter);
+        let named = match guard(|| adapter.lineage(&tref)) {
+            Ok(lineage) => lineage.and_then(|l| l.parent),
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, "cannot read a sub-agent's head; its parent is looked up at the next start");
+                return Ok(false);
+            }
+        };
+        let Ok(parent) = self.parent_of(engine, &path, inner.as_deref(), named.as_deref(), home)
+        else {
+            return Ok(false);
+        };
+        let account = self.homes.get(home).map(|h| h.account.clone());
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return Ok(false);
+        };
+        let Some(l) = t.loaded.as_deref_mut() else {
+            return Ok(false);
+        };
+        let row = &mut l.row;
+        row.facts.parent = Some(parent);
+        if let Some(meta) = &mut row.meta
+            && meta.parent.is_none()
+        {
+            meta.parent.clone_from(&named);
+        }
+        let Parent::Session(found) = parent else {
+            // No parent: nothing to state.
+            l.dirty = true;
+            t.sync();
+            return Ok(true);
+        };
+        let session = row.session;
+        let mut s = session_of(row, row.mtime, machine, Some(found), None, account);
+        // Its own folder or branch link, which a re-statement without one would clear.
+        if let Some(linked) = row.facts.linked {
+            s.workstream = Some(linked.workstream);
+            s.link_basis = Some(linked.basis);
+        }
+        let event = Event {
+            id: event_id(
+                session,
+                row.generation,
+                Cause::Lineage,
+                0,
+                discovered_id_time(row),
+            ),
+            at: s.started,
+            workspace,
+            author: owner,
+            on_behalf_of: None,
+            body: EventBody::SessionDiscovered { session: s },
+        };
+        tracing::info!(%session, parent = %found, "a sub-agent indexed before parents were kept now names its parent");
+        let commit = Commit::Full(Box::new(row.clone()));
+        let unsaved = Some(l.sending());
+        t.sync();
+        self.send(Batch {
+            events: vec![event],
+            commit,
+            unsaved,
+        })?;
+        Ok(false)
     }
 
     /// A stored path whose canonical form changed (a folder above it became a symlink) moves to
@@ -2651,6 +2777,13 @@ impl Watcher {
         match found {
             Ok(Some(row)) => Ok(Parent::Session(row.session)),
             Ok(None) => {
+                // A session a child names in its own store is indexed only if the store holds it.
+                if let Some(inner) = inner
+                    && !self.in_store(engine, parent, inner, home)?
+                {
+                    tracing::debug!(path = %parent.display(), "a sub-agent names a session its store does not hold; it has no parent");
+                    return Ok(Parent::None);
+                }
                 // A parent started for a session the hub named is that session already.
                 let named = self.named_session(engine, parent, inner);
                 let mut row = new_row(&TranscriptRef {
@@ -2674,6 +2807,32 @@ impl Watcher {
             }
             Err(e) => {
                 tracing::warn!(path = %parent.display(), error = %e, "cannot look up a sub-agent's parent; its hooks are refused for now");
+                Err(LookupFailed)
+            }
+        }
+    }
+
+    /// Whether the store at `path` (home `home`) holds session `inner`, as its adapter's
+    /// `lineage` tells: an adapter that cannot tell holds none.
+    fn in_store(
+        &self,
+        engine: Engine,
+        path: &Path,
+        inner: &str,
+        home: usize,
+    ) -> Result<bool, LookupFailed> {
+        let tref = TranscriptRef {
+            engine,
+            path: path.to_path_buf(),
+            inner_id: Some(inner.to_owned()),
+            size: 0,
+            modified: 0,
+        };
+        let adapter = Arc::clone(&self.homes[home].adapter);
+        match guard(|| adapter.lineage(&tref)) {
+            Ok(found) => Ok(found.is_some()),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot look for a sub-agent's parent in its store; its hooks are refused for now");
                 Err(LookupFailed)
             }
         }
@@ -3007,6 +3166,9 @@ enum Cause {
     Link(u32),
     /// The n-th change to what the session says about itself (`session_updated`).
     Update(u32),
+    /// A sub-agent stated again with the parent its transcript names, once, after an upgrade
+    /// (`Watcher::reparent`).
+    Lineage,
 }
 
 /// A ULID whose time is the event's and whose random part is a hash of what caused it, so an
@@ -3039,6 +3201,7 @@ fn event_id(
             h.update([4]);
             h.update(n.to_le_bytes());
         }
+        Cause::Lineage => h.update([5]),
     }
     h.update(seq.to_le_bytes());
     let digest = h.finalize();

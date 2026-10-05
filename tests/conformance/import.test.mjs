@@ -46,6 +46,16 @@ test('device-only reversible import: modes, dimensions, visibility and full rest
   const expected = sessions.filter((s) => s.parent === undefined && s.engine === chosen.engine &&
     (s.cwd === chosen.cwd || s.cwd.startsWith(chosen.cwd.replace(/\/$/,'') + '/')));
   assert.equal(await agreement(filter),expected.length);
+  // A sub-agent started on a later day than its parent: since that day, it matches and its parent
+  // does not, so neither is listed or counted.
+  const byId = new Map(sessions.map((s) => [s.id,s]));
+  const day = (ms) => new Date(ms).toISOString().slice(0,10);
+  const late = sessions.find((s) => s.parent !== undefined && byId.has(s.parent) &&
+    day(byId.get(s.parent).started) < day(s.started));
+  assert.ok(late, 'the fixtures have a sub-agent started a day after its parent');
+  await agreement({mode:'filtered',since:day(late.started)});
+  assert.equal((await call('GET','/v1/sessions/'+late.id)).status,404);
+  assert.ok(!(await ok('GET','/v1/sessions')).some((s) => s.id === late.id));
   assert.equal(await agreement({mode:'filtered',since:'9999-12-31'}),0);
   assert.equal((await ok('GET','/v1/events?session='+chosen.id)).events.length,0);
   assert.equal((await call('GET','/v1/sessions/'+chosen.id)).status,404);

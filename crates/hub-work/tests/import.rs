@@ -114,12 +114,14 @@ fn sub_agents_follow_their_parents_and_are_counted_apart() {
     let all = ImportFilter::default();
     let before = work.import_dry_run(all.clone()).unwrap();
 
-    // Two sub-agents of one demo session: one in another folder, one started much later.
+    // Two sub-agents of one demo session: one in another folder, one started years later
+    // (2030-01-01T00:00:00Z).
+    const LATER: i64 = 1_893_456_000_000;
     let parent = work.sessions(&Default::default()).unwrap()[0].clone();
     let mut events = Vec::new();
     for (n, (cwd, started)) in [
         (format!("{}/elsewhere", parent.cwd), parent.started),
-        (parent.cwd.clone(), parent.started + 1_000_000),
+        (parent.cwd.clone(), LATER),
     ]
     .into_iter()
     .enumerate()
@@ -137,9 +139,40 @@ fn sub_agents_follow_their_parents_and_are_counted_apart() {
     }
     store.append(&events).unwrap();
 
-    let after = work.import_dry_run(all).unwrap();
+    let after = work.import_dry_run(all.clone()).unwrap();
     assert_eq!(after.count, before.count, "sub-agents are not sessions");
     assert_eq!(after.subagents, before.subagents + 2);
+
+    // Children whose chain ends nowhere the hub knows are sessions of their own, as clients show
+    // them: one naming a parent the hub never saw, and two naming each other.
+    let (a, b) = (
+        pitcrew_protocol::ids::SessionId::new(),
+        pitcrew_protocol::ids::SessionId::new(),
+    );
+    let strays: Vec<_> = [
+        (
+            pitcrew_protocol::ids::SessionId::new(),
+            pitcrew_protocol::ids::SessionId::new(),
+        ),
+        (a, b),
+        (b, a),
+    ]
+    .into_iter()
+    .map(|(id, named)| {
+        let mut stray = parent.clone();
+        stray.id = id;
+        stray.native_id = format!("stray-{id}");
+        stray.parent = Some(named);
+        let mut event = demo.events[0].clone();
+        event.id = pitcrew_protocol::ids::EventId::new();
+        event.body = pitcrew_protocol::events::EventBody::SessionDiscovered { session: stray };
+        event
+    })
+    .collect();
+    store.append(&strays).unwrap();
+    let with_strays = work.import_dry_run(all).unwrap();
+    assert_eq!(with_strays.count, after.count + 3);
+    assert_eq!(with_strays.subagents, after.subagents);
 
     // Only the parent's folder: both sub-agents come with it, the one elsewhere too.
     let only_parent = ImportFilter {
@@ -177,4 +210,22 @@ fn sub_agents_follow_their_parents_and_are_counted_apart() {
         };
         assert!(!work.session_included(&session.id).unwrap());
     }
+
+    // Since a day the parent started before: the later sub-agent matches it, and is still left
+    // out, of the list too.
+    let since_later = ImportFilter {
+        mode: ImportMode::Filtered,
+        engines: Vec::new(),
+        folders: Vec::new(),
+        since: Some("2030-01-01".into()),
+    };
+    work.commit_import(since_later).unwrap();
+    let listed = work.included_sessions(&Default::default()).unwrap();
+    assert!(
+        listed
+            .iter()
+            .all(|s| s.parent.is_none() || listed.iter().any(|p| Some(p.id) == s.parent)),
+        "{listed:?}"
+    );
+    assert!(!listed.iter().any(|s| s.native_id == "agent-1"));
 }

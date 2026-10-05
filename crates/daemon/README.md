@@ -1309,8 +1309,11 @@ What the hub shows matches what happened (brief `0-trusted-data`; api-v1.md, "Se
   `parent_id`), and the runner states it as the session's `parent` when it finds that session in
   the same home (its README, "Where a sub-agent's parent is"). `HubAgents` judges a sub-agent's
   hooks by its parent's agent (above). The import's counts leave sub-agents out and report them
-  apart (`subagents`); a sub-agent is included exactly when its parent is (hub-work's
-  `import.rs`, up a chain of at most 16). Clients nest sub-agents under their parents.
+  apart (`subagents`); a sub-agent is included exactly when the top of its chain of parents is
+  (hub-work's `import.rs`, up a chain of at most 16), in `GET /v1/sessions` as in counts; one
+  naming a session the hub does not have, or in a loop, is a session of its own. Clients nest
+  sub-agents under their parents. A runner upgraded from one that did not keep parents states
+  the sub-agents it had indexed again, once, with their parents (runner README).
 - **Worktrees belong to their repository.** The scan resolves a `.git` file (`gitdir:`, then the
   git folder's `commondir`) to the main worktree, so a repository and its worktrees
   (`.claude/worktrees/*` included) are one suggested project, with a default (`main`) workstream
@@ -1323,7 +1326,10 @@ What the hub shows matches what happened (brief `0-trusted-data`; api-v1.md, "Se
   both (migration 0212).
 - **Who did it.** The runner's events are stamped with the workspace's person, but clients name
   the session's agent or the session itself (engine and name); a person started a session only
-  when it has a terminal of PitCrew's and no agent. Clients order activity by `at`.
+  when it has no agent and a terminal of PitCrew's, or is the hub's record of the start (no CLI
+  id yet). Recaps follow the same rule: a block's `agent` is its session's agent, and the prose
+  names the session itself when it has none. Clients order activity by `at`, within what they
+  have loaded.
 
 `tests/trusted_data.rs` runs all of it end to end on synthetic homes shaped like the audit's: a
 repository with two worktrees (one under `.claude/worktrees`), Claude sub-agents in both

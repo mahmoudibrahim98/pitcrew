@@ -17,11 +17,14 @@ export function within(inner: string, outer: string): boolean {
 
 /**
  * A project's default workstream: the one with a location at the project's root (same machine
- * and folder, no branch), which creating from a scan always makes (api-v1.md, "Sessions").
+ * and folder, no branch), which creating from a scan always makes (api-v1.md, "Sessions"). A
+ * project without a root has its `Main` with no location, as "Link to…" makes it.
  */
 export function defaultWorkstream(project: Project, workstreams: readonly Workstream[]): Workstream | undefined {
   const root = project.root;
-  if (root === undefined) return undefined;
+  if (root === undefined) {
+    return workstreams.find((w) => w.project === project.id && w.name === DEFAULT_NAME && w.locations.length === 0);
+  }
   return workstreams.find(
     (w) =>
       w.project === project.id &&
@@ -29,9 +32,50 @@ export function defaultWorkstream(project: Project, workstreams: readonly Workst
   );
 }
 
+const DEFAULT_NAME = 'Main';
+
 /** The workstream a project's default would be made as, when it has none: `Main`, at its root. */
 export function newDefaultWorkstream(project: Project): { project: string; name: string; locations: Location[] } {
-  return { project: project.id, name: 'Main', locations: project.root === undefined ? [] : [{ ...project.root }] };
+  return { project: project.id, name: DEFAULT_NAME, locations: project.root === undefined ? [] : [{ ...project.root }] };
+}
+
+/** What [`linkedWorkstream`] needs from the hub. */
+export interface TargetHub {
+  /** The project, as listed. */
+  project(id: string): Project | undefined;
+  /** The workstreams as the hub has them now (fetched again, not a cache that may be stale). */
+  workstreams(): Promise<readonly Workstream[]>;
+  createWorkstream(w: { project: string; name: string; locations?: Location[] }): Promise<{ id: string }>;
+}
+
+/**
+ * The workstream a link to `target` goes to, made at most once. A project's default is looked up
+ * in the workstreams as the hub has them now, so one made elsewhere since the list was loaded is
+ * used; it is made only when there is none. One made for a choice is kept in `made` (by choice),
+ * so trying again after a link failed uses it rather than making another.
+ */
+export async function linkedWorkstream(
+  target: LinkTarget,
+  newName: string,
+  hub: TargetHub,
+  made: Map<string, string>,
+): Promise<string> {
+  if (target.kind === 'workstream') return target.id;
+  const key = target.kind === 'project' ? `project:${target.id}` : `new:${target.project}:${newName}`;
+  const before = made.get(key);
+  if (before !== undefined) return before;
+  let id: string;
+  if (target.kind === 'project') {
+    const project = hub.project(target.id);
+    if (project === undefined) throw new Error('That project is gone; choose again.');
+    const existing = defaultWorkstream(project, await hub.workstreams());
+    id = existing?.id ?? (await hub.createWorkstream(newDefaultWorkstream(project))).id;
+  } else {
+    if (newName === '') throw new Error('Name the new workstream.');
+    id = (await hub.createWorkstream({ project: target.project, name: newName })).id;
+  }
+  made.set(key, id);
+  return id;
 }
 
 /** The sessions that can be linked with `session` at once. */

@@ -25,7 +25,7 @@
 use crate::claude::{self, ClaudeAdapter};
 use crate::codex::{self, CodexAdapter};
 use crate::opencode::{self, OpenCodeAdapter};
-use pitcrew_interfaces::source::{SourceAdapter, TranscriptRef};
+use pitcrew_interfaces::source::{Lineage, SourceAdapter, SourceError, TranscriptRef};
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -472,6 +472,28 @@ fn claude_light(home: &ScanHome, t: &TranscriptRef) -> Option<SessionFacts> {
         native_id,
         parent,
     })
+}
+
+/// A Claude or Codex transcript's [`Lineage`], from the same head the scan reads: the
+/// adapters' `SourceAdapter::lineage`. `Err` when the head cannot be read.
+pub(crate) fn head_lineage(t: &TranscriptRef) -> Result<Option<Lineage>, SourceError> {
+    let home = ScanHome {
+        engine: t.engine,
+        home: PathBuf::new(),
+    };
+    let facts = match t.engine {
+        Engine::Claude => claude_light(&home, t),
+        Engine::Codex => codex_light(&home, t),
+        _ => return Ok(None),
+    };
+    let facts = facts.ok_or_else(|| SourceError::Unreadable {
+        path: t.path.clone(),
+        reason: "its head cannot be read".into(),
+    })?;
+    Ok(Some(Lineage {
+        is_subagent: facts.is_subagent,
+        parent: facts.parent.filter(|_| facts.is_subagent),
+    }))
 }
 
 fn codex_light(home: &ScanHome, t: &TranscriptRef) -> Option<SessionFacts> {

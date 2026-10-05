@@ -47,7 +47,9 @@ export function AgentsNow({
   title?: string;
 }) {
   const [showAll, setShowAll] = useState(false);
-  const sessions = useSessions(workstream === undefined ? {} : { workstream });
+  // Every session, so a sub-agent is judged by its parent wherever that is linked (a worktree's
+  // sub-agent of a session in the main checkout is still no agent of the worktree's).
+  const sessions = useSessions();
   const workstreams = useWorkstreams(project);
   const tasks = useTaskMap(project === undefined ? {} : { project });
   const members = useMemberMap();
@@ -55,10 +57,11 @@ export function AgentsNow({
   const nav = useProjectsNav();
   const inProject = new Set((workstreams.data ?? []).map((w) => w.id));
   const belongs = (s: Session) =>
-    project === undefined ||
-    (s.workstream !== undefined && inProject.has(s.workstream)) ||
-    (s.task !== undefined && tasks.has(s.task));
-  // Sub-agents are left out of the whole list (also of a workstream's), not only of this view.
+    (workstream === undefined || s.workstream === workstream) &&
+    (project === undefined ||
+      (s.workstream !== undefined && inProject.has(s.workstream)) ||
+      (s.task !== undefined && tasks.has(s.task)));
+  // Sub-agents are left out of the whole list, then the view's sessions are taken from it.
   const agents = topLevel(sessions.data ?? []).filter(belongs);
   const running = agents.filter(isActive).sort(runningFirst);
   const recent = agents.filter((s) => !isActive(s)).sort((a, b) => b.last_activity - a.last_activity);

@@ -21,17 +21,22 @@ export function parseImport(value: unknown): ImportFilter {
 /** Sub-agents are followed up their chain of parents for at most this many sessions. */
 const MAX_PARENT_CHAIN = 16;
 /**
- * The session whose inclusion decides `session`'s: a sub-agent follows its parent, up the chain,
- * to the first session without one (a parent the hub does not know, or a loop, stops there).
+ * The top of `session`'s chain of parents: the first session whose parent the hub does not know
+ * (none, or one it never saw), `session` itself when that is it. Undefined when the chain ends
+ * nowhere (a loop, or one too long): the session then stands on its own, as clients show it.
  */
-export function deciding(hub: Pick<Hub, 'findSession'>, session: Session): Session {
+export function rootOf(hub: Pick<Hub, 'findSession'>, session: Session): Session | undefined {
   let at = session;
-  for (let i = 1; i < MAX_PARENT_CHAIN && at.parent !== undefined; i += 1) {
-    const parent = hub.findSession(at.parent);
-    if (parent === undefined || parent.id === session.id) break;
+  for (let i = 0; i < MAX_PARENT_CHAIN; i += 1) {
+    const parent = at.parent === undefined ? undefined : hub.findSession(at.parent);
+    if (parent === undefined) return at;
     at = parent;
   }
-  return at;
+  return undefined;
+}
+/** The session whose inclusion decides `session`'s: the top of its chain, else itself. */
+export function deciding(hub: Pick<Hub, 'findSession'>, session: Session): Session {
+  return rootOf(hub, session) ?? session;
 }
 /** Whether `session` is included; with `hub`, a sub-agent exactly when its parent is. */
 export function includesSession(choice: ImportChoice, session: Session, hub?: Pick<Hub, 'findSession'>): boolean {
@@ -94,13 +99,17 @@ export function includedRecaps(hub: Hub): DemoRecaps {
     }),
   })) };
 }
-/** Included sessions without a parent, and included sub-agents, as the import counts them. */
+/**
+ * Included sessions, and apart from them included sub-agents: sessions nested under the top of
+ * their chain of parents. One naming a parent the hub never saw, or in a loop, is a session.
+ */
 export function importCounts(hub: Hub, choice: ImportChoice): { sessions: number; subagents: number } {
   let sessions = 0;
   let subagents = 0;
   for (const s of hub.sessions) {
-    if (!includesSession(choice, s, hub)) continue;
-    if (s.parent === undefined) sessions += 1;
+    const top = deciding(hub, s);
+    if (!includesSession(choice, top)) continue;
+    if (top.id === s.id) sessions += 1;
     else subagents += 1;
   }
   return { sessions, subagents };

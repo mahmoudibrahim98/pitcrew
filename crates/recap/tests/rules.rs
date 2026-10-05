@@ -307,7 +307,39 @@ fn unknown_things_get_plain_names_or_are_skipped() {
     assert_eq!(builder.skipped(), 1);
     let all = builder.finish();
     assert_eq!(all.len(), 1);
-    assert_eq!(block_line(&all[0], &empty).text, "someone ran a tool");
+    // A session it does not know runs as no agent it knows: named as a session.
+    assert_eq!(block_line(&all[0], &empty).text, "a session ran a tool");
+}
+
+/// A session found on disk runs as no agent: its work is the session's, named by its CLI and
+/// title, never the person its events are stamped with. A session a person started from PitCrew
+/// (stated with a terminal and no agent) is theirs to start; its work is still the session's.
+#[test]
+fn a_session_without_an_agent_is_named_by_itself() {
+    let w = World::new(1, 1, 1);
+    let run = |terminal: bool| {
+        let id = SessionId(ulid::Ulid::from(if terminal { 78u128 } else { 77u128 }));
+        let mut session = common::session(id, w.agents[0], None, Some("Fix the parser".into()));
+        session.agent = None;
+        if terminal {
+            session.terminal = Some(pitcrew_protocol::ids::TerminalId(ulid::Ulid::from(5u128)));
+        }
+        let mut dir = w.dir.clone();
+        dir.add_session(&session);
+        let mut log = Log::new();
+        log.add(&w, 0, w.person, EventBody::SessionDiscovered { session })
+            .add(&w, 60, w.person, tool(id, "ls", false, 10))
+            .add(&w, 60, w.person, turn(id, 20));
+        lines(&log, &dir)
+    };
+    assert_eq!(
+        run(false),
+        vec!["Claude · Fix the parser started a session, ran a tool, finished a turn"]
+    );
+    assert_eq!(
+        run(true),
+        vec!["@lead started a session, Claude · Fix the parser ran a tool, finished a turn"]
+    );
 }
 
 #[test]

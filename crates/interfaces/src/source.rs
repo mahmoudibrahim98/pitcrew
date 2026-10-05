@@ -121,4 +121,25 @@ pub trait SourceAdapter: Send + Sync {
         before: Option<u64>,
         limit: usize,
     ) -> Result<TranscriptPage, SourceError>;
+
+    /// What `transcript`'s head says of its place among sessions ([`Lineage`]), read as cheaply
+    /// as the machine scan reads it, never the whole transcript. For a runner whose index holds
+    /// sub-agents read before it kept the parents they name, and for one checking that a session
+    /// a child names is there before indexing it.
+    ///
+    /// `Ok(None)`: the adapter cannot tell (the default), or the session is not there (an
+    /// OpenCode store without it). `Err`: it cannot be read now; the caller tries again later.
+    fn lineage(&self, transcript: &TranscriptRef) -> Result<Option<Lineage>, SourceError> {
+        let _ = transcript;
+        Ok(None)
+    }
+}
+
+/// A session's place among sessions, from its transcript's head ([`SourceAdapter::lineage`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lineage {
+    /// Whether it is a sub-agent's transcript, as [`SessionMeta::is_subagent`].
+    pub is_subagent: bool,
+    /// For a sub-agent, its parent's own id, as [`SessionMeta::parent`].
+    pub parent: Option<String>,
 }

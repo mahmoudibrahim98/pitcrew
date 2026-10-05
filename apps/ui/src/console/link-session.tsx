@@ -4,11 +4,11 @@
 // stream refreshes the session lists.
 
 import { useMutation } from '@tanstack/react-query';
-import { useId, useState } from 'react';
+import { useId, useRef, useState } from 'react';
 import { ApiError, useApi, useProjects, useSessions, useTasks, useWorkstreams, type Session } from '../data/index.ts';
 import { Button, Dialog, DialogContent, DialogFooter } from '../design/index.ts';
 import { sessionTitle } from './format.ts';
-import { companions, defaultWorkstream, newDefaultWorkstream, parseTarget } from './link-targets.ts';
+import { companions, linkedWorkstream, parseTarget } from './link-targets.ts';
 
 export function LinkSessionDialog({ session, onClose }: { session: Session; onClose: () => void }) {
   const api = useApi();
@@ -27,23 +27,17 @@ export function LinkSessionDialog({ session, onClose }: { session: Session; onCl
   const chosen = [session, ...subagents.filter((s) => !left.has(s.id)), ...unsorted.filter((s) => added.has(s.id))];
   const parsed = parseTarget(target);
   const workstreamId = parsed?.kind === 'workstream' ? parsed.id : undefined;
+  // Workstreams this dialog made, by choice: a retry after a failed link uses them.
+  const made = useRef(new Map<string, string>());
 
   const link = useMutation({
     mutationFn: async () => {
       if (parsed === undefined) throw new Error('Choose where to link it.');
-      let workstream: string;
-      if (parsed.kind === 'workstream') {
-        workstream = parsed.id;
-      } else if (parsed.kind === 'project') {
-        const project = projects.data?.find((p) => p.id === parsed.id);
-        if (project === undefined) throw new Error('That project is gone; choose again.');
-        const existing = defaultWorkstream(project, workstreams.data ?? []);
-        workstream = existing?.id ?? (await api.createWorkstream(newDefaultWorkstream(project))).id;
-      } else {
-        const name = newName.trim();
-        if (name === '') throw new Error('Name the new workstream.');
-        workstream = (await api.createWorkstream({ project: parsed.project, name })).id;
-      }
+      const workstream = await linkedWorkstream(parsed, newName.trim(), {
+        project: (pid) => projects.data?.find((p) => p.id === pid),
+        workstreams: async () => (await workstreams.refetch({ throwOnError: true })).data ?? [],
+        createWorkstream: (w) => api.createWorkstream(w),
+      }, made.current);
       const withTask = parsed.kind === 'workstream' && task !== '' ? { task } : {};
       for (const s of chosen) await api.linkSession(s.id, { workstream, ...withTask });
     },

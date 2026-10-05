@@ -196,12 +196,31 @@ fn a_model_recorded_later_is_a_session_update() {
         })
     };
     assert!(eventually(WAIT, || updated().is_some()));
+    // Claude's `<synthetic>` stand-in (a reply the CLI made up, as for an error) is no model: it
+    // neither replaces the model nor brings it back after.
+    let synthetic = json!({"type": "assistant", "cwd": "/w/atlas", "timestamp": "2026-10-01T09:00:07Z",
+        "message": {"role": "assistant", "model": "<synthetic>", "content": [{"type": "text", "text": "No response."}]}});
+    common::append(&path, lines(&[synthetic]).as_bytes());
+    common::append(&path, reply.as_bytes());
+    let turns = || {
+        sink.events()
+            .iter()
+            .filter(|e| matches!(e.body, EventBody::TurnEnded { .. }))
+            .count()
+    };
+    assert!(eventually(WAIT, || turns() >= 2));
     runner.stop();
     assert_eq!(
         updated(),
         Some((Some("synthetic-model-9".into()), None)),
         "only what changed"
     );
+    let updates = sink
+        .events()
+        .iter()
+        .filter(|e| matches!(e.body, EventBody::SessionUpdated { .. }))
+        .count();
+    assert_eq!(updates, 1, "{:?}", sink.events());
 }
 
 fn codex_meta(id: &str, source: &serde_json::Value, ts: &str) -> String {
@@ -280,6 +299,148 @@ fn a_codex_sub_agent_names_its_parent_thread() {
     );
 }
 
+/// A Codex adapter as a runner read it before parents were kept: the parent a transcript names
+/// is left out, and it reads no lineage.
+struct Unnamed(CodexAdapter);
+
+impl SourceAdapter for Unnamed {
+    fn engine(&self) -> Engine {
+        Engine::Codex
+    }
+
+    fn discover(
+        &self,
+        home: &Path,
+    ) -> Result<
+        Vec<pitcrew_interfaces::source::TranscriptRef>,
+        pitcrew_interfaces::source::SourceError,
+    > {
+        self.0.discover(home)
+    }
+
+    fn read_from(
+        &self,
+        t: &pitcrew_interfaces::source::TranscriptRef,
+        cursor: &pitcrew_interfaces::source::Cursor,
+    ) -> Result<pitcrew_interfaces::source::ParseChunk, pitcrew_interfaces::source::SourceError>
+    {
+        let mut chunk = self.0.read_from(t, cursor)?;
+        if let Some(meta) = &mut chunk.meta {
+            meta.parent = None;
+        }
+        Ok(chunk)
+    }
+
+    fn read_page(
+        &self,
+        t: &pitcrew_interfaces::source::TranscriptRef,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<pitcrew_interfaces::source::TranscriptPage, pitcrew_interfaces::source::SourceError>
+    {
+        self.0.read_page(t, before, limit)
+    }
+}
+
+fn pending(state: &Path) -> i64 {
+    let db = rusqlite::Connection::open(state.join("runner.sqlite3")).unwrap();
+    db.query_row("SELECT count(*) FROM lineage_pending", [], |r| r.get(0))
+        .unwrap()
+}
+
+/// A sub-agent a runner indexed before it kept the parents transcripts name was stated with none.
+/// After the upgrade, it is looked up once at start, from its head, and stated again with its
+/// parent (an event of its own); the next starts leave it be.
+#[test]
+fn an_upgraded_runner_states_the_parents_of_sub_agents_it_indexed_once() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let day = home
+        .path()
+        .join("sessions")
+        .join("2026")
+        .join("10")
+        .join("02");
+    std::fs::create_dir_all(&day).unwrap();
+    let parent_id = "0199a000-0000-7000-8000-00000000001a";
+    let child_id = "0199a000-0000-7000-8000-00000000001b";
+    let parent = day.join(format!("rollout-2026-10-02T09-00-00-{parent_id}.jsonl"));
+    std::fs::write(
+        &parent,
+        codex_meta(parent_id, &json!("cli"), "2026-10-02T09:00:00Z"),
+    )
+    .unwrap();
+    age(&parent, Duration::from_secs(120));
+    let spawn = json!({"subagent": {"thread_spawn": {"parent_thread_id": parent_id, "depth": 1}}});
+    std::fs::write(
+        day.join(format!("rollout-2026-10-02T09-01-00-{child_id}.jsonl")),
+        codex_meta(child_id, &spawn, "2026-10-02T09:01:00Z"),
+    )
+    .unwrap();
+    let config = || runner_config(state.path(), &[(Engine::Codex, home.path())]);
+
+    // Before: the sub-agent is stated with no parent.
+    let before = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(),
+        vec![Arc::new(Unnamed(CodexAdapter::new()))],
+        before.clone(),
+    )
+    .unwrap();
+    assert!(eventually(WAIT, || discovered(&before.events()).len() == 2));
+    runner.stop();
+    let sessions = discovered(&before.events());
+    let (p, c) = (
+        by_native(&sessions, parent_id),
+        by_native(&sessions, child_id),
+    );
+    assert_eq!(c.parent, None);
+    // As that runner's index was: no list of sub-agents to look up.
+    let db = rusqlite::Connection::open(state.path().join("runner.sqlite3")).unwrap();
+    db.execute_batch("DROP TABLE lineage_pending; PRAGMA user_version = 5;")
+        .unwrap();
+    drop(db);
+
+    // The upgrade: stated again, with its parent, by an event of its own.
+    let after = Arc::new(CollectSink::default());
+    let runner =
+        pitcrew_runner::start(config(), vec![Arc::new(CodexAdapter::new())], after.clone())
+            .unwrap();
+    let restated = || {
+        after.events().into_iter().find(
+            |e| matches!(&e.body, EventBody::SessionDiscovered { session } if session.id == c.id),
+        )
+    };
+    assert!(eventually(WAIT, || restated().is_some()));
+    runner.stop();
+    let event = restated().unwrap();
+    let EventBody::SessionDiscovered { session } = &event.body else {
+        unreachable!()
+    };
+    assert_eq!(session.parent, Some(p.id));
+    assert_eq!(session.native_id, child_id);
+    let first = before
+        .events()
+        .into_iter()
+        .find(|e| matches!(&e.body, EventBody::SessionDiscovered { session } if session.id == c.id))
+        .unwrap();
+    assert_ne!(event.id, first.id);
+    assert_eq!(
+        discovered(&after.events()).len(),
+        1,
+        "only the sub-agent is stated again"
+    );
+
+    // Settled: the next start states nothing again, and the list is empty.
+    let again = Arc::new(CollectSink::default());
+    let runner =
+        pitcrew_runner::start(config(), vec![Arc::new(CodexAdapter::new())], again.clone())
+            .unwrap();
+    assert!(eventually(WAIT, || pending(state.path()) == 0));
+    runner.stop();
+    assert!(discovered(&again.events()).is_empty());
+}
+
 /// An OpenCode child session names its parent by `parent_id`, in the same store.
 #[test]
 fn an_opencode_child_session_names_its_parent() {
@@ -303,8 +464,20 @@ fn an_opencode_child_session_names_its_parent() {
         [],
     )
     .unwrap();
+    // And one whose parent is not in the store (deleted): it has none, and no row is made for it.
+    db.execute(
+        "INSERT INTO session (id, project_id, parent_id, directory, title, version, time_created, time_updated)
+         SELECT 'ses_01jb9demo00000000000000010', project_id, 'ses_01jb9demo0000000000000gone',
+                directory, 'Child session - y', version, time_created + 2000, time_updated + 2000
+         FROM session WHERE parent_id IS NULL LIMIT 1",
+        [],
+    )
+    .unwrap();
     let children: Vec<(String, String)> = db
-        .prepare("SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL")
+        .prepare(
+            "SELECT id, parent_id FROM session WHERE parent_id IS NOT NULL
+             AND parent_id IN (SELECT id FROM session)",
+        )
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
@@ -331,4 +504,8 @@ fn an_opencode_child_session_names_its_parent() {
             "{child}"
         );
     }
+    assert_eq!(
+        by_native(&sessions, "ses_01jb9demo00000000000000010").parent,
+        None
+    );
 }

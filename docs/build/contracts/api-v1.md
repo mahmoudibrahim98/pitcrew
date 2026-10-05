@@ -383,7 +383,12 @@ the project's root).
   parent's work: clients nest it under its parent (never list it as an agent of its own, nor count
   it among sessions) and fold its activity into its parent's. A sub-agent whose parent is not
   found (its transcript names none, as a Codex review sub-agent's does not, or the parent's
-  transcript is gone) has no `parent`, and is a session of its own.
+  transcript is gone) has no `parent`, and is a session of its own. A sub-agent is nested under
+  the top of its chain of parents: the first session whose parent the client (or hub) does not
+  have. One whose `parent` names a session it does not have, or that is part of a loop of
+  parents, stands on its own. A runner upgraded from one that did not keep the parents
+  transcripts name states each sub-agent it had indexed with none once more, with its parent, at
+  its first start.
 - `recorded`: what its transcript records about it, once the runner has read it:
   `{ "model"?, "account"? }`. `model` is the model the transcript last recorded (it changes with
   `session_updated`); `account` the account home its transcript is in (`~/.claude`, `~/.codex`,
@@ -406,7 +411,10 @@ started it, for the person whose device asked. A session stated again (the start
 its terminal, then its transcript adopted) is one start: clients show its first statement.
 
 **Order.** Clients show activity in the order things happened (`at`, newest first), not in log
-order: importing history appends old events late. `session_updated` carries `title`, `branch`
+order: importing history appends old events late. The order holds within what a client has
+loaded: `GET /v1/events` pages by revision, so an old event appended late can arrive on a newer
+page than its time suggests. A time ahead of the client's clock (a machine whose clock runs fast)
+counts as now, so it cannot hold the top. `session_updated` carries `title`, `branch`
 and `model` when the runner sees them change after the session's discovery.
 
 Folder/branch linking uses this machine's workstream locations: the deepest containing folder
@@ -589,6 +597,9 @@ Both need a device token, like the activity log they summarise. The types are in
   "tool_receipts": Receipt[], "turn_receipts": Receipt[] }`.
   - `id` is its first event's id and `last` its last's; `start` and `end` are the times of its
     earliest and latest events.
+  - `agent` is the session's agent. A session that runs as no agent has none, and its prose
+    names the session itself ("Claude · its title"), as "Who did it" under "Sessions" says; a
+    start a person made from PitCrew is theirs.
   - `BlockKey` is `{ "kind": "session" | "workstream" | "project", "id" }`.
   - `Counts` has `events`, `tools_run`, `tools_failed`, `file_edits`, `lines_added`,
     `lines_removed`, `turns`, `asks_raised`, `asks_answered`, `task_moves` and `comments`.
@@ -891,9 +902,12 @@ agents, and sign in to each agent CLI with the CLI's own login. The types are in
 - All includes every indexed session. None means start fresh: sessions with `started` strictly
   after the commit time are included. Its dry run evaluates a prospective boundary at request time (normally zero). PUT counts at its commit boundary.
   Recommitting none establishes a new boundary. Before the first commit the default is all.
-- `count` and `imported` leave sub-agent sessions (those with a `parent`) out: they come with
-  their parents, and are counted in `subagents`. A sub-agent is included exactly when its parent
-  is, whatever its own start, engine or folder. So importing everything after a scan shows the
+- `count` and `imported` leave sub-agent sessions (those nested under the top of their chain of
+  parents, as "What a session says about itself" defines it) out: they come with their parents,
+  and are counted in `subagents`. A sub-agent is included exactly when the top of its chain is,
+  whatever its own start, engine or folder, in session lists (`GET /v1/sessions`) as in counts
+  and reads. One naming a session the hub does not have, or in a loop, is judged and counted as a
+  session of its own. So importing everything after a scan shows the
   scan's `sessions` and `subagent_sessions`. Counts describe indexed sessions, not a fresh
   filesystem scan.
   A dry run and commit agree if no session was indexed between the requests. Later sessions obey

@@ -3,7 +3,7 @@
 use pitcrew_ingest::claude::{ClaudeAdapter, ReadReport};
 use pitcrew_ingest::{SkipReason, SkippedLine};
 use pitcrew_interfaces::source::{
-    Cursor, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptRef,
+    Cursor, Lineage, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptRef,
 };
 use pitcrew_protocol::model::Engine;
 use proptest::prelude::*;
@@ -808,4 +808,42 @@ fn read_page_on_200mb() {
     );
     assert!(page.items.len() >= 200);
     assert!(newest.as_millis() < 50, "newest page took {newest:?}");
+}
+
+/// A transcript's lineage, from its head as the machine scan reads it: a sub-agent and the parent
+/// its records (or its session folder) name; a session names none; an unreadable file is an error.
+#[test]
+fn lineage_reads_the_head() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = dir.path().join("sess-1.jsonl");
+    let sub = dir
+        .path()
+        .join("sess-1")
+        .join("subagents")
+        .join("agent-a.jsonl");
+    fs::create_dir_all(sub.parent().expect("parent")).expect("mkdir");
+    let record = |extra: serde_json::Value| {
+        let mut r = json!({"type": "user", "cwd": "/w", "timestamp": "2026-01-01T00:00:00Z",
+                           "message": {"content": "Go"}});
+        for (k, v) in extra.as_object().expect("object") {
+            r[k] = v.clone();
+        }
+        format!("{r}\n")
+    };
+    fs::write(&session, record(json!({"sessionId": "sess-1"}))).expect("write");
+    fs::write(
+        &sub,
+        record(json!({"sessionId": "sess-1", "agentId": "a", "isSidechain": true})),
+    )
+    .expect("write");
+    let lineage = |path: &Path| ClaudeAdapter.lineage(&tref(path));
+    assert_eq!(
+        lineage(&sub).expect("read"),
+        Some(Lineage {
+            is_subagent: true,
+            parent: Some("sess-1".into())
+        })
+    );
+    assert_eq!(lineage(&session).expect("read"), Some(Lineage::default()));
+    assert!(lineage(&dir.path().join("gone.jsonl")).is_err());
 }

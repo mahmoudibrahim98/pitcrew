@@ -77,6 +77,22 @@ describe('the activity feed', () => {
   });
 });
 
+describe('model updates', () => {
+  it('make no line of their own: a title or branch change does', () => {
+    const { parents } = auditSessions();
+    const all = sessionsById([parents.atlas]);
+    const update = (data: Record<string, string>) =>
+      event({ type: 'session_updated', data: { session: parents.atlas.id, ...data } }, 1_000);
+    const items = [
+      { event: update({ model: 'model-a' }), rev: 1 },
+      { event: update({ model: 'model-b' }), rev: 2 },
+      { event: update({ title: 'Renamed' }), rev: 3 },
+    ];
+    expect(attributedFeed(items, all, names).map((f) => f.rev)).toEqual([3]);
+    expect(changesSince(items.slice(0, 2), all, names, ALEX)).toEqual([]);
+  });
+});
+
 describe('since you last looked', () => {
   it('leaves out my own actions and folds each session into one line', () => {
     const { sessions, parents } = auditSessions();

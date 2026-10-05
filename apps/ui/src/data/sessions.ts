@@ -19,12 +19,30 @@ export function byId(sessions: readonly Session[]): Map<SessionId, Session> {
 }
 
 /**
- * The session a sub-agent is nested under: its parent, when that is among `sessions`. A sub-agent
- * whose parent is not there (not found, or not imported) stands on its own.
+ * The top of `session`'s chain of parents among `sessions`: the first session whose parent is not
+ * there (none, not found, or not imported). Undefined when the chain ends nowhere: a loop of
+ * parents, or one past `MAX_CHAIN`.
+ */
+function topOf(session: Session, sessions: ReadonlyMap<SessionId, Session>): Session | undefined {
+  let at = session;
+  for (let i = 0; i < MAX_CHAIN; i += 1) {
+    const parent = at.parent === undefined ? undefined : sessions.get(at.parent);
+    if (parent === undefined) return at;
+    at = parent;
+  }
+  return undefined;
+}
+
+/**
+ * The session a sub-agent is nested under: its parent, when that is among `sessions` and the
+ * chain of parents ends at a session of its own. A sub-agent whose parent is not there (not found,
+ * or not imported), or whose chain loops, stands on its own.
  */
 export function parentOf(session: Session, sessions: ReadonlyMap<SessionId, Session>): Session | undefined {
-  if (session.parent === undefined || session.parent === session.id) return undefined;
-  return sessions.get(session.parent);
+  if (session.parent === undefined) return undefined;
+  const parent = sessions.get(session.parent);
+  if (parent === undefined || topOf(session, sessions) === undefined) return undefined;
+  return parent;
 }
 
 /** Whether `session` is nested under a parent in `sessions` (and so is no agent of its own). */
@@ -38,15 +56,9 @@ export function topLevel(sessions: readonly Session[]): Session[] {
   return sessions.filter((s) => !isNested(s, all));
 }
 
-/** The outermost session `session` is part of: itself, or its parent's, up the chain. */
+/** The outermost session `session` is part of: the top of its chain, or itself when it stands alone. */
 export function rootOf(session: Session, sessions: ReadonlyMap<SessionId, Session>): Session {
-  let at = session;
-  for (let i = 1; i < MAX_CHAIN; i += 1) {
-    const parent = parentOf(at, sessions);
-    if (parent === undefined || parent.id === session.id) break;
-    at = parent;
-  }
-  return at;
+  return topOf(session, sessions) ?? session;
 }
 
 /** Each parent's sub-agents (those nested under it), oldest first. */
@@ -159,10 +171,17 @@ export function aboutSubagent(event: Event, sessions: ReadonlyMap<SessionId, Ses
   return session !== undefined && isNested(session, sessions);
 }
 
-/** Events newest first, by when they happened; the same moment keeps the log's order. */
-export function byTimeNewestFirst<T extends { event: Event; rev?: number }>(items: readonly T[]): T[] {
+/**
+ * Events newest first, by when they happened; the same moment keeps the log's order. A time ahead
+ * of `now` (a machine whose clock runs fast) counts as now, so it cannot hold the top of the list.
+ */
+export function byTimeNewestFirst<T extends { event: Event; rev?: number }>(
+  items: readonly T[],
+  now: number = Date.now(),
+): T[] {
+  const when = (event: Event) => Math.min(event.at, now);
   return items
     .map((item, i) => ({ item, i }))
-    .sort((a, b) => b.item.event.at - a.item.event.at || (b.item.rev ?? b.i) - (a.item.rev ?? a.i))
+    .sort((a, b) => when(b.item.event) - when(a.item.event) || (b.item.rev ?? b.i) - (a.item.rev ?? a.i))
     .map(({ item }) => item);
 }

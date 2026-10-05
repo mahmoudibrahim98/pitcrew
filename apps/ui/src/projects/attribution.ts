@@ -20,7 +20,7 @@ import {
   type Session,
   type SessionId,
 } from '../data/index.ts';
-import { describeEvent, SESSION_STATE, type Names } from './format.ts';
+import { describeEvent, SESSION_STATE, worthALine, type Names } from './format.ts';
 
 export interface Attributed {
   event: Event;
@@ -91,7 +91,9 @@ export function attributedFeed(
   sessions: ReadonlyMap<SessionId, Session>,
   names: Names,
 ): Attributed[] {
-  return byTimeNewestFirst(withoutRestatements(items)).map(({ event, rev }) => attribute(event, rev, sessions, names));
+  return byTimeNewestFirst(withoutRestatements(items).filter(({ event }) => worthALine(event))).map(({ event, rev }) =>
+    attribute(event, rev, sessions, names),
+  );
 }
 
 /** One line of "Since you last looked". */
@@ -154,7 +156,7 @@ export function changesSince(
 ): ChangeLine[] {
   const lines: (ChangeLine | SessionTally)[] = [];
   const tallies = new Map<SessionId, SessionTally>();
-  for (const { event, rev } of byTimeNewestFirst(withoutRestatements(items))) {
+  for (const { event, rev } of byTimeNewestFirst(withoutRestatements(items).filter(({ event }) => worthALine(event)))) {
     const actor = actorOf(event, sessions);
     if (actor.kind === 'member' && me !== undefined && actor.member === me) continue;
     const id = eventSession(event);

@@ -1,6 +1,6 @@
 # pitcrew-hub-work
 
-Session import stores reversible rules via `with_import_file` in a private atomic file. API session reads filter the retained projections; internal runner/command reads remain complete. Recaps rebuild when the choice changes, retaining the original event log.
+Session import stores reversible rules via `with_import_file` in a private atomic file. API session reads filter the retained projections (`included_sessions`, `session_included`: a sub-agent is judged by the top of its chain of parents, so it is listed exactly when that is; one naming a session the hub does not have, or in a loop, is judged and counted as a session); internal runner/command reads remain complete. Recaps rebuild when the choice changes, retaining the original event log.
 
 The hub's model of the work: projects, workstreams, tasks and subtasks, sessions and dispatches,
 asks, comments, briefs, and the workspace's machines, members, personas and teams. Everything is

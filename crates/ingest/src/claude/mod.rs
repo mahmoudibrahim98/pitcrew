@@ -14,8 +14,8 @@ use crate::lines::{Backward, SkipReason};
 use crate::open::open_transcript;
 use crate::text::title;
 use pitcrew_interfaces::source::{
-    Cursor, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptPage,
-    TranscriptRef,
+    Cursor, Lineage, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem,
+    TranscriptPage, TranscriptRef,
 };
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use serde::{Deserialize, Serialize};
@@ -187,6 +187,11 @@ impl SourceAdapter for ClaudeAdapter {
             to: end,
             at_start,
         })
+    }
+
+    /// From the head the machine scan reads: whether it is a sub-agent, and the parent it names.
+    fn lineage(&self, transcript: &TranscriptRef) -> Result<Option<Lineage>, SourceError> {
+        crate::scan::head_lineage(transcript)
     }
 }
 

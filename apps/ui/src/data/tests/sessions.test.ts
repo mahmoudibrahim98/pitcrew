@@ -48,6 +48,24 @@ describe('sub-agents', () => {
     loop.parent = loop.id;
     expect(topLevel([loop])).toEqual([loop]);
   });
+
+  it('nest only when their chain of parents ends: a loop hides no one', () => {
+    const a = session('a');
+    const b = session('b', { parent: a.id });
+    a.parent = b.id;
+    const child = session('child', { parent: a.id });
+    const all = [a, b, child];
+    // Both of the loop, and what hangs off it, stand on their own: none is hidden.
+    expect(topLevel(all).map((s) => s.native_id)).toEqual(['a', 'b', 'child']);
+    expect(subagentsByParent(all).size).toBe(0);
+    expect(rootOf(child, byId(all)).id).toBe(child.id);
+    // A chain that ends at a session whose parent is not there nests under that session.
+    const top = session('top', { parent: '01JB00000000000000SES99998' });
+    const mid = session('mid', { parent: top.id });
+    const leaf = session('leaf', { parent: mid.id });
+    expect(topLevel([top, mid, leaf]).map((s) => s.native_id)).toEqual(['top']);
+    expect(rootOf(leaf, byId([top, mid, leaf])).id).toBe(top.id);
+  });
 });
 
 describe('who did it', () => {
@@ -106,5 +124,16 @@ describe('order', () => {
       { event: event({ type: 'session_ended', data: { session: 'd' } }, 200), rev: 4 },
     ];
     expect(byTimeNewestFirst(imported).map((i) => i.rev)).toEqual([1, 4, 3, 2]);
+  });
+
+  it('counts a time ahead of now as now, so a fast clock does not hold the top', () => {
+    const now = 1_000;
+    const items = [
+      { event: event({ type: 'session_ended', data: { session: 'fast' } }, 1_000_000), rev: 1 },
+      { event: event({ type: 'session_ended', data: { session: 'later' } }, 900), rev: 2 },
+      { event: event({ type: 'session_ended', data: { session: 'newest' } }, 1_000), rev: 3 },
+    ];
+    // The fast one reads as now: with what happened now, by the log; above what came before.
+    expect(byTimeNewestFirst(items, now).map((i) => i.rev)).toEqual([3, 1, 2]);
   });
 });

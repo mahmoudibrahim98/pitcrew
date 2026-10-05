@@ -13,6 +13,13 @@ Recap engine: activity blocks, summaries with receipts, and Where-it-stands prop
   "job diverged", "moved PAP-1 to review"), and every fact carries receipts. `BlockBuilder` does
   the same incrementally; `push_batch` reports the blocks that changed and closed, and any
   batching gives the same blocks as `blocks`.
+- **Who did it** (api-v1.md, "Sessions": "Who did it"). A session block's `agent` is its
+  session's agent, never the person the runner's events are stamped with. When it has none (a
+  session found on disk, or one a person started), the prose names the session itself, by its
+  CLI and title (or folder): "Claude · Fix the parser ran 3 tools". Its start is the person's
+  only when they started it from PitCrew (the directory keeps that: stated with no agent and a
+  terminal, or recorded before its CLI ran). The directory keeps each session's CLI and name,
+  so `names_version` moves when one is renamed (`session_updated`) or dropped.
 - **Directory.** What is known before the first event (members, workstreams, tasks, sessions,
   dispatches, asks), seeded from projections with `add_*` and kept current from events (members
   too, from `member_added`, so one directory serves both the builder and the names in prose). It

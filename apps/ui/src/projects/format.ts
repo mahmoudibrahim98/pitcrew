@@ -175,6 +175,16 @@ export const plainNames: Names = {
   ask: () => undefined,
 };
 
+/**
+ * Whether an event is worth a line of activity. A `session_updated` that changes only the model a
+ * transcript records is not: it is shown in the session's details, and a CLI that switches models
+ * mid-session would fill the feed.
+ */
+export function worthALine(event: Event): boolean {
+  const { body } = event;
+  return body.type !== 'session_updated' || body.data.title !== undefined || body.data.branch !== undefined;
+}
+
 /** What an event did, as the rest of a sentence whose subject is its author. */
 export function describeEvent(event: Event, names: Names): string {
   const { body } = event;

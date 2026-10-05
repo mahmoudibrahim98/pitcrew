@@ -47,7 +47,7 @@
 //!
 //! What a dropped entry costs: later events about a dropped session, task or dispatch are placed
 //! as if it were new (or not at all), and prose that needs a dropped name says "someone", "a task",
-//! "a workstream" or "an ask". [`Directory::names_version`] moves on whenever a name may read
+//! "a workstream", "a session" or "an ask". [`Directory::names_version`] moves on whenever a name may read
 //! differently, so a cache of prose knows to write it again.
 //!
 //! Memory: with every kind full at the default limit (which only a flood of made-up ids reaches),
@@ -55,13 +55,13 @@
 //! characters (release build, Linux x86-64).
 
 use crate::lru::Lru;
-use crate::text::{NAME_CHARS, clean};
+use crate::text::{NAME_CHARS, TITLE_CHARS, clean};
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{
     AskId, DispatchId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Ask, AskKind, Dispatch, LinkBasis, Member, Session, Task, TaskStatus, Workstream,
+    Ask, AskKind, Dispatch, Engine, LinkBasis, Member, Session, Task, TaskStatus, Workstream,
 };
 
 /// Most entries kept of each kind by default.
@@ -74,6 +74,13 @@ pub(crate) struct SessionInfo {
     pub(crate) task: Option<TaskId>,
     /// Why the session is linked; `None` when it is not, or nobody said.
     basis: Option<LinkBasis>,
+    /// Its CLI, once stated.
+    engine: Option<Engine>,
+    /// What prose calls it: its title, else its folder's name (as clients do).
+    name: Option<String>,
+    /// A person started it from PitCrew: stated with no agent and a terminal, or recorded by the
+    /// hub before its CLI ran (no CLI id yet). Kept once known.
+    pub(crate) person_start: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +133,7 @@ fn replaces_link(existing: Option<LinkBasis>, incoming: Option<LinkBasis>) -> bo
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Dropped {
     members: bool,
+    sessions: bool,
     tasks: bool,
     workstreams: bool,
     asks: bool,
@@ -219,10 +227,21 @@ impl Directory {
     /// Adds or replaces a session, for its agent and links, by the hub's rules: a firm link stays
     /// unless the session comes with another firm one, and an agent stays unless it names one.
     pub fn add_session(&mut self, session: &Session) {
-        let (info, _) = self.sessions.entry(session.id, SessionInfo::default);
+        let (info, evicted) = self.sessions.entry(session.id, SessionInfo::default);
         if session.agent.is_some() {
             info.agent = session.agent;
         }
+        info.engine = Some(session.engine);
+        info.person_start |=
+            session.agent.is_none() && (session.terminal.is_some() || session.native_id.is_empty());
+        let name = session_name(session.title.as_deref(), &session.cwd);
+        let renamed = info.name.as_ref().map(|old| *old != name);
+        info.name = Some(name);
+        let dropped = &mut self.dropped.sessions;
+        self.names_version = names_moved(self.names_version, renamed, evicted, dropped);
+        let Some(info) = self.sessions.get_mut(&session.id) else {
+            return;
+        };
         if replaces_link(info.basis, session.link_basis) {
             info.workstream = session.workstream;
             info.task = session.task;
@@ -300,6 +319,11 @@ impl Directory {
                 task,
                 basis,
             } => return self.link(*session, *workstream, *task, *basis),
+            EventBody::SessionUpdated {
+                session,
+                title: Some(title),
+                ..
+            } => self.retitle(*session, title),
             EventBody::SessionStateChanged { session, .. }
             | EventBody::TurnEnded { session, .. }
             | EventBody::ToolRan { session, .. }
@@ -447,7 +471,8 @@ impl Directory {
     }
 
     /// A number that moves on whenever prose written with this directory may now read
-    /// differently: a member's handle, a task's key or a workstream's name re-stated differently,
+    /// differently: a member's handle, a task's key, a workstream's name or a session's name (its
+    /// title, or folder) re-stated differently,
     /// an ask raised again as another kind or by someone else, or any of them dropped for the
     /// limit; and, once one of a kind has been dropped, any name of that kind learned (it may be
     /// one dropped before). Learning a name that was never known does not move it: whether prose
@@ -459,6 +484,34 @@ impl Directory {
 
     pub(crate) fn session(&self, id: SessionId) -> Option<&SessionInfo> {
         self.sessions.get(&id)
+    }
+
+    /// What prose calls a session that runs as no agent: its CLI and its title (or folder), e.g.
+    /// `Claude · Fix the parser`, as clients name it.
+    pub(crate) fn session_name(&self, id: SessionId) -> Option<String> {
+        let info = self.sessions.get(&id)?;
+        let engine = match info.engine? {
+            Engine::Claude => "Claude",
+            Engine::Codex => "Codex",
+            Engine::OpenCode => "OpenCode",
+            _ => "An agent",
+        };
+        Some(format!("{engine} · {}", info.name.as_deref()?))
+    }
+
+    /// A known session's new title, from `session_updated`.
+    fn retitle(&mut self, id: SessionId, title: &str) {
+        let Some(info) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let name = clean(title, TITLE_CHARS);
+        if name.is_empty() || info.name.as_ref() == Some(&name) {
+            self.sessions.touch(id);
+            return;
+        }
+        info.name = Some(name);
+        self.sessions.touch(id);
+        self.names_version = self.names_version.wrapping_add(1);
     }
 
     pub(crate) fn task(&self, id: TaskId) -> Option<&TaskInfo> {
@@ -484,6 +537,21 @@ impl Directory {
 
 /// The names version after a write of a name: `changed` is `None` for a new entry, else whether
 /// its name changed; `evicted` is what went to make room.
+/// A session's name in prose: its title, else its folder's name, else its folder.
+fn session_name(title: Option<&str>, cwd: &str) -> String {
+    if let Some(title) = title.map(|t| clean(t, TITLE_CHARS))
+        && !title.is_empty()
+    {
+        return title;
+    }
+    let folder = cwd
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default();
+    clean(if folder.is_empty() { cwd } else { folder }, NAME_CHARS)
+}
+
 fn names_moved<K, V>(
     version: u64,
     changed: Option<bool>,
@@ -544,7 +612,8 @@ mod tests {
         let newest = SessionId(Ulid::from(MAX_ENTRIES as u128));
         assert_eq!(dir.session(newest).and_then(|s| s.task), Some(task));
         assert_eq!(dir.task_session(task), Some(newest));
-        assert_eq!(dir.names_version(), 0, "no name was dropped");
+        // A session is named in prose when it runs as no agent: dropping one drops its name.
+        assert_eq!(dir.names_version(), 1, "one session's name was dropped");
     }
 
     #[test]

@@ -89,8 +89,8 @@ use crate::jsonl::Skips;
 use crate::lines::{MAX_LINE_BYTES, SkipReason, SkippedLine};
 use crate::text::title;
 use pitcrew_interfaces::source::{
-    Cursor, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptPage,
-    TranscriptRef,
+    Cursor, Lineage, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem,
+    TranscriptPage, TranscriptRef,
 };
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use serde::{Deserialize, Serialize};
@@ -505,6 +505,22 @@ impl SourceAdapter for OpenCodeAdapter {
             to: end,
             at_start,
         })
+    }
+
+    /// The session's own row (`parent_id`): `Ok(None)` when the store does not hold it.
+    fn lineage(&self, transcript: &TranscriptRef) -> Result<Option<Lineage>, SourceError> {
+        let id = session_id(transcript)?;
+        let store = Store::open(&transcript.path)?;
+        if !store.has_sessions() {
+            return Ok(None);
+        }
+        let row = store.session(id)?;
+        // A read that changed mid-way is not trusted: tried again later.
+        store.finish()?;
+        Ok(row.map(|row| Lineage {
+            is_subagent: row.parent_id.as_deref().is_some_and(|p| !p.is_empty()),
+            parent: parent_of(id, row.parent_id.as_deref()),
+        }))
     }
 }
 

@@ -52,8 +52,9 @@ project?: ProjectId,
  */
 tasks: Array<TaskId>, 
 /**
- * The agent doing the work: the session's agent, or the author of the first tool run, edit
- * or turn.
+ * The agent doing the work: the session's agent. A session that runs as no agent (found on
+ * disk, or started by a person) has none, and prose names the session itself ("Claude ·
+ * its title"), never the person the runner's events are stamped with.
  */
 agent?: MemberId, 
 /**

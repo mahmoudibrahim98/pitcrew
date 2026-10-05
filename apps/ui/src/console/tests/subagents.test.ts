@@ -6,7 +6,15 @@ import { describe, expect, it } from 'vitest';
 import type { Project, Workstream } from '../../data/index.ts';
 import { auditSessions, session } from '../../data/tests/audit-sessions.ts';
 import type { SessionPlaces } from '../facets.ts';
-import { companions, defaultWorkstream, newDefaultWorkstream, parseTarget, within } from '../link-targets.ts';
+import {
+  companions,
+  defaultWorkstream,
+  linkedWorkstream,
+  newDefaultWorkstream,
+  parseTarget,
+  within,
+  type TargetHub,
+} from '../link-targets.ts';
 import { groupSessions } from '../session-list.tsx';
 import { buildRows } from '../transcript.ts';
 
@@ -96,6 +104,43 @@ describe('Link to…', () => {
     const elsewhere = { ...main, locations: [{ machine: MACHINE, path: '/home/sam/work/atlas', branch: 'dev' }] };
     expect(defaultWorkstream(project, [elsewhere])).toBeUndefined();
     expect(newDefaultWorkstream(project)).toEqual({ project: project.id, name: 'Main', locations: [project.root] });
+  });
+
+  it('makes a project’s default once: kept across retries, found when made elsewhere', async () => {
+    const rootless: Project = { ...project, id: '01JB000000000000000PRJ0002', key: 'NR', name: 'notes', root: undefined };
+    let listed: Workstream[] = [main];
+    const created: string[] = [];
+    const hub: TargetHub = {
+      project: (id) => [project, rootless].find((p) => p.id === id),
+      workstreams: async () => listed,
+      createWorkstream: async (w) => {
+        const made: Workstream = { ...main, id: `01JB000000000000000WST01${String(created.length).padStart(2, '0')}`, project: w.project, name: w.name, locations: w.locations ?? [] };
+        created.push(made.id);
+        listed = [...listed, made];
+        return made;
+      },
+    };
+    // A project with a root: its default is found, never made.
+    expect(await linkedWorkstream({ kind: 'project', id: project.id }, '', hub, new Map())).toBe(main.id);
+    expect(created).toEqual([]);
+    // A rootless one: made once; a retry after a failed link uses it.
+    const made = new Map<string, string>();
+    const first = await linkedWorkstream({ kind: 'project', id: rootless.id }, '', hub, made);
+    expect(await linkedWorkstream({ kind: 'project', id: rootless.id }, '', hub, made)).toBe(first);
+    // Another dialog later finds the empty Main rather than making a second.
+    expect(await linkedWorkstream({ kind: 'project', id: rootless.id }, '', hub, new Map())).toBe(first);
+    expect(created).toEqual([first]);
+    // A default made elsewhere since the list was loaded is found in what the hub has now.
+    const elsewhere: Project = { ...project, id: '01JB000000000000000PRJ0003', root: { machine: MACHINE, path: '/home/sam/work/beacon' } };
+    const theirs: Workstream = { ...main, id: '01JB000000000000000WST0099', project: elsewhere.id, locations: [{ machine: MACHINE, path: '/home/sam/work/beacon' }] };
+    listed = [...listed, theirs];
+    const withElsewhere: TargetHub = { ...hub, project: (id) => (id === elsewhere.id ? elsewhere : hub.project(id)) };
+    expect(await linkedWorkstream({ kind: 'project', id: elsewhere.id }, '', withElsewhere, new Map())).toBe(theirs.id);
+    // A named new one: made once per name, across retries.
+    const named = new Map<string, string>();
+    const search = await linkedWorkstream({ kind: 'new', project: project.id }, 'search', hub, named);
+    expect(await linkedWorkstream({ kind: 'new', project: project.id }, 'search', hub, named)).toBe(search);
+    expect(created).toEqual([first, search]);
   });
 
   it('reads its choice', () => {

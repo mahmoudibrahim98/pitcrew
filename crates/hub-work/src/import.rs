@@ -15,42 +15,50 @@ use std::path::PathBuf;
 use std::sync::PoisonError;
 
 /// Sub-agents followed up their chain of parents for at most this many sessions, the session
-/// itself included: past it (or in a loop) the session is judged by itself.
+/// itself included: past it the session stands on its own.
 const MAX_PARENT_CHAIN: usize = 16;
 
-/// The session whose inclusion decides `session`'s: a sub-agent follows its parent, up the chain,
-/// to the first session without one. A parent the hub does not know, a loop, or a chain past
-/// [`MAX_PARENT_CHAIN`] stops the climb where it is.
+/// The top of `session`'s chain of parents: the first session whose parent the hub does not know
+/// (it names none, or one the hub never saw), `session` itself when that is it. `None` when the
+/// chain ends nowhere (a loop, or one past [`MAX_PARENT_CHAIN`]): the session then stands on its
+/// own, as clients show it.
+fn root<'a>(
+    session: &'a Session,
+    by_id: &impl Fn(&SessionId) -> Option<&'a Session>,
+) -> Option<&'a Session> {
+    let mut at = session;
+    for _ in 0..MAX_PARENT_CHAIN {
+        match at.parent.as_ref().and_then(by_id) {
+            Some(parent) => at = parent,
+            None => return Some(at),
+        }
+    }
+    None
+}
+
+/// The session whose inclusion decides `session`'s: the top of its chain, or itself when it
+/// stands on its own ([`root`]).
 fn deciding<'a>(
     session: &'a Session,
     by_id: &impl Fn(&SessionId) -> Option<&'a Session>,
 ) -> &'a Session {
-    let mut at = session;
-    for _ in 1..MAX_PARENT_CHAIN {
-        let Some(parent) = at.parent.as_ref().and_then(by_id) else {
-            break;
-        };
-        if parent.id == session.id {
-            break;
-        }
-        at = parent;
-    }
-    at
+    root(session, by_id).unwrap_or(session)
 }
 
-/// Whether `session` is included, as a sub-agent through its parent.
+/// Whether `session` is included, a sub-agent through the top of its chain of parents ([`root`]).
 fn included(c: &Connection, choice: &ImportChoice, session: &Session) -> Result<bool> {
     let mut at = session.clone();
-    for _ in 1..MAX_PARENT_CHAIN {
-        let Some(parent) = at.parent else {
-            break;
+    for _ in 0..MAX_PARENT_CHAIN {
+        let parent = match at.parent {
+            Some(parent) => query::session(c, &parent)?,
+            None => None,
         };
-        match query::session(c, &parent)? {
-            Some(p) if p.id != session.id => at = p,
-            _ => break,
+        match parent {
+            Some(p) => at = p,
+            None => return Ok(choice.includes(&at)),
         }
     }
-    Ok(choice.includes(&at))
+    Ok(choice.includes(session))
 }
 
 #[derive(Debug, Default)]
@@ -100,21 +108,24 @@ impl WorkService {
         Ok(ImportDryRun { count, subagents })
     }
 
-    /// Included sessions without a parent, and included sub-agents (sessions with one, which
-    /// follow it).
+    /// Included sessions, and apart from them included sub-agents: sessions nested under the top
+    /// of their chain of parents ([`root`]), which they follow.
     fn import_count(&self, choice: &ImportChoice) -> Result<(usize, usize)> {
         let sessions = self.read(|c| query::sessions(c, &SessionFilter::default()))?;
         let by_id: HashMap<SessionId, &Session> = sessions.iter().map(|s| (s.id, s)).collect();
         let lookup = |id: &SessionId| by_id.get(id).copied();
         let (mut count, mut subagents) = (0, 0);
         for s in &sessions {
-            if !choice.includes(deciding(s, &lookup)) {
+            let top = deciding(s, &lookup);
+            if !choice.includes(top) {
                 continue;
             }
-            if s.parent.is_some() {
-                subagents += 1;
-            } else {
+            // A sub-agent nests under the top of its chain; one naming a parent the hub never saw,
+            // or in a loop of parents, is a session of its own.
+            if top.id == s.id {
                 count += 1;
+            } else {
+                subagents += 1;
             }
         }
         Ok((count, subagents))
@@ -151,6 +162,23 @@ impl WorkService {
         Ok(ImportResult {
             imported,
             subagents,
+        })
+    }
+
+    /// The indexed sessions `filter` matches that the import includes: a sub-agent exactly when
+    /// its parent is, whether or not the filter matches the parent.
+    /// # Errors
+    /// Database errors.
+    pub fn included_sessions(&self, filter: &SessionFilter) -> Result<Vec<Session>> {
+        let choice = self.import_choice();
+        self.read(|c| {
+            let mut out = Vec::new();
+            for s in query::sessions(c, filter)? {
+                if included(c, &choice, &s)? {
+                    out.push(s);
+                }
+            }
+            Ok(out)
         })
     }
 

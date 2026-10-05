@@ -552,15 +552,9 @@ async fn list_sessions(Work(w): Work, Person(_): Person, params: Params) -> Repl
         task: params.one("task")?,
         states: params.all("state")?,
     };
+    // A sub-agent is listed exactly when its parent is (api-v1.md, "Session import").
     Ok(Json(
-        blocking(w, move |w| {
-            let choice = w.import_choice();
-            Ok(w.sessions(&filter)?
-                .into_iter()
-                .filter(|s| choice.includes(s))
-                .collect())
-        })
-        .await?,
+        blocking(w, move |w| w.included_sessions(&filter)).await?,
     ))
 }
 

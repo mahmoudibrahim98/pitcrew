@@ -71,7 +71,9 @@ reports it:
   watches **in the sub-agent's own home**:
   - **Claude**: `<session>.jsonl` beside a `<session>/subagents/` folder; for an older top-level
     sidechain transcript (`isSidechain` records), `<sessionId>.jsonl` in its own folder;
-  - **OpenCode**: the session its `parent_id` names, in the same store;
+  - **OpenCode**: the session its `parent_id` names, in the same store, if the store holds it
+    (asked through the adapter's `SourceAdapter::lineage`); a session it names that is not there
+    gets no row, and the child has no parent;
   - **Codex**: the rollout whose id its `source.subagent.thread_spawn.parent_thread_id` names,
     among the rollouts tracked in the same home, else in the sub-agent's own day folder. A review
     or compaction sub-agent (`source.subagent` a string) names no parent.
@@ -83,6 +85,16 @@ reports it:
   at once, which its discovery then keeps. A sub-agent whose parent is not found has none, is
   judged by its own answer alone, and is a session of its own in the hub. A Codex sub-agent read
   before its parent was discovered, whose rollout is not in its own day folder, has none either.
+- **Sub-agents indexed before parents were kept.** A runner before this one stated Codex's and
+  OpenCode's sub-agents, and Claude's older top-level sidechains, with no parent. The store's
+  migration 0006 lists those (`lineage_pending`). At the next start, before discovery, each is
+  looked up once (`Watcher::reparent`): its head is read again as the machine scan reads it
+  (`SourceAdapter::lineage`, never the whole transcript), its parent found as at discovery, and
+  one that has a parent is stated again (`session_discovered`, with an id of its own,
+  `Cause::Lineage`, and its own folder or branch link), so the hub nests it. It leaves the list
+  once that is settled: no parent found, or, at a later start, the re-statement saved with its
+  row (a crash in between states it again with the same id). A lookup that fails is tried again
+  at the next start.
 - **Which session a hook names.** A hook names the CLI's own id; a sub-agent's is whatever its
   transcript says (`agentId`). Sessions and sub-agents are looked up apart, sessions first: a
   sub-agent named like a session never takes that session's hooks, whichever is found first.

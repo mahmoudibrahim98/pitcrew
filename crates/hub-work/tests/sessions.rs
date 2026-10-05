@@ -49,7 +49,8 @@ async fn sessions_list_with_every_filter() {
             format!("?machine={LAPTOP}"),
             vec![ses(1), ses(3), ses(4), ses(6)],
         ),
-        (format!("?machine={CLUSTER}"), vec![ses(2)]),
+        // SES0007 is SES0002's sub-agent, on the cluster, in the same workstream: it ended.
+        (format!("?machine={CLUSTER}"), vec![ses(2), ses(7)]),
         (format!("?workstream={SUBMISSION}"), vec![ses(1), ses(6)]),
         (format!("?workstream={PARSERS}"), vec![ses(3), ses(4)]),
         (format!("?task={PAP1}"), vec![ses(1)]),
@@ -61,7 +62,7 @@ async fn sessions_list_with_every_filter() {
         ),
         (format!("?machine={LAPTOP}&state=ended"), vec![ses(6)]),
         (format!("?workstream={SEED_RUNS}&state=idle"), vec![]),
-        ("?state=".to_owned(), (1..=6).map(ses).collect()),
+        ("?state=".to_owned(), (1..=7).map(ses).collect()),
     ] {
         let got = get(&app, sam, &format!("/v1/sessions{query}")).await;
         expect(&got, 200);

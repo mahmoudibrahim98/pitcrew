@@ -26,7 +26,7 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import type { Session } from '../data/index.ts';
+import { isNested, sessionsById, type Session } from '../data/index.ts';
 import { Badge, Button, ChevronRightIcon, Kbd, ResizablePanel } from '../design/index.ts';
 import { paths, SHELL_KEYS_ATTRIBUTE, useWorkspaceId } from '../shell/index.ts';
 import { StartSessionButton } from './start-session-button.tsx';
@@ -311,6 +311,10 @@ export function ConsolePage() {
   };
 
   const active = facetCount(facets);
+  // Sessions, as the sidebar counts them: a sub-agent is part of its parent's (shown under it).
+  const allById = sessionsById(all);
+  const agents = (list: readonly Session[]) => list.filter((s) => !isNested(s, allById)).length;
+  const [shownCount, allCount] = [agents(sessions), agents(all)];
   const filters = (
     <div data-pane="filters" className="min-h-0 flex-1 overflow-y-auto">
       <SessionFilters value={facets} onChange={setFacets} />
@@ -321,7 +325,7 @@ export function ConsolePage() {
       <div className="flex h-11 shrink-0 items-center gap-2 border-b border-line pr-2 pl-3">
         <h1 className="text-md font-semibold whitespace-nowrap">Agent console</h1>
         <span className="truncate text-xs text-ink-2 tabular-nums" data-testid="session-count">
-          {active > 0 ? `${sessions.length} of ${all.length}` : all.length} {all.length === 1 ? 'session' : 'sessions'}
+          {active > 0 ? `${shownCount} of ${allCount}` : allCount} {allCount === 1 ? 'session' : 'sessions'}
         </span>
         <StartSessionButton />
         <Button variant="ghost" className="ml-auto" aria-pressed={filtersShown} onClick={() => showFilters(!filtersShown)}>
