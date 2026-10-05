@@ -40,6 +40,13 @@ pub(crate) struct Facts {
     /// `session_discovered` named, so a restart does not derive another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<Parent>,
+    /// `session_updated` events emitted so far; they make their ids unique.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub updates: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A session's parent, as the runner found it.
@@ -73,6 +80,7 @@ impl Default for Facts {
             linked: None,
             links: 0,
             parent: None,
+            updates: 0,
         }
     }
 }

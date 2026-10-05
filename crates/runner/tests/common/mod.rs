@@ -265,12 +265,43 @@ pub fn label(e: &Event) -> String {
         } => format!("turn@{offset}"),
         EventBody::SessionEnded { .. } => "ended".into(),
         EventBody::SessionLinked { basis, .. } => format!("linked:{basis:?}"),
+        EventBody::SessionUpdated {
+            title,
+            branch,
+            model,
+            ..
+        } => {
+            let changed: Vec<&str> = [("title", title), ("branch", branch), ("model", model)]
+                .into_iter()
+                .filter(|(_, v)| v.is_some())
+                .map(|(k, _)| k)
+                .collect();
+            format!("updated:{}", changed.join(","))
+        }
         other => format!("{other:?}"),
     }
 }
 
 pub fn labels(events: &[Event]) -> Vec<String> {
     events.iter().map(label).collect()
+}
+
+/// [`labels`], without `session_updated` events: where one lands depends on how a transcript's
+/// writes were split into reads.
+pub fn labels_without_updates(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter(|e| !matches!(e.body, EventBody::SessionUpdated { .. }))
+        .map(label)
+        .collect()
+}
+
+/// How many `session_updated` events name a new title.
+pub fn title_updates(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(&e.body, EventBody::SessionUpdated { title: Some(_), .. }))
+        .count()
 }
 
 pub fn fixture_transcript() -> PathBuf {
@@ -318,6 +349,7 @@ pub fn session_of(e: &Event) -> Option<pitcrew_protocol::ids::SessionId> {
         | EventBody::FileEdited { session, .. }
         | EventBody::TurnEnded { session, .. }
         | EventBody::SessionEnded { session }
+        | EventBody::SessionUpdated { session, .. }
         | EventBody::SessionLinked { session, .. } => Some(*session),
         _ => None,
     }

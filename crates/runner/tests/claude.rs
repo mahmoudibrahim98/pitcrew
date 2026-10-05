@@ -154,6 +154,7 @@ fn session_of(e: &pitcrew_protocol::events::Event) -> Option<pitcrew_protocol::i
         EventBody::SessionStateChanged { session, .. }
         | EventBody::ToolRan { session, .. }
         | EventBody::FileEdited { session, .. }
+        | EventBody::SessionUpdated { session, .. }
         | EventBody::TurnEnded { session, .. } => Some(*session),
         _ => None,
     }
@@ -208,7 +209,7 @@ fn appended_lines_become_the_right_events() {
     runner.stop();
     let events = sink.events();
     assert_eq!(
-        labels(&events[3..]),
+        common::labels_without_updates(&events[3..]),
         [
             "tool:Edit",
             "edit:method.tex",
@@ -220,6 +221,8 @@ fn appended_lines_become_the_right_events() {
             "turn@6514",
         ]
     );
+    // The custom title, written after the first read, reaches the hub.
+    assert_eq!(common::title_updates(&events), 1, "{:?}", labels(&events));
     let bash = events
         .iter()
         .find_map(|e| match &e.body {
@@ -364,7 +367,11 @@ fn truncation_and_replacement_are_reindexed_from_the_start() {
     sink.wait_for(n + 2, WAIT).expect("events after truncation");
     std::thread::sleep(Duration::from_millis(300));
     let events = sink.events();
-    assert_eq!(labels(&events[n..]), ["state:Working", "tool:TodoWrite"]);
+    // The title falls back to the first prompt again: a session update.
+    assert_eq!(
+        labels(&events[n..]),
+        ["updated:title", "state:Working", "tool:TodoWrite"]
+    );
     assert_eq!(reindex_notes(&path), before + 1, "a note in the log");
 
     // Replace with a new file (a new inode), larger than the truncated one.
@@ -377,7 +384,7 @@ fn truncation_and_replacement_are_reindexed_from_the_start() {
     runner.stop();
     assert!(got.is_some(), "events after replacement");
     let events = sink.events();
-    let after = labels(&events[n..]);
+    let after = common::labels_without_updates(&events[n..]);
     assert_eq!(after.first().map(String::as_str), Some("tool:TodoWrite"));
     assert_eq!(after.last().map(String::as_str), Some("turn@6514"));
     assert_eq!(reindex_notes(&path), before + 2, "a note in the log");
@@ -424,7 +431,7 @@ fn a_deleted_transcript_is_dropped_and_keeps_its_session_if_it_returns() {
     let events = sink.events();
     assert!(events[3..].iter().all(|e| session_of(e) == Some(session)));
     assert_eq!(
-        labels(&events[3..5]),
+        common::labels_without_updates(&events[3..])[..2],
         ["tool:TodoWrite", "tool:Read"],
         "from the start: {:?}",
         labels(&events)
@@ -580,7 +587,13 @@ fn a_symlinked_home_keeps_its_session_ids_even_if_it_appears_later() {
     std::thread::sleep(Duration::from_millis(300));
     runner.stop();
     let first = sink.events();
-    assert_eq!(first.len(), 11, "{:?}", labels(&first));
+    assert_eq!(
+        common::labels_without_updates(&first).len(),
+        11,
+        "{:?}",
+        labels(&first)
+    );
+    let base = first.len();
     let session = session_of(&first[0]).unwrap();
 
     // Second run, the same home by its real path: nothing is sent again...
@@ -591,11 +604,12 @@ fn a_symlinked_home_keeps_its_session_ids_even_if_it_appears_later() {
     )
     .unwrap();
     std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(sink.len(), 11, "{:?}", labels(&sink.events()[11..]));
+    assert_eq!(sink.len(), base, "{:?}", labels(&sink.events()[base..]));
 
     // ...and a new line belongs to the same session.
     append(&real.join(path.strip_prefix(&link).unwrap()), &lines[0]);
-    sink.wait_for(12, WAIT).expect("event for the new line");
+    sink.wait_for(base + 1, WAIT)
+        .expect("event for the new line");
     runner.stop();
     let last = sink.events().pop().unwrap();
     assert_eq!(common::label(&last), "state:Working");

@@ -106,12 +106,14 @@ fn the_fixture_reaches_the_store_once_across_a_crash_and_resend() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(stored(&store).len(), 3, "the replay adds nothing");
     append(&path, &lines[5..].concat());
-    wait_for(&store, EXPECTED.len());
+    // And the custom title the rest of the transcript sets: a session update.
+    wait_for(&store, EXPECTED.len() + 1);
     std::thread::sleep(Duration::from_millis(300));
     runner.stop();
 
     let events = stored(&store);
-    assert_eq!(labels(&events), EXPECTED);
+    assert_eq!(common::labels_without_updates(&events), EXPECTED);
+    assert_eq!(common::title_updates(&events), 1);
     let ids: HashSet<_> = events.iter().map(|e| e.id).collect();
     assert_eq!(ids.len(), events.len(), "each event once");
     // Agentless sessions' events are authored by the configured owner.

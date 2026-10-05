@@ -223,7 +223,7 @@ fn a_stop_hook_beats_the_watcher_and_the_transcript_then_agrees() {
     // Idle comes from the hook, first. The transcript's items, all timestamped before the hook, add
     // their tools and turn end but no state changes: nothing is said twice or undone.
     assert_eq!(
-        labels(&events[3..]),
+        common::labels_without_updates(&events[3..]),
         [
             "state:Idle",
             "tool:Edit",
