@@ -1,17 +1,20 @@
-//! The integrations' routes (api-v1.md, "Integrations"). Device tokens only: the API layer's
-//! `device_only` refuses an agent before any of these runs. Bodies are at most 64 KiB, and a body
-//! that does not parse is `400` with a fixed message, never one that could echo a secret back.
+//! The integrations' routes (api-v1.md, "Integrations" and "Outward writes"). Device tokens only:
+//! the API layer's `device_only` refuses an agent before any of these runs. Bodies are at most
+//! 64 KiB, and a body that does not parse is `400` with a fixed message, never one that could
+//! echo a secret back.
 
 use super::{Integrations, Refusal};
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
+use pitcrew_hub_work::WriteFilter;
 use pitcrew_protocol::api::{ApiError, Caller, ErrorCode};
-use pitcrew_protocol::ids::IntegrationId;
+use pitcrew_protocol::ids::{AskId, IntegrationId, TaskId};
 use pitcrew_protocol::integrations::{NewCredential, NewIntegration};
+use pitcrew_protocol::writes::{NewWrite, WriteState};
 use std::sync::Arc;
 
 /// The largest body these routes read.
@@ -42,6 +45,9 @@ pub fn routes(integrations: Arc<Integrations>) -> Router {
         .route("/v1/integrations/{id}/test", post(test))
         .route("/v1/integrations/{id}/sync", post(sync_now))
         .route("/v1/integrations/{id}/credential", put(credential))
+        .route("/v1/writes", get(list_writes).post(request_write))
+        .route("/v1/writes/{id}", get(one_write))
+        .route("/v1/writes/{id}/retry", post(retry_write))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(integrations)
 }
@@ -110,4 +116,79 @@ async fn credential(
         .await
         .map_err(|_| Refusal::internal("Storing the secret"))??;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// A write's id in the path: its approval ask's. Anything else names no write (`404`).
+fn write_id(raw: &str) -> Result<AskId, Refusal> {
+    raw.parse()
+        .map_err(|_| Refusal::new(ErrorCode::NotFound, "No such write."))
+}
+
+/// `?task=&state=` (`state` may repeat; empty values are ignored); other parameters are ignored.
+fn write_filter(query: Option<&str>) -> Result<WriteFilter, Refusal> {
+    let mut filter = WriteFilter::default();
+    for (name, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        // An empty value counts as absent, as on the other list routes.
+        if value.is_empty() {
+            continue;
+        }
+        match name.as_ref() {
+            "task" => {
+                let task: TaskId = value
+                    .parse()
+                    .map_err(|_| Refusal::new(ErrorCode::Invalid, "task must be a task id."))?;
+                filter.task = Some(task);
+            }
+            "state" => {
+                let state: WriteState = serde_json::from_value(serde_json::Value::String(
+                    value.into_owned(),
+                ))
+                .map_err(|_| {
+                    Refusal::new(
+                        ErrorCode::Invalid,
+                        "state must be pending, approved, denied, sending, sent, failed \
+                                 or not_sent.",
+                    )
+                })?;
+                filter.states.push(state);
+            }
+            _ => {}
+        }
+    }
+    Ok(filter)
+}
+
+async fn list_writes(State(i): Shared, RawQuery(query): RawQuery) -> Result<Response, Refusal> {
+    let filter = write_filter(query.as_deref())?;
+    Ok(Json(i.list_writes(filter).await?).into_response())
+}
+
+async fn one_write(State(i): Shared, Path(raw): Path<String>) -> Result<Response, Refusal> {
+    Ok(Json(i.get_write(write_id(&raw)?).await?).into_response())
+}
+
+async fn request_write(
+    State(i): Shared,
+    Extension(caller): Extension<Caller>,
+    parsed: Result<Json<NewWrite>, JsonRejection>,
+) -> Result<Response, Refusal> {
+    let new = body(parsed, "NewWrite (api-v1.md, \"Outward writes\")")?;
+    Ok((
+        StatusCode::CREATED,
+        Json(i.request_write(&caller, new).await?),
+    )
+        .into_response())
+}
+
+async fn retry_write(
+    State(i): Shared,
+    Extension(caller): Extension<Caller>,
+    Path(raw): Path<String>,
+) -> Result<Response, Refusal> {
+    let ask = write_id(&raw)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(i.retry_write(&caller, ask).await?),
+    )
+        .into_response())
 }

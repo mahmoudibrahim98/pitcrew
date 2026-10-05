@@ -9,8 +9,9 @@ node tests/conformance/run.mjs daemon
 
 Both commands run `onboarding.test.mjs` on its own, then the same `api.test.mjs`, `scan.test.mjs`
 and `files.test.mjs`, then `import.test.mjs` on its own, then `integrations.test.mjs` on its own
-(its syncs append events, which the main suite's exact-revision checks must not see). Every phase
-runs, and the first failure decides the exit code. No npm dependency is needed. The
+(its syncs append events, which the main suite's exact-revision checks must not see), then
+`writes.test.mjs` on its own (it connects the same repository). Every phase runs, and the first
+failure decides the exit code. No npm dependency is needed. The
 daemon runner builds `pitcrewd` and `pitcrew-ptyd` with the locked workspace dependencies, starts a
 seeded demo on an OS-assigned free loopback port, and reads its two private token files without
 printing them. Each runner creates an empty temporary home and cleans up its child process and
@@ -99,3 +100,17 @@ the recorded fixtures in `apps/mock-hub/fixtures` that `run.mjs` makes
 fixture file that sorts first. The daemon runner passes `--integration-fixtures` and puts a
 stand-in `gh` (printing a synthetic credential) first on the daemon's `PATH`; the mock gets
 `startServer({ integrationFixtures })`. Nothing reaches GitHub or Jira.
+
+`writes.test.mjs` covers "Outward writes: every one approved first": the routes refused to an
+agent (`403`), unknown ids `404`, malformed requests `400`; a hub task in a workstream linked to
+milestone 2 that asks to create an issue (an `approval` ask with exactly what will be sent),
+denied (recorded as not sent, never started), asked again and approved (sent once; the new issue
+`#8` becomes the task's source; a second create is `409`); a move to `done` that the hub turns into
+a proposal to close the issue, approved and sent (after reading the issue as upstream has it
+now); a comment upstream refuses (`422` in the fixtures), failed, and a retry (a logged
+`write_retry_requested`) that looks upstream for the earlier attempt, finds none and sends it once
+more; then, with the fixture copy saying the comment is there after all, a second retry that finds
+it and records it as sent without commenting again; a retry by a person the ask is not addressed
+to (`403`) and of a sent write (`409`); the task's writes and their events in order; and an
+approval ask an agent raised itself, which proposes nothing. The daemon sends writes in the
+background, so the test polls for each outcome.

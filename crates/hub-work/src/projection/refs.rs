@@ -10,7 +10,8 @@
 //!   project; a `task_updated` that moves the task to another workstream is about the new one, and
 //!   so is every later event about the task;
 //! - `dispatch_finished` and `ask_answered` are about the task and session of their dispatch or
-//!   ask.
+//!   ask;
+//! - `write_proposed`, `write_started` and `write_finished` are about the task they name.
 //!
 //! The parents come from this projection's own `work_ref_parents`, never from the other work
 //! tables (a projection reads only its own), and follow the same rules: a session keeps a firm
@@ -34,7 +35,7 @@ pub struct Refs;
 impl Refs {
     /// The projection's name.
     pub const NAME: &'static str = "work.refs";
-    const VERSION: u32 = 2;
+    const VERSION: u32 = 3;
 }
 
 /// What an event is about, as bare ULIDs.
@@ -315,6 +316,12 @@ fn direct(tx: &Transaction<'_>, body: &EventBody) -> Result<About, BoxError> {
         }
         EventBody::DecisionRecorded { workstream, .. } => {
             about.workstream = workstream.as_ref().map(IdText::text);
+        }
+        EventBody::WriteProposed { write } => about.task = write.task.as_ref().map(IdText::text),
+        EventBody::WriteStarted { task, .. }
+        | EventBody::WriteRetryRequested { task, .. }
+        | EventBody::WriteFinished { task, .. } => {
+            about.task = task.as_ref().map(IdText::text);
         }
         // Machines, members, personas and teams belong to the workspace, not to any work.
         _ => {}

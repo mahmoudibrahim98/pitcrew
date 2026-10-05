@@ -221,14 +221,16 @@ try {
   }
   // One phase per file (or group) that changes the hub for every view, in this order:
   // onboarding.test.mjs first, then the main suite, then import.test.mjs, which commits session
-  // inclusion (and restores it), and integrations.test.mjs last, which syncs, appending events that
-  // the main suite's exact-revision checks must not see. Every phase runs; the first failure
+  // inclusion (and restores it), then integrations.test.mjs, which syncs, appending events that
+  // the main suite's exact-revision checks must not see, and writes.test.mjs last, on its own: it
+  // connects the same repository integrations.test.mjs does. Every phase runs; the first failure
   // decides the exit code.
   for (const files of [
     ['tests/conformance/onboarding.test.mjs'],
     ['tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
     ['tests/conformance/import.test.mjs'],
     ['tests/conformance/integrations.test.mjs'],
+    ['tests/conformance/writes.test.mjs'],
   ]) {
     suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,

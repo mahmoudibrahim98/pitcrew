@@ -23,6 +23,20 @@ pub enum FieldOwner {
     Mirrored,
 }
 
+/// What a change made in PitCrew to a field means upstream: the table's other direction (api-v1.md,
+/// "Outward writes"). Whatever it says, nothing is sent until a person approves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outward {
+    /// Upstream owns the field, so a person's change in PitCrew is a conflict, raised as an
+    /// approval ask to send the new value upstream (an `update`).
+    AskToSend,
+    /// A move across the open/closed line (into or out of `done` and `canceled`) raises an
+    /// approval ask to close or reopen the issue.
+    AskToCloseOrReopen,
+    /// Never sent upstream.
+    Never,
+}
+
 /// One row of the field-ownership table.
 #[derive(Clone, Copy, Debug)]
 pub struct FieldOwnership {
@@ -30,8 +44,20 @@ pub struct FieldOwnership {
     pub field: &'static str,
     /// Who owns it.
     pub owner: FieldOwner,
+    /// What a change in PitCrew to it means upstream.
+    pub outward: Outward,
     /// Why.
     pub note: &'static str,
+}
+
+/// What a change in PitCrew to `field` means upstream, by `table`; [`Outward::Never`] for a field
+/// the table does not list.
+#[must_use]
+pub fn outward(table: &[FieldOwnership], field: &str) -> Outward {
+    table
+        .iter()
+        .find(|row| row.field == field)
+        .map_or(Outward::Never, |row| row.outward)
 }
 
 /// The field-ownership table for GitHub issues mirrored as tasks.
@@ -39,26 +65,31 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "title",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue title always overwrites the task's title.",
     },
     FieldOwnership {
         field: "body",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue body always overwrites the task's description.",
     },
     FieldOwnership {
         field: "labels",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "GitHub labels always overwrite the task's labels.",
     },
     FieldOwnership {
         field: "milestone",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue's milestone always overwrites the task's linked milestone reference.",
     },
     FieldOwnership {
         field: "status",
         owner: FieldOwner::Mirrored,
+        outward: Outward::AskToCloseOrReopen,
         note: "Moved only through TaskStatus::can_move(.., Mover::Sync): an upstream close \
                proposes `done`, a reopen proposes `todo`, and in-progress work is never touched. \
                A disallowed move raises a conflict ask instead of being dropped.",
@@ -66,6 +97,7 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "assignee",
         owner: FieldOwner::Hub,
+        outward: Outward::Never,
         note: "The hub's assignee is never changed by sync. Upstream assignee changes are still \
                recorded as UpstreamChange::IssueReassigned for visibility, but `plan` emits no \
                intent for them.",
@@ -78,12 +110,14 @@ pub const MILESTONE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "name",
         owner: FieldOwner::Hub,
+        outward: Outward::Never,
         note: "A person named the workstream; an upstream rename is shown on the link only, and \
                never renames the workstream.",
     },
     FieldOwnership {
         field: "status",
         owner: FieldOwner::Mirrored,
+        outward: Outward::Never,
         note: "A milestone closed upstream proposes `shipped`, from idea, active or paused only, \
                and never while one of the workstream's tasks is in progress: that raises a \
                conflict ask instead. A shipped or dropped workstream is left as it is.",
@@ -641,6 +675,28 @@ mod tests {
                 .map(|row| row.owner),
             Some(FieldOwner::Hub)
         );
+    }
+
+    #[test]
+    fn the_tables_say_what_a_change_in_pitcrew_means_upstream() {
+        for field in ["title", "body", "labels", "milestone"] {
+            assert_eq!(
+                outward(ISSUE_FIELD_OWNERSHIP, field),
+                Outward::AskToSend,
+                "{field}"
+            );
+            let row = ISSUE_FIELD_OWNERSHIP.iter().find(|r| r.field == field);
+            assert_eq!(row.map(|r| r.owner), Some(FieldOwner::Upstream));
+        }
+        assert_eq!(
+            outward(ISSUE_FIELD_OWNERSHIP, "status"),
+            Outward::AskToCloseOrReopen
+        );
+        assert_eq!(outward(ISSUE_FIELD_OWNERSHIP, "assignee"), Outward::Never);
+        assert_eq!(outward(ISSUE_FIELD_OWNERSHIP, "priority"), Outward::Never);
+        for row in MILESTONE_FIELD_OWNERSHIP {
+            assert_eq!(row.outward, Outward::Never, "{}", row.field);
+        }
     }
 
     #[test]

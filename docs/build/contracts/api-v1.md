@@ -677,11 +677,12 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   session lists, activity and recaps after committing a choice.
 - All three routes reject agent tokens with 403, before reading a body.
 
-### Integrations: GitHub and Jira, read-only
+### Integrations: GitHub and Jira
 
 A person connects GitHub repositories or Jira projects to the workspace, links workstreams to
 upstream scopes ("Linking a workstream upstream"), and the hub keeps tasks in step with upstream.
-**The hub only reads upstream**: no route here writes to GitHub or Jira. Every route is **device
+**A sync only reads upstream**: no route here writes to GitHub or Jira, and every write goes
+through a person's approval first ("Outward writes", below). Every route is **device
 tokens only** (an agent token gets `403`, before anything else is checked). Types are in
 `crates/protocol/src/integrations.rs`.
 
@@ -772,10 +773,10 @@ the integration is added) and on `POST …/sync`, one integration at a time:
   or under an epic that routes to a workstream this way. Issues in no linked scope, and issues
   already closed when first seen, are skipped (`skipped`). The task's `source` is the issue, its
   status `todo`.
-- **Field owners.** Title, description and labels belong to upstream: an upstream change
-  overwrites them (`task_updated`). The assignee belongs to the hub. A change of milestone or epic
-  moves the task to the workstream that links the new one (in the same project); otherwise it
-  stays.
+- **Field owners** (the tables are in "Outward writes"). Title, description and labels belong to
+  upstream: an upstream change overwrites them (`task_updated`). The assignee belongs to the hub. A
+  change of milestone or epic moves the task to the workstream that links the new one (in the same
+  project); otherwise it stays.
 - **Moves follow `can_move(.., sync)`.** An upstream close moves the task to `done`, a reopen moves
   a done task to `todo` (`task_moved`, mover `sync`). In-progress work is never touched: a move the
   rules refuse becomes an ask instead (a **conflict**, below).
@@ -805,6 +806,178 @@ in memory only. The daemon reads them the same way when started with the hidden
 `--integration-fixtures <dir>` (tests only; it then never reaches the network). Both read the
 folder again at each sync, so a test changes what upstream says by adding a file whose name sorts
 first.
+
+### Outward writes: every one approved first
+
+PitCrew can change GitHub and Jira (create an issue from a task, comment, close or reopen, change
+the title, description or labels, set a milestone or epic), but **nothing is sent upstream until a
+person approves it**. A hub change that implies a write raises an ask of kind `approval` that shows
+exactly what will be sent; the hub sends it only after the person answers **Send**, and records
+the result as an event. Every route here is **device tokens only** (an agent token gets `403`
+before anything else is checked). Types are in `crates/protocol/src/writes.rs`.
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/writes?task=&state=` | → `UpstreamWrite[]` | Oldest first; `state` may repeat. |
+| `GET /v1/writes/{id}` | → `UpstreamWrite` | `id` is the approval ask's id. |
+| `POST /v1/writes` | `NewWrite` → `UpstreamWrite` (201) | A person asks for a write: see below. |
+| `POST /v1/writes/{id}/retry` | → `UpstreamWrite` (202) | Asks to send a `failed` write again: see "Retrying". |
+
+**Field owners, both ways.** Each field has one owner. A sync applies upstream's changes to the
+fields upstream owns ("What a sync does"); a person's change in PitCrew to a field upstream owns is
+a conflict, raised as an approval to send it. The hub's own fields are never sent.
+
+GitHub issue ↔ task:
+
+| Field | Owner | Upstream → PitCrew (a sync) | PitCrew → upstream (after approval) |
+|---|---|---|---|
+| `title` | GitHub | overwrites the task's title | a person's change: `update`, only when the hub holds upstream's title exactly ("Only what the hub holds exactly") |
+| `body` | GitHub | overwrites the task's description | a person's change: `update`, only when the hub holds upstream's body exactly |
+| `labels` | GitHub | overwrite the task's labels | a person's change: `update`, as the labels added and removed; every other label upstream is kept |
+| `milestone` | GitHub | moves the task to the workstream that links the new milestone (same project) | moving the task to a workstream that links another milestone of its repository: `update` |
+| `state` | both, through rules | a close moves the task to `done`, a reopen a done task to `todo`, when `can_move(.., sync)` allows | a move into `done` or `canceled` closes the issue (`close`, reason `completed` or `not_planned`); a move out of them reopens it (`reopen`) |
+| `assignees` | PitCrew | never read into the task | never sent |
+
+Jira issue ↔ task: the same, with `summary` for the title, `description` for the body, the
+**epic** for the milestone (Cloud's `parent`; Data Center's `epic_link_field`, so Data Center gets
+no epic writes without one), and the status category for the state (`close` is a transition into
+the Done category, `reopen` one into To Do; the first such transition the issue's workflow offers).
+The assignee belongs to PitCrew.
+
+**What raises an approval.**
+- **Implied by a change** in the event log, authored by anyone but a sync (any integration's own
+  sync member: a sync's changes come from upstream and are never sent back), on a task whose
+  `source` is an issue of a repository or Jira project an integration syncs:
+  - `task_moved` across the open/closed line (`done` and `canceled` are closed): `close` or `reopen`;
+  - `task_updated` with `title`, `description` or `labels`, or a `workstream` that links another
+    milestone or epic of the issue's repository or project: one `update` with those fields, for an
+    issue a sync has read (an `update` is checked against upstream's values as last read; a change
+    to an issue no sync has read yet, such as one PitCrew just created, proposes nothing).
+
+  Nothing is raised when upstream already has the value (as the last sync read it), and one change
+  raises one approval, never two (it names the change as `cause`). Creating a task never creates an
+  issue by itself.
+- **Only what the hub holds exactly is sent back.** A sync keeps upstream's text in the form the
+  hub can hold: hidden characters stripped, titles and bodies cut to their caps, Jira Cloud's rich
+  text turned into plain lines. Writing that copy back would replace what PitCrew never held, so:
+  - the **title** and the **description** are proposed only when the last read was lossless
+    (`IssueSnapshot::title_lossless` and `body_lossless` in the sync crates): what the hub holds
+    equals what upstream sent, and on Jira Cloud the description is plain paragraphs of
+    unformatted text, the form PitCrew writes. Otherwise that field is left out (the ask says so
+    when other fields are sent), nothing is raised for it alone, and the hub keeps its own value
+    until upstream next changes it;
+  - **labels** are sent as a change, `add_labels` and `remove_labels`: the labels the person added
+    and removed, against upstream's as last read and as the hub holds them (at most 32, each cut to
+    64 characters). Labels upstream has that the hub does not hold are never touched.
+- **Asked for by a person**, `POST /v1/writes` with `NewWrite`: `{ "task": TaskId, "operation":
+  "create_issue" | "comment", "text"?: String }`.
+  - `create_issue`: the task must not mirror an issue yet (`409`), and its workstream must link a
+    scope an integration syncs (`400` otherwise): the first such link in the workstream's list
+    names the repository or project, and the milestone or epic when it is one. It sends the task's
+    title, description and labels.
+  - `comment`: the task must mirror an issue of an integration (`409` otherwise); `text` is 1 to
+    65,536 characters, with no control characters but line breaks and tabs.
+  - `operation` anything else, an unknown task, or a missing `text` for a comment is `400`.
+
+**The approval ask.** `ask_raised` (kind `approval`, from the integration's own sync member, to the
+person who added the integration, with the task) and `write_proposed` (`{ "write": WriteProposal }`) are appended
+together. The ask's title names the tracker, the operation and the issue; its body lists every
+field as `before → after`; its options are `["Send", "Don't send"]`. `UpstreamWrite.proposal` holds
+the same, structured:
+
+`WriteProposal`: `{ "ask": AskId, "integration": IntegrationId, "system": "github" | "jira",
+"scope": String, "target"?: ExternalRef, "task"?: TaskId, "operation": WriteOperation, "before":
+WriteFields, "after": WriteFields, "requested_by": MemberId, "cause"?: EventId }`.
+- `scope` is the repository (`owner/repo`) or Jira project (`DEMO`); `target` the issue (absent for
+  `create_issue`).
+- `WriteOperation`: `create_issue`, `comment`, `update`, `close` or `reopen`.
+- `WriteFields`: `{ "title"?, "body"?, "labels"?: String[], "add_labels"?: String[],
+  "remove_labels"?: String[], "milestone"?: String, "epic"?: String, "state"?: "open" | "closed",
+  "close_reason"?: "completed" | "not_planned", "comment"? }`. `after` is **exactly what is sent**,
+  and only the fields being changed; `before` is upstream's value of each, as the last sync read it
+  (absent when the hub has not read it). `labels` in `after` is a new issue's whole list
+  (`create_issue`); an `update` sends `add_labels` and `remove_labels` instead, with upstream's
+  labels as last read in `before.labels`. `milestone` is a link key (`owner/repo#milestone:2`),
+  `epic` an issue key (`DEMO-5`).
+- `requested_by` is whose change implied it, or who asked; `cause` the event that implied it.
+
+**Answering, and what is sent.** `POST /v1/asks/{id}/answer` (a device token, the person the ask is
+addressed to) with `{ "option": 0 }` approves; any other answer is a denial.
+- **Approved:** the hub checks the write is still what the task says (each field of `after` still
+  equals the task's, the move's status is still on the same side of the open/closed line, the
+  integration still exists), then appends `write_started` (`{ "ask", "task"?, "attempt" }`).
+- **Upstream as it is now.** For an `update`, `close` or `reopen` it then reads the issue (one
+  `GET`: GitHub `…/issues/{n}`, Jira `…/issue/{key}?fields=…`) and compares it with `before`, field
+  by field:
+  - a field upstream already holds as `after` is not sent again;
+  - a field upstream changed since it was read (it is neither `before` nor `after`, or the
+    description now has formatting) means **nothing is sent**: `not_sent` ("Not sent: <issue>
+    changed upstream since this was proposed (title). …"). The next sync brings upstream's change
+    into the hub;
+  - labels are taken one by one: a label to add that upstream has, or one to remove that it no
+    longer has, is skipped, and a label to remove is removed under upstream's own spelling;
+  - when nothing is left to send, the write is `sent` with no request.
+- **What is sent:** what is left of `after`, with the integration's credential, and nothing else:
+  GitHub one `PATCH …/issues/{n}` (title, body, milestone, state), then `POST …/issues/{n}/labels`
+  with the labels to add, then one `DELETE …/issues/{n}/labels/{name}` per label to remove; Jira one
+  `PUT …/issue/{key}` with `fields` and `update.labels` (`add` and `remove`), or a transition. Each
+  request is sent once; a refusal stops the rest. Then `write_finished` (`{ "ask", "task"?,
+  "result": WriteResult }`):
+  - `{ "outcome": "sent", "created"?: ExternalRef, "url"?: String }`: `created` is the new issue
+    (`create_issue`), and the task's `source` becomes it; `url` links what was written;
+  - `{ "outcome": "failed", "message": String, "status"?: u16 }`: upstream refused it (its HTTP
+    status, its message capped and stripped of hidden characters) or could not be reached.
+  A write that is no longer what the task says, or whose integration is gone, is not sent:
+  `{ "outcome": "not_sent", "reason": String }`.
+- **Denied:** `write_finished` with `not_sent` ("Not sent: <person> chose not to."). Nothing reaches
+  upstream, and the hub keeps its own value.
+- Only an approval ask the hub raised with its `write_proposed` can send anything, and only when
+  it comes from the write's own integration's sync member and a person answered it: an ask of kind
+  `approval` raised through `POST /v1/asks` never does.
+
+`UpstreamWrite`: `{ "proposal": WriteProposal, "state": WriteState, "attempts": u32, "proposed_at":
+ms, "answered_at"?: ms, "answered_by"?: MemberId, "finished_at"?: ms, "result"?: WriteResult,
+"retry_requested_by"?: MemberId }`. `retry_requested_by` is the person whose retry waits to be
+sent (see "Retrying").
+`WriteState`: `pending` (waiting for the person), `approved` and `denied` (answered, about to be
+sent or recorded), `sending`, `sent`, `failed`, `not_sent`.
+
+**Retrying, and sending at most once.** Each attempt is one `write_started`, followed by exactly one
+`write_finished`.
+- `POST /v1/writes/{id}/retry` asks to send a `failed` write again, the same `after`: it appends
+  `write_retry_requested` (`{ "ask", "task"?, "by": MemberId }`, authored by that person) and
+  answers `202` with the write. A second request while one waits appends nothing (`202` too).
+  `409 conflict` in any other state (a sent write is never sent again); `403` for a person who may
+  not answer its ask; `404` for an unknown id.
+- A failed write starts again only with a `write_retry_requested` by a person that no
+  `write_started` has used yet, so the log shows who asked for each attempt after the first.
+- **Before a `create_issue` or a `comment` is sent again**, the hub looks upstream for the earlier
+  attempt, since the first may have arrived though its answer was lost:
+  - GitHub: `GET …/issues?state=all&sort=created&direction=desc&per_page=100&since=` for an issue
+    with the same title and body, created since the write was approved (ten minutes' margin), or
+    `GET …/issues/{n}/comments?since=&per_page=100` for a comment with the same text;
+  - Jira: `GET …/search/jql` (Cloud) or `…/search` (Data Center) with `project = "KEY" AND reporter
+    = currentUser() ORDER BY created DESC` for an issue with the same summary and description, or
+    `GET …/issue/{key}/comment?orderBy=-created&maxResults=100` for a comment with the same text,
+    created since.
+
+  When it is there, the attempt is `sent` with it (a found issue becomes the task's `source`) and
+  nothing is sent again; when the look-up fails, the attempt is `failed` and nothing is sent.
+- A result the hub could not record (its database was busy) is kept in memory and recorded first
+  at the next pass, before writes still `sending` are swept.
+- A `write_started` with no `write_finished` (the hub stopped while sending) is finished as `failed`
+  ("The hub stopped while sending; a retry first looks upstream for this attempt") when the hub
+  starts again. It is never sent again by itself.
+- Writes run one at a time with the integration's syncs, so a sync never reads an issue PitCrew is
+  creating before the task links it.
+
+**The mock** proposes, answers and records writes by the same rules, over the same fixtures: a
+write is `sent` when `apps/mock-hub/fixtures/` holds an exchange for its method and URL with a 2xx
+status, `failed` with that status otherwise, or with "no recorded fixture" when there is none. It
+reads the issue before an `update`, `close` or `reopen` from its copy of upstream, and looks for an
+earlier attempt before a retried create or comment in the same fixtures. A sent write changes the
+mock's copy of upstream, so its next sync agrees. The daemon's `--integration-fixtures` answers
+writes from the same files.
 
 ## Live updates: `GET /v1/stream?since=<rev>` (WebSocket, device tokens)
 

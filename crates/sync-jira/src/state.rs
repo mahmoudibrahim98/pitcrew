@@ -44,6 +44,59 @@ pub struct IssueSnapshot {
     pub(crate) assignee: Option<String>,
     pub(crate) epic_key: Option<String>,
     pub(crate) updated: JiraTimestamp,
+    /// Whether `title` is exactly the summary Jira sent: nothing hidden was stripped, nothing was
+    /// cut. `false` in a state saved before this was kept, until the issue is read again.
+    #[serde(default)]
+    pub(crate) title_lossless: bool,
+    /// Whether `body` holds the whole description: plain text Jira sent as it is, or an Atlassian
+    /// Document Format document that is exactly plain paragraphs of unformatted text (what
+    /// `write::adf` makes of `body`). See [`crate::change::description_is_lossless`].
+    #[serde(default)]
+    pub(crate) body_lossless: bool,
+}
+
+impl IssueSnapshot {
+    /// The summary, as last read.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// The description, as last read (plain text).
+    #[must_use]
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Its status category.
+    #[must_use]
+    pub fn category(&self) -> StatusCategory {
+        self.category
+    }
+
+    /// The labels, as last read.
+    #[must_use]
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Its epic's key.
+    #[must_use]
+    pub fn epic_key(&self) -> Option<&str> {
+        self.epic_key.as_deref()
+    }
+
+    /// Whether [`Self::title`] is exactly what Jira sent, so writing it back loses nothing.
+    #[must_use]
+    pub fn title_lossless(&self) -> bool {
+        self.title_lossless
+    }
+
+    /// Whether [`Self::body`] is the whole description, so writing it back loses nothing.
+    #[must_use]
+    pub fn body_lossless(&self) -> bool {
+        self.body_lossless
+    }
 }
 
 /// The owned fields of one epic, as last seen.

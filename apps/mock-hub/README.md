@@ -146,6 +146,20 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   epic seen closing ships its workstreams; and a merged pull request is noted on its task.
   Credentials stay in memory and are never returned. `gh_cli` connections always have a
   credential here.
+- **Outward writes** (`/v1/writes…`, `src/writes.ts`), by the daemon's rules: after every request
+  that may change something, a pass proposes what a person's change implies upstream (an
+  `approval` ask from the integration's own sync member, with `write_proposed`; a title or
+  description only when upstream's is held exactly, labels as a change), records a denial as not
+  sent, and "sends" an approved write, or a failed one a person asked to retry
+  (`write_retry_requested`), once: it starts only from the integration's own member's approval
+  answered "Send" by a person; an edit, close or reopen is first checked against the issue's
+  fixture as upstream has it now (a change since sends nothing), and a retried create or comment
+  first looks for its earlier attempt; links are kept only on the integration's web origin. The
+  fixtures' answer to each method and URL decides it (2xx sent, else failed with that status; no
+  exchange at all is a failure too; a `since=` parameter is ignored, as the daemon's fixture
+  transport does). A sent write changes the mock's copy of upstream, so the next sync agrees; a
+  created issue becomes the task's source. Every request "sent", reads included, is kept
+  (`sentRequests`) for the tests.
 - **Terminals.** `GET /v1/sessions/{id}/terminal` replays a short ANSI screen, echoes keystrokes,
   accepts `{"type":"resize"}` and ignores unknown control types (malformed JSON closes with 1007),
   sends `{"type":"truncated"}` before the replay for sessions that ran over a day, and sends
@@ -197,7 +211,8 @@ a single entry point.
 | `src/recaps.ts` | The recap routes, paged from the recaps fixture. |
 | `src/scan.ts` | The machine scan: its synthetic report and streamed frames. |
 | `src/integrations.ts` | GitHub and Jira integrations over `fixtures/*.fixture`, and the links' checks. |
-| `fixtures/` | Recorded, synthetic GitHub and Jira answers, shared with the daemon's tests and the conformance runner. |
+| `src/writes.ts` | Outward writes: proposals, approvals and the recorded answers. |
+| `fixtures/` | Recorded, synthetic GitHub and Jira answers (reads, and the writes' answers), shared with the daemon's tests and the conformance runner. |
 | `src/ws.ts` | A minimal WebSocket server (RFC 6455). |
 | `src/types.ts` | Wire types mirroring `crates/protocol`. |
 | `src/rules.ts` | `can_move` and date checks ported from `model.rs`. |

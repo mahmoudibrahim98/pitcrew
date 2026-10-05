@@ -2,7 +2,7 @@
 //!
 //! | Path | What |
 //! |---|---|
-//! | `integrations.json` | The connections (no secret), each one's sync member, status and the upstream titles of linked scopes. Private (0600). |
+//! | `integrations.json` | The connections (no secret), each one's sync member, status and the upstream titles of linked scopes, and how far the outward-write planner has read the log. Private (0600). |
 //! | `integrations/<id>.state.json` | One connection's sync state (`pitcrew_sync_github::SyncState` or `pitcrew_sync_jira::SyncState`: cursors, `ETag`s, snapshots). Private (0600). |
 //! | `integrations/<id>.secret` | Its stored secret, when it has one (see `secret.rs`). |
 
@@ -54,6 +54,10 @@ pub struct Saved {
     /// The connections, oldest first.
     #[serde(default)]
     pub integrations: Vec<Record>,
+    /// The last revision of the event log the outward-write planner has read (`writes.rs`);
+    /// `None` until it first runs, which starts it at the log's end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writes_rev: Option<u64>,
 }
 
 /// The files: `integrations.json` and the `integrations/` folder.

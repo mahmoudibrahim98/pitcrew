@@ -429,7 +429,11 @@ export type EventBody =
   | {
       type: 'decision_recorded';
       data: { workstream?: WorkstreamId; text: string; why?: string; receipts: Receipt[] };
-    };
+    }
+  | { type: 'write_proposed'; data: { write: WriteProposal } }
+  | { type: 'write_started'; data: { ask: AskId; task?: TaskId; attempt: number } }
+  | { type: 'write_retry_requested'; data: { ask: AskId; task?: TaskId; by: MemberId } }
+  | { type: 'write_finished'; data: { ask: AskId; task?: TaskId; result: WriteResult } };
 
 // ─── API (api.rs) ───────────────────────────────────────────────────────────────────────────────
 
@@ -776,3 +780,65 @@ export interface IntegrationCheck {
   checks: ScopeCheck[];
   warnings: string[];
 }
+
+// ─── Outward writes (writes.rs) ─────────────────────────────────────────────────────────────────
+
+export const WRITE_OPERATIONS = ['create_issue', 'comment', 'update', 'close', 'reopen'] as const;
+export type WriteOperation = (typeof WRITE_OPERATIONS)[number];
+
+export const WRITE_STATES = ['pending', 'approved', 'denied', 'sending', 'sent', 'failed', 'not_sent'] as const;
+export type WriteState = (typeof WRITE_STATES)[number];
+
+export type IssueState = 'open' | 'closed';
+export type CloseReason = 'completed' | 'not_planned';
+
+export interface WriteFields {
+  title?: string;
+  body?: string;
+  /** A new issue's whole label list; in `before`, upstream's labels as last read. */
+  labels?: string[];
+  /** Labels an `update` adds; the issue's others are kept. */
+  add_labels?: string[];
+  /** Labels an `update` removes. */
+  remove_labels?: string[];
+  milestone?: string;
+  epic?: string;
+  state?: IssueState;
+  close_reason?: CloseReason;
+  comment?: string;
+}
+
+export interface WriteProposal {
+  ask: AskId;
+  integration: IntegrationId;
+  system: 'github' | 'jira';
+  scope: string;
+  target?: ExternalRef;
+  task?: TaskId;
+  operation: WriteOperation;
+  before: WriteFields;
+  after: WriteFields;
+  requested_by: MemberId;
+  cause?: EventId;
+}
+
+export type WriteResult =
+  | { outcome: 'sent'; created?: ExternalRef; url?: string }
+  | { outcome: 'failed'; message: string; status?: number }
+  | { outcome: 'not_sent'; reason: string };
+
+export interface UpstreamWrite {
+  proposal: WriteProposal;
+  state: WriteState;
+  attempts: number;
+  proposed_at: TimestampMs;
+  answered_at?: TimestampMs;
+  answered_by?: MemberId;
+  finished_at?: TimestampMs;
+  result?: WriteResult;
+  /** The person whose retry waits to be sent. */
+  retry_requested_by?: MemberId;
+}
+
+/** The options of every approval ask: the first sends. */
+export const APPROVAL_OPTIONS = ['Send', "Don't send"] as const;

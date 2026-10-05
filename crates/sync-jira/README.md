@@ -1,13 +1,31 @@
 # pitcrew-sync-jira
 
 Read Jira issues and epics, for Jira Cloud and Jira Data Center, safely and incrementally; field
-ownership; the write-approval queue and outward writes are later briefs. This crate is read-only
-and never writes to Jira. `pitcrewd` runs it on a timer and applies its intents to the hub
-(`crates/daemon/src/integrations/`); `probe::probe` is the read-only "test this connection".
-`SyncState::created_from_snapshot(source, epic)` gives an issue that is not done as a first read
-would report it (`IssueCreated`), from the snapshot the last read kept: an `IssueReparented` change
-carries none of its fields, so this is how `pitcrewd` makes a task of an issue moved under an epic
-it follows.
+ownership, both ways; and the requests an approved outward write is sent as. `pitcrewd` runs the
+sync on a timer and applies its intents to the hub (`crates/daemon/src/integrations/`);
+`probe::probe` is the read-only "test this connection". The sync only reads.
+
+- `write::send(transport, config, write)`: one write a person approved (api-v1.md, "Outward
+  writes"), sent once: create an issue (type `Task`), comment, edit the summary, description,
+  labels or epic (Cloud's `parent`, Data Center's epic link field), or move the issue into Done
+  or To Do through the first transition its workflow offers (read first; none means nothing is
+  sent). Cloud gets Atlassian Document Format text, Data Center plain text. Keys are checked
+  before they reach a URL; answers are untrusted (messages capped and stripped, created keys
+  checked). `tests/fixtures/writes.fixture` pins exactly what each write sends.
+- Labels change as a change (`update.labels`, `add` and `remove`), never the whole list.
+  `write::read_issue` (`GET …/issue/{key}?fields=…`) reads an issue as Jira has it now, and
+  `write::find_earlier` looks for an earlier create (the same summary and description, reported by
+  the credential's account) or comment (the same text) since a time, before either is sent again.
+- `IssueSnapshot::title_lossless` and `body_lossless`: whether the summary and description were
+  read whole. A description is lossless only as plain text, or as ADF that is exactly plain
+  paragraphs of unformatted text (`change::description_is_lossless`); lists, code, links,
+  mentions and marks make it lossy, and then PitCrew never writes it back.
+- The ownership tables (`ISSUE_FIELD_OWNERSHIP`, `EPIC_FIELD_OWNERSHIP`) say both directions: an
+  `Outward` rule per field (ask to send, ask to close or reopen, never).
+- `SyncState::created_from_snapshot(source, epic)` gives an issue that is not done as a first read
+  would report it (`IssueCreated`), from the snapshot the last read kept: an `IssueReparented`
+  change carries none of its fields, so this is how `pitcrewd` makes a task of an issue moved under
+  an epic it follows.
 
 See the [crate's own docs](src/lib.rs) ("Shape" and "Reuse, not a fork") for the architecture and
 for exactly what is reused from [`pitcrew-sync-github`](../sync-github/README.md) versus added

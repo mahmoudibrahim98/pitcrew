@@ -70,7 +70,7 @@ pub(crate) fn expected_web_origin(api_base: Option<&str>) -> WebOrigin {
 /// port on the right host, entirely — O30 closes the port gap; this pins both to the one web
 /// origin this sync is actually about, the same reasoning `origin::trusted_next_url` uses for the
 /// API host).
-fn trusted_html_url(raw: &str, web_origin: &WebOrigin) -> Option<url::Url> {
+pub(crate) fn trusted_html_url(raw: &str, web_origin: &WebOrigin) -> Option<url::Url> {
     if raw.len() > MAX_KEPT_URL_BYTES || contains_hidden(raw) {
         return None;
     }
@@ -340,9 +340,14 @@ fn snapshot_of(issue: &WireIssue) -> IssueSnapshot {
         .map(|a| strip_hidden(&a.login))
         .collect();
     assignees.sort();
+    let title = cap_chars(&issue.title, MAX_TITLE_CHARS);
+    let raw_body = issue.body.as_deref().unwrap_or("");
+    let body = cap_chars(raw_body, MAX_BODY_CHARS);
     IssueSnapshot {
-        title: cap_chars(&issue.title, MAX_TITLE_CHARS),
-        body: cap_chars(issue.body.as_deref().unwrap_or(""), MAX_BODY_CHARS),
+        title_lossless: title == issue.title,
+        body_lossless: body == raw_body,
+        title,
+        body,
         open: issue.state != "closed",
         close_reason: (issue.state == "closed").then_some(CloseReason::from_state_reason(
             issue.state_reason.as_deref(),
@@ -649,6 +654,48 @@ mod malformed_timestamp_tests {
             host: "github.com".to_string(),
             port: 443,
         }
+    }
+
+    #[test]
+    fn a_snapshot_says_whether_its_title_and_body_are_exactly_what_github_sent() {
+        let snap = |title: &str, body: Option<&str>| {
+            let mut wire = issue("2026-01-01T00:00:00Z");
+            wire.title = title.to_string();
+            wire.body = body.map(str::to_string);
+            let mut malformed = 0u32;
+            diff_issue(
+                "example-org/demo-repo",
+                &wire,
+                None,
+                &github_com(),
+                &mut malformed,
+            )
+            .unwrap()
+            .1
+        };
+        let plain = snap("Fix the login test", Some("Line one.\n\n- a list item\n"));
+        assert!(plain.title_lossless() && plain.body_lossless());
+        assert!(
+            snap("No body", None).body_lossless(),
+            "an absent body is an empty one"
+        );
+        // A zero-width joiner (an emoji sequence) is stripped from the copy: not exact.
+        let joined = snap(
+            "Ship it \u{1F469}\u{200D}\u{1F4BB}",
+            Some("Ok \u{200D} then"),
+        );
+        assert!(!joined.title_lossless() && !joined.body_lossless());
+        assert_eq!(joined.body(), "Ok  then");
+        // A body over the cap is cut: not exact.
+        let long = "x".repeat(MAX_BODY_CHARS + 1);
+        assert!(!snap("t", Some(&long)).body_lossless());
+        // A state saved before the flags were kept reads as not exact.
+        let old: IssueSnapshot = serde_json::from_value(serde_json::json!({
+            "title": "t", "body": "b", "open": true, "close_reason": null, "labels": [],
+            "assignees": [], "milestone_number": null, "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(!old.title_lossless() && !old.body_lossless());
     }
 
     #[test]

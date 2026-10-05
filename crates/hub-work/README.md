@@ -418,7 +418,7 @@ whatever it sent.
 | `ensure_office_member(owner)` | the daemon | finds or adds the back office's member (see "The back office"); 400 `owner` is not a person; 409 `@office` held by a person, another person's agent or no one's agent |
 | `run_office`, `OfficeCommands` | the back office | see "The back office" |
 | `ensure_sync_member(owner)` | the daemon, when a person connects a tracker (each connection keeps its own) | finds or adds the tracker sync's member: an agent of `owner` named `@sync` (`@tracker-sync` when `@sync` is someone else's); 400 `owner` is not a person; 409 both handles taken |
-| `SyncCommands` | a tracker sync (`sync_commands(member)`) | see "Tracker sync" |
+| `SyncCommands` | a tracker sync (`sync_commands(member)`) | see "Tracker sync" and "Outward writes" |
 
 "Own task" means the agent is the assignee or holds an active (not ended) dispatch on it.
 
@@ -454,6 +454,31 @@ the tracker), each command re-checked under the command lock like any caller's:
 `links::scope_of(link)` says what a workstream link names (a repository or milestone, a Jira
 project or epic); the sync routes issues by it. Nothing here knows GitHub or Jira: the daemon reads
 them and plans with `pitcrew-sync-github` and `pitcrew-sync-jira`.
+
+## Outward writes (`writes.rs`, `work.writes`)
+
+A write to GitHub or Jira (api-v1.md, "Outward writes") is approved by a person first; these
+commands are the gate the daemon sends through:
+
+- `propose_write(to, write, title, body)`: an `approval` ask from the sync's member (each
+  integration's own) to `to` (a person), with the task, `["Send", "Don't send"]` and the cause as
+  a receipt, and `write_proposed`, in one append; `None` when a write was already proposed for that
+  cause.
+- `WorkService::request_retry(caller, ask)`: `write_retry_requested { ask, task, by }`, authored
+  by a person who may answer the write's ask, for a `failed` write; a second request while one
+  waits appends nothing.
+- `start_write(ask)`: `write_started`, only for a write whose ask is this member's own approval ask
+  answered "Send" by a person, or a failed one with a person's retry request no attempt has used
+  yet (the start uses it). Anything else is `Refused`.
+- `finish_write(ask, result)`: `write_finished`; `sent` and `failed` only after a start, `not_sent`
+  only before one (or after a failure).
+- `writes(filter)`, `write(ask)`, `check_retry(caller, ask)` (who may answer its ask; `failed`
+  only) are what the routes read; `UpstreamWrite.retry_requested_by` says whose retry waits.
+
+The `work.writes` projection (migrations `0401_work_writes.sql` and `0402_work_write_retries.sql`)
+applies the same transitions from the log, so a rebuild gives the same rows. A `write_finished` that created an issue gives its task
+that issue as `source` (`work.tasks` v4), and write events are their task's activity (`work.refs`
+v3).
 
 ## The back office
 

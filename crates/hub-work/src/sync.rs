@@ -202,6 +202,16 @@ impl SyncCommands<'_> {
         self.work.event(self.member, Some(self.owner), body)
     }
 
+    /// The service, for the write commands (`crate::writes`).
+    pub(crate) fn work(&self) -> &WorkService {
+        self.work
+    }
+
+    /// An event authored by the sync on behalf of its owner, for the write commands.
+    pub(crate) fn sync_event(&self, body: EventBody) -> pitcrew_protocol::events::Event {
+        self.event(body)
+    }
+
     /// The task mirroring the upstream item `source` (same system and key), if there is one.
     ///
     /// # Errors

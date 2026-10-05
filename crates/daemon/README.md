@@ -68,7 +68,7 @@ in the log when used (see "Terminals"):
 | `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `agents/<agent id>.token` | An agent token for each agent whose CLI the runner started (a dispatch's, or `POST /v1/sessions` with `agent`), bound to that agent and its owner, `pca_…`. The CLI is given its path (`PITCREW_TOKEN_FILE`), never the token. Minted once, reused while it verifies as exactly that. The folder is 0700, each file 0600. |
-| `integrations.json` | The GitHub and Jira connections (never a secret), each connection's sync member (`@sync` or `@tracker-sync`, an agent of the person who added it) and last sync status, and the upstream titles of linked milestones and epics. Private. |
+| `integrations.json` | The GitHub and Jira connections (never a secret), each connection's sync member (`@sync` or `@tracker-sync`, an agent of the person who added it) and last sync status, the upstream titles of linked milestones and epics, and how far the outward-write planner has read the log (`writes_rev`). Private. |
 | `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream; never in the event log) and its stored secret, when it has one. The folder is 0700 (an owner-only DACL on Windows), each file 0600. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
@@ -671,7 +671,7 @@ link) are not part of this.
 | `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SessionTerminals` (see "Terminals") |
 | `POST /v1/sessions`, `POST /v1/sessions/{id}/send`, `/keys`, `/interrupt`, `/end` | `src/sessions.rs`, device routes, through the runner's `RunnerCommands` (see "Terminals") |
 | `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route, from the runner's `RunnerTranscripts` (see "The runner") |
-| `/v1/integrations…` | `src/integrations/`, device routes (see "Integrations") |
+| `/v1/integrations…`, `/v1/writes…` | `src/integrations/`, device routes (see "Integrations") |
 
 On development TCP only, the daemon answers CORS as the mock hub does: preflights from
 `http://localhost:<port>`, `http://127.0.0.1:<port>` and the Tauri app's origins get `204` and
@@ -1106,7 +1106,8 @@ and handed back, not kept, once it has.
 
 ## Integrations
 
-GitHub and Jira, **read-only** (api-v1.md, "Integrations"; `src/integrations/`):
+GitHub and Jira (api-v1.md, "Integrations" and "Outward writes"; `src/integrations/`). A sync only
+reads; a write goes upstream only after a person approves it:
 
 - **Connections** live in `integrations.json`, never in the event log, each with its own sync
   member: `@sync` (or `@tracker-sync`), an agent of the person who added it (hub-work's
@@ -1139,6 +1140,35 @@ GitHub and Jira, **read-only** (api-v1.md, "Integrations"; `src/integrations/`):
 - `--integration-fixtures <dir>` swaps the transport for recorded exchanges, answered by URL (a
   `since=` cursor ignored) and read again for each request, for tests: `tests/integrations.rs`
   and the conformance runner, which changes what upstream says by adding a file that sorts first.
+  Writes are answered from the same files.
+- **Outward writes** (`writes.rs`), on the same loop, before the syncs, woken by every append to
+  the log:
+  - the **planner** reads the log from `integrations.json`'s `writes_rev` (the log's end the first
+    time, and again, with a warning, when the saved place is beyond the log): a person's (or
+    agent's, or the office's) move across the open/closed line, or change of a field upstream owns
+    (the crates' ownership tables, both directions), on a task mirroring an issue a connection
+    syncs, becomes an approval ask from that connection's sync member with `write_proposed`
+    (hub-work's `propose_write`, once per cause). `before` is upstream's value from the sync
+    state's snapshots; nothing is proposed when upstream already has the value. Only what the hub
+    holds exactly goes back: a title or description is proposed only from a lossless read (the
+    snapshots' `title_lossless` and `body_lossless`), and labels go as the labels added and
+    removed (`label_change`). No connection's sync member's changes ever imply a write;
+  - the **executor** records a denial as not sent; checks an approved write against the task as it
+    is now; reads the issue as upstream has it now before an edit, close or reopen (`reconcile`:
+    a field changed since sends nothing, what upstream holds is not sent again) and looks upstream
+    for the earlier attempt before a retried create or comment (`find_earlier`); then
+    `start_write` (hub-work allows it only for the connection's own member's approval ask
+    answered "Send" by a person, or a person's logged retry request), sends what is left once,
+    with the connection's credential, through `pitcrew_sync_github::write` or
+    `pitcrew_sync_jira::write`; and records the result. A result the store cannot record is kept
+    in memory and recorded first at the next pass; a write still `sending` after that (the daemon
+    stopped mid-send) is finished as failed, never resent by itself; a failed one is sent again
+    only after a person's `POST …/retry`, which hub-work logs as `write_retry_requested`;
+  - routes (device only): `GET /v1/writes`, `GET /v1/writes/{id}`, `POST /v1/writes` (create an
+    issue from a task, or comment on its issue) and `POST /v1/writes/{id}/retry`.
+- `writes_tests.rs` shows the guarantee with a transport that keeps every request it was sent, over
+  a copy of the fixtures each test can change: nothing before an approval, after a denial, twice
+  for one approval or one retry, over a change upstream made since, or from a lossy copy.
 
 ## Not wired yet
 
@@ -1166,8 +1196,9 @@ GitHub and Jira, **read-only** (api-v1.md, "Integrations"; `src/integrations/`):
 - Remote machines (the desktop's side of the tunnel, and a supervisor of the local daemon), the
   Tauri shell, auto-start and installers.
 - Integrations: no `https://` or SOCKS proxy and no `ALL_PROXY` (only an `http://` proxy from
-  `HTTPS_PROXY`), no HTTP/2 or connection reuse, and no write to GitHub or Jira
-  (G-approval-writes). Removing a connection keeps its workstream links as plain links.
+  `HTTPS_PROXY`), no HTTP/2 or connection reuse. Removing a connection keeps its workstream links
+  as plain links; an approved write of a removed connection is recorded as not sent. An approval
+  that turns stale stays open in the Inbox until answered (asks have no withdrawal event).
 - Scanning another machine of the workspace (`POST /v1/machines/{id}/scan` is `409` for one), and
   stopping a scan part-way: `pitcrew_ingest::scan` takes no cancel, so a scan whose client went
   away runs to its end. A cancel flag in its `ScanOptions` (stream A) would let the route stop it.

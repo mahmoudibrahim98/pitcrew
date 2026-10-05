@@ -13,13 +13,15 @@
 //!   lost a race with another move, and is ignored.
 //!
 //! A `task_updated` writes its patch into the task as it is (`TaskPatch::apply`): the command that
-//! appended it checked the rules, and `apply` never second-guesses an event.
+//! appended it checked the rules, and `apply` never second-guesses an event. A `write_finished`
+//! that created an issue from a task gives the task that issue as its `source`, when it has none.
 
 use super::{Applied, clear, exec};
 use crate::codec::{IdText, enum_text, json, opt_text, sql_rev};
 use pitcrew_protocol::events::EventBody;
 use pitcrew_protocol::ids::TaskId;
 use pitcrew_protocol::model::{SubtaskSource, Task};
+use pitcrew_protocol::writes::WriteResult;
 use pitcrew_store::sql::{OptionalExtension, Transaction, params};
 use pitcrew_store::{BoxError, Projection, StoredEvent};
 
@@ -35,7 +37,8 @@ impl Tasks {
     ///
     /// 2: key clashes are recorded instead of failing, and stale moves are ignored.
     /// 3: `task_updated` is applied.
-    pub const VERSION: u32 = 3;
+    /// 4: a `write_finished` that created an issue gives the task its `source`.
+    pub const VERSION: u32 = 4;
 }
 
 impl Projection for Tasks {
@@ -75,6 +78,21 @@ impl Projection for Tasks {
             EventBody::SubtasksReplaced { task, subtasks } => {
                 change(tx, task, |t| t.subtasks.clone_from(subtasks))
             }
+            // An issue created from the task (api-v1.md, "Outward writes"): the task now mirrors
+            // it, unless it already mirrors one.
+            EventBody::WriteFinished {
+                task: Some(task),
+                result:
+                    WriteResult::Sent {
+                        created: Some(created),
+                        ..
+                    },
+                ..
+            } => change(tx, task, |t| {
+                if t.source.is_none() {
+                    t.source = Some(created.clone());
+                }
+            }),
             _ => Ok(()),
         }
     }

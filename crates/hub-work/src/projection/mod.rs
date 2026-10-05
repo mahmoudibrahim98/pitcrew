@@ -1,7 +1,8 @@
 //! Projections: the work model's tables, derived from the event log.
 //!
-//! Each projection owns its tables (migrations `0200`–`0210`) and follows the store's rules, so
-//! applying events one append at a time and rebuilding from the log give identical tables:
+//! Each projection owns its tables (migrations `0200`–`0211`, and `0401`–`0402` for
+//! [`Writes`]) and follows the store's rules, so applying events one append at a time and
+//! rebuilding from the log give identical tables:
 //! - `apply` has no side effects: it never appends events and never reads the clock; times come
 //!   from the event (`at`), and authorship from `author` and `on_behalf_of`;
 //! - `apply` reads and writes only its own tables, never another projection's, and there are no
@@ -27,6 +28,7 @@ mod projects;
 mod refs;
 mod sessions;
 mod tasks;
+mod writes;
 
 pub use asks::Asks;
 pub use briefs::Briefs;
@@ -38,6 +40,7 @@ pub use projects::Projects;
 pub use refs::Refs;
 pub use sessions::Sessions;
 pub use tasks::Tasks;
+pub use writes::Writes;
 
 use pitcrew_store::sql::{Params, Transaction};
 use pitcrew_store::{BoxError, Projection};
@@ -56,11 +59,12 @@ pub fn projections() -> Vec<Box<dyn Projection>> {
         Box::new(Refs),
         Box::new(Cursors),
         Box::new(crate::safety::Safety),
+        Box::new(Writes),
     ]
 }
 
 /// The names of [`projections`], e.g. for `Store::rebuild`.
-pub const NAMES: [&str; 10] = [
+pub const NAMES: [&str; 11] = [
     Directory::NAME,
     Projects::NAME,
     Tasks::NAME,
@@ -71,10 +75,11 @@ pub const NAMES: [&str; 10] = [
     Refs::NAME,
     Cursors::NAME,
     crate::safety::Safety::NAME,
+    Writes::NAME,
 ];
 
 /// Every table the work model owns, children before parents (the order `reset` clears them in).
-pub const TABLES: [&str; 25] = [
+pub const TABLES: [&str; 26] = [
     "work_safety",
     "work_read_cursors",
     "work_team_members",
@@ -100,6 +105,7 @@ pub const TABLES: [&str; 25] = [
     "work_briefs",
     "work_event_refs",
     "work_ref_parents",
+    "work_writes",
 ];
 
 type Applied = Result<(), BoxError>;

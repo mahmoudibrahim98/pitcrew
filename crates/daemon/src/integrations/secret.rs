@@ -219,9 +219,9 @@ impl GhCli {
         }
     }
 
-    /// `gh` from the given `PATH` value (tests). Only the Unix tests run a stand-in `gh`, so on
-    /// Windows nothing calls it.
-    #[cfg(all(test, unix))]
+    /// `gh` from the given `PATH` value (tests). The Unix sync tests run a stand-in `gh` on it;
+    /// the outward-write tests (`writes_tests.rs`, every platform) give it a folder with no `gh`.
+    #[cfg(test)]
     #[must_use]
     pub fn with_path(path: OsString) -> Self {
         Self { path: Some(path) }

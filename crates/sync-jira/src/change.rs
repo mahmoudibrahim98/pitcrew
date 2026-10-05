@@ -181,12 +181,31 @@ pub(crate) fn description_text(description: &Option<Value>) -> String {
     }
 }
 
+/// Whether `text` (what [`description_text`] made of `description`) is the whole description, so
+/// writing `text` back changes nothing else: no description and no text; a plain string (Data
+/// Center) equal to it, nothing hidden stripped and nothing cut; or an Atlassian Document Format
+/// document that is exactly [`crate::write::adf`] of it, plain paragraphs of unformatted text.
+/// Lists, code, links, mentions, marks, empty paragraphs or attributes make it lossy.
+#[must_use]
+pub fn description_is_lossless(description: Option<&Value>, text: &str) -> bool {
+    match description {
+        None | Some(Value::Null) => text.is_empty(),
+        Some(Value::String(s)) => s == text,
+        Some(doc @ Value::Object(_)) => crate::write::adf(text) == *doc,
+        Some(_) => false,
+    }
+}
+
 fn snapshot_of(issue: &WireIssue, epic_link_field: Option<&str>) -> IssueSnapshot {
     let mut labels = issue.fields.labels.clone();
     labels.sort();
+    let title = cap_chars(&issue.fields.summary, MAX_TITLE_CHARS);
+    let body = description_text(&issue.fields.description);
     IssueSnapshot {
-        title: cap_chars(&issue.fields.summary, MAX_TITLE_CHARS),
-        body: description_text(&issue.fields.description),
+        title_lossless: title == issue.fields.summary,
+        body_lossless: description_is_lossless(issue.fields.description.as_ref(), &body),
+        title,
+        body,
         category: StatusCategory::from_key(&issue.fields.status.status_category.key),
         // Resolution and assignee names are short "names" in the sense R10 means (round 2
         // review): never length-capped (they're already bounded by Jira's own field shapes), but
@@ -370,6 +389,53 @@ mod tests {
             }
         }))
         .expect("valid wire issue")
+    }
+
+    #[test]
+    fn a_snapshot_says_whether_its_summary_and_description_are_whole() {
+        let snap = |summary: &str, description: Value| {
+            let mut wire = issue("2026-01-01T00:00:00.000+0000", "new");
+            wire.fields.summary = summary.to_string();
+            wire.fields.description = Some(description);
+            diff_issue("https://jira.example.com", &wire, None, None)
+                .expect("well-formed")
+                .1
+        };
+        let paragraph =
+            |text: &str| json!({"type": "paragraph", "content": [{"type": "text", "text": text}]});
+        let doc = |content: Vec<Value>| json!({"type": "doc", "version": 1, "content": content});
+        // Plain paragraphs of unformatted text read back exactly.
+        let plain = snap(
+            "Send invoices",
+            doc(vec![paragraph("Monthly."), paragraph("As a PDF.")]),
+        );
+        assert_eq!(plain.body(), "Monthly.\nAs a PDF.\n");
+        assert!(plain.title_lossless() && plain.body_lossless());
+        assert!(snap("t", doc(vec![])).body_lossless());
+        assert!(snap("t", Value::Null).body_lossless());
+        assert!(snap("t", json!("Data Center *wiki* text")).body_lossless());
+        // Formatting, lists, links, mentions and hidden characters do not.
+        let bold = json!({"type": "paragraph", "content": [{"type": "text", "text": "Monthly.",
+            "marks": [{"type": "strong"}]}]});
+        let list = json!({"type": "bulletList", "content": [{"type": "listItem", "content":
+            [paragraph("one")]}]});
+        let mention = json!({"type": "paragraph", "content": [{"type": "mention", "attrs":
+            {"id": "x", "text": "@Sam"}}]});
+        for lossy in [
+            doc(vec![bold]),
+            doc(vec![list]),
+            doc(vec![mention]),
+            doc(vec![
+                paragraph("a"),
+                json!({"type": "paragraph", "content": []}),
+                paragraph("b"),
+            ]),
+            doc(vec![paragraph("zero\u{200b}width")]),
+            json!("plain \u{200b} text"),
+        ] {
+            assert!(!snap("t", lossy.clone()).body_lossless(), "{lossy}");
+        }
+        assert!(!snap("Ship \u{200d} it", Value::Null).title_lossless());
     }
 
     #[test]

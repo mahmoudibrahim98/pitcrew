@@ -370,6 +370,68 @@ export interface Ask {
   created: TimestampMs;
 }
 
+// ─── Outward writes (`crates/protocol/src/writes.rs`) ──────────────────────────────────────────
+//
+// API v1, "Outward writes: every one approved first". A write to GitHub or Jira waits for a
+// person's answer to its approval ask (`proposal.ask`); `after` is exactly what is sent.
+
+export type WriteOperation = 'create_issue' | 'comment' | 'update' | 'close' | 'reopen';
+export type WriteState = 'pending' | 'approved' | 'denied' | 'sending' | 'sent' | 'failed' | 'not_sent';
+
+export interface WriteFields {
+  title?: string;
+  body?: string;
+  /** A new issue's whole label list; in `before`, upstream's labels as last read. */
+  labels?: string[];
+  /** Labels an `update` adds; the issue's others are kept. */
+  add_labels?: string[];
+  /** Labels an `update` removes. */
+  remove_labels?: string[];
+  /** GitHub: a milestone link key, `owner/repo#milestone:2`. */
+  milestone?: string;
+  /** Jira: an epic's key, `DEMO-5`. */
+  epic?: string;
+  state?: 'open' | 'closed';
+  close_reason?: 'completed' | 'not_planned';
+  comment?: string;
+}
+
+export interface WriteProposal {
+  ask: AskId;
+  integration: string;
+  system: 'github' | 'jira';
+  /** The repository or Jira project. */
+  scope: string;
+  /** The issue; absent for `create_issue`. */
+  target?: ExternalRef;
+  task?: TaskId;
+  operation: WriteOperation;
+  /** Upstream's values, as the last sync read them. */
+  before: WriteFields;
+  /** Exactly what is sent. */
+  after: WriteFields;
+  requested_by: MemberId;
+  cause?: EventId;
+}
+
+export type WriteResult =
+  | { outcome: 'sent'; created?: ExternalRef; url?: string }
+  | { outcome: 'failed'; message: string; status?: number }
+  | { outcome: 'not_sent'; reason: string };
+
+export interface UpstreamWrite {
+  proposal: WriteProposal;
+  state: WriteState;
+  attempts: number;
+  proposed_at: TimestampMs;
+  answered_at?: TimestampMs;
+  answered_by?: MemberId;
+  finished_at?: TimestampMs;
+  result?: WriteResult;
+  /** The person whose retry waits to be sent. */
+  retry_requested_by?: MemberId;
+}
+
 // ─── Recaps (`crates/protocol/src/recap.rs`) ───────────────────────────────────────────────────
 //
 // `GET /v1/recaps/blocks` and `GET /v1/recaps/days` (API v1, "Recaps"). Derived from the event
@@ -589,7 +651,11 @@ export type EventBody =
   | {
       type: 'decision_recorded';
       data: { workstream?: WorkstreamId; text: string; why?: string; receipts: Receipt[] };
-    };
+    }
+  | { type: 'write_proposed'; data: { write: WriteProposal } }
+  | { type: 'write_started'; data: { ask: AskId; task?: TaskId; attempt: number } }
+  | { type: 'write_retry_requested'; data: { ask: AskId; task?: TaskId; by: MemberId } }
+  | { type: 'write_finished'; data: { ask: AskId; task?: TaskId; result: WriteResult } };
 
 export type EventType = EventBody['type'];
 
@@ -627,6 +693,10 @@ export const EVENT_TYPES = [
   'brief_proposed',
   'brief_accepted',
   'decision_recorded',
+  'write_proposed',
+  'write_started',
+  'write_retry_requested',
+  'write_finished',
 ] as const satisfies readonly EventType[];
 
 // Fails to compile if EVENT_TYPES misses a type of EventBody.

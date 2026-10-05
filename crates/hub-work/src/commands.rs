@@ -910,7 +910,11 @@ pub(crate) fn brief_target_exists(conn: &Connection, target: &BriefTarget) -> Re
 }
 
 /// Why `caller` may not answer `ask`, or `None` if it may.
-fn answer_refusal(conn: &Connection, caller: &Caller, ask: &Ask) -> Result<Option<String>> {
+pub(crate) fn answer_refusal(
+    conn: &Connection,
+    caller: &Caller,
+    ask: &Ask,
+) -> Result<Option<String>> {
     let me = caller.member;
     if caller.scope == TokenScope::Agent {
         if ask.to != me {

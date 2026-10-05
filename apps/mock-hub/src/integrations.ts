@@ -1,4 +1,4 @@
-// GitHub and Jira integrations (api-v1.md, "Integrations"), read-only, over the recorded fixtures
+// GitHub and Jira integrations (api-v1.md, "Integrations"); a sync only reads, over the recorded fixtures
 // in `apps/mock-hub/fixtures/` (the sync crates' format; `pitcrewd serve --integration-fixtures`
 // reads the same files). Device tokens only. Credentials stay in memory and are never returned.
 //
@@ -17,6 +17,8 @@
 // - a merged pull request is noted on the task it closes.
 // Everything a sync changes is authored by its integration's own member, `@sync` (an agent of the
 // person who added it; `@tracker-sync` when `@sync` is another person's).
+// Outward writes are `writes.ts`'s; what a sent one changed is laid over the fixtures here
+// (`changeUpstream`), so the next sync agrees with it.
 //
 // The fixtures are read again at each sync and test, from `fixtures/` or the folder `useFixtures`
 // names: a file whose name sorts first changes what "upstream" says (tests/conformance does).
@@ -53,21 +55,24 @@ const SYNC_FALLBACK = '@tracker-sync';
 const MAX_SCOPES = 50;
 const MAX_LINKS = 16;
 
-interface Exchange {
+export interface Exchange {
   url: string;
   status: number;
   headers: Map<string, string>;
   body: string;
 }
 
-/** Every exchange in the fixtures of `dir`, by URL; the first of two for one URL, by file name, wins. */
+/**
+ * Every exchange in the fixtures of `dir`, by method and URL (`GET https://…`); the first of two for
+ * one method and URL, by file name, wins.
+ */
 function fixtures(dir: URL | string): Map<string, Exchange> {
   const exchanges = new Map<string, Exchange>();
   for (const name of readdirSync(dir).filter((n) => n.endsWith('.fixture')).sort()) {
     const text = readFileSync(typeof dir === 'string' ? join(dir, name) : new URL(name, dir), 'utf8');
     for (const block of text.split(SEPARATOR).map((b) => b.trim()).filter(Boolean)) {
       const lines = block.split('\n');
-      const url = (lines[0] ?? '').split(' ')[1] ?? '';
+      const [method = '', url = ''] = (lines[0] ?? '').split(' ');
       let i = 1;
       while (i < lines.length && lines[i] !== '') i++;
       i++;
@@ -81,17 +86,32 @@ function fixtures(dir: URL | string): Map<string, Exchange> {
         i++;
       }
       const body = lines.slice(i + 1).join('\n');
-      if (!exchanges.has(url)) exchanges.set(url, { url, status, headers, body });
+      const key = `${method} ${url}`;
+      if (!exchanges.has(key)) exchanges.set(key, { url, status, headers, body });
     }
   }
   return exchanges;
 }
 
-/** What "upstream" answers now, for one sync or test. */
+/** What "upstream" answers now, for one sync, test or write, by method and URL. */
 type Upstream = Map<string, Exchange>;
 
 function upstreamOf(hub: Hub): Upstream {
   return fixtures(state(hub).fixtures);
+}
+
+/**
+ * The recorded answer to `method url`, if the fixtures hold one now: its URL, else its URL without
+ * a `since=` parameter, as the daemon's fixture transport answers.
+ */
+export function exchange(hub: Hub, method: string, url: string): Exchange | undefined {
+  const upstream = upstreamOf(hub);
+  const exact = upstream.get(`${method} ${url}`);
+  if (exact !== undefined) return exact;
+  const [base, query] = url.split('?', 2);
+  if (query === undefined) return undefined;
+  const kept = query.split('&').filter((pair) => !pair.startsWith('since='));
+  return upstream.get(`${method} ${kept.length === 0 ? base : `${base}?${kept.join('&')}`}`);
 }
 
 function json(exchange: Exchange | undefined): unknown {
@@ -153,6 +173,90 @@ function record(hub: Hub, id: string): Record {
   const found = state(hub).records.find((r) => r.integration.id === id.toUpperCase());
   if (found === undefined) throw notFound(`No integration ${id}.`);
   return found;
+}
+
+/** The member the integration `id`'s sync acts as, while it is connected. */
+export function syncMemberOf(hub: Hub, id: string): MemberId | undefined {
+  return state(hub).records.find((r) => r.integration.id === id)?.member;
+}
+
+/** Whether `member` is any connected integration's sync member. */
+export function isSyncMember(hub: Hub, member: MemberId): boolean {
+  return state(hub).records.some((r) => r.member === member);
+}
+
+/** The integration with this id, if it is still connected. */
+export function integrationById(hub: Hub, id: string): Integration | undefined {
+  return state(hub).records.find((r) => r.integration.id === id)?.integration;
+}
+
+/** The integration that syncs `container` (a repository or Jira project), and its spelling of it. */
+export function integrationFor(
+  hub: Hub,
+  system: string,
+  container: string,
+): { integration: Integration; container: string } | undefined {
+  for (const r of state(hub).records) {
+    const settings = r.integration.settings;
+    if (settings.kind === 'github' && system === 'github') {
+      const repo = settings.repos.find((x) => x.toLowerCase() === container.toLowerCase());
+      if (repo !== undefined) return { integration: r.integration, container: repo };
+    }
+    if (settings.kind === 'jira' && system === 'jira' && settings.projects.includes(container)) {
+      return { integration: r.integration, container };
+    }
+  }
+  return undefined;
+}
+
+/** What a sent write changed upstream, by issue key: the mock's copy of upstream (see `sync`). */
+export interface Overlay {
+  title?: string;
+  body?: string;
+  labels?: string[];
+  parent?: string;
+  open?: boolean;
+}
+
+const overlays = new WeakMap<Hub, Map<string, Overlay>>();
+
+/** Records what a sent write changed on `key`, so the next sync and the next write see it. */
+export function changeUpstream(hub: Hub, key: string, change: Overlay): void {
+  let map = overlays.get(hub);
+  if (map === undefined) {
+    map = new Map();
+    overlays.set(hub, map);
+  }
+  map.set(key, { ...map.get(key), ...change });
+}
+
+/** `item` with what sent writes changed laid over it. */
+export function withOverlay(hub: Hub, item: Item): Item {
+  const change = overlays.get(hub)?.get(item.key);
+  if (change === undefined) return item;
+  const out: Item = { ...item };
+  // What PitCrew sent is exactly what upstream then holds.
+  if (change.title !== undefined) {
+    out.title = change.title;
+    out.titleExact = true;
+  }
+  if (change.body !== undefined) {
+    out.body = change.body;
+    out.bodyExact = true;
+  }
+  if (change.labels !== undefined) out.labels = [...change.labels].sort();
+  if (change.parent !== undefined) out.parent = change.parent;
+  if (change.open !== undefined) out.open = change.open;
+  return out;
+}
+
+/** One issue as upstream has it now (the fixtures, then what writes changed), if it is known. */
+export function upstreamIssue(hub: Hub, integration: Integration, key: string): Item | undefined {
+  const settings = integration.settings;
+  const upstream = upstreamOf(hub);
+  const read = settings.kind === 'github' ? readGithub(upstream, settings) : readJira(upstream, settings);
+  const item = read.items.find((i) => i.key === key);
+  return item === undefined ? undefined : withOverlay(hub, item);
 }
 
 // ─── Links ──────────────────────────────────────────────────────────────────────────────────────
@@ -474,6 +578,12 @@ function credentialProblem(rec: Record): string | undefined {
   return undefined;
 }
 
+/** Why the integration `id` has no credential to write with, if it has none. */
+export function missingCredential(hub: Hub, id: string): string | undefined {
+  const rec = state(hub).records.find((r) => r.integration.id === id);
+  return rec === undefined ? 'Its integration was removed.' : credentialProblem(rec);
+}
+
 export function test(hub: Hub, id: string): Reply {
   const rec = record(hub, id);
   const at = Date.now();
@@ -486,7 +596,7 @@ export function test(hub: Hub, id: string): Reply {
   const warnings: string[] = [];
   const settings = rec.integration.settings;
   const upstream = upstreamOf(hub);
-  const read = (url: string): Exchange | undefined => upstream.get(url);
+  const read = (url: string): Exchange | undefined => upstream.get(`GET ${url}`);
   if (settings.kind === 'github') {
     const base = settings.api_base ?? GITHUB_API;
     for (const repo of settings.repos) {
@@ -525,7 +635,7 @@ export function test(hub: Hub, id: string): Reply {
 // ─── Sync ───────────────────────────────────────────────────────────────────────────────────────
 
 /** One upstream issue, as either tracker reports it. */
-interface Item {
+export interface Item {
   key: string;
   url: string;
   title: string;
@@ -534,6 +644,39 @@ interface Item {
   open: boolean;
   /** Its milestone's or epic's key. */
   parent?: string;
+  /** Whether the hub holds `title` exactly as upstream has it (the daemon's `title_lossless`). */
+  titleExact: boolean;
+  /** Whether `body` is upstream's whole body or description (the daemon's `body_lossless`). */
+  bodyExact: boolean;
+}
+
+/** Whether `text` reaches the hub as is: nothing hidden to strip, and within `max` characters. */
+function exact(text: string, max: number): boolean {
+  return !HIDDEN.test(text) && [...text].length <= max;
+}
+
+/** ADF as PitCrew writes it: one paragraph of plain text per non-empty line. */
+export function adf(text: string): unknown {
+  return {
+    type: 'doc',
+    version: 1,
+    content: text
+      .split('\n')
+      .filter((l) => l.trim() !== '')
+      .map((l) => ({ type: 'paragraph', content: [{ type: 'text', text: l }] })),
+  };
+}
+
+/** The daemon's `description_is_lossless`: `text` is the whole description `raw`. */
+export function descriptionExact(raw: unknown, text: string): boolean {
+  if (raw === undefined || raw === null) return text === '';
+  if (typeof raw === 'string') return raw === text && exact(raw, 65_536);
+  return isRecord(raw) && JSON.stringify(adf(text)) === JSON.stringify(raw) && exact(text, 65_536);
+}
+
+/** The labels the hub holds of upstream's (the daemon's `fit_labels`). */
+export function heldLabels(labels: string[]): string[] {
+  return fitLabels(labels);
 }
 
 function fit(text: string, max: number): string {
@@ -550,7 +693,7 @@ function fitLabels(labels: string[]): string[] {
   return out;
 }
 
-function adfText(node: unknown, out: string[] = []): string[] {
+export function adfText(node: unknown, out: string[] = []): string[] {
   if (isRecord(node)) {
     if (typeof node['text'] === 'string') out.push(node['text']);
     if (Array.isArray(node['content'])) {
@@ -573,7 +716,7 @@ interface Read {
 
 function readGithub(upstream: Upstream, settings: Extract<IntegrationSettings, { kind: 'github' }>): Read {
   const base = settings.api_base ?? GITHUB_API;
-  const read = (url: string): unknown => json(upstream.get(url));
+  const read = (url: string): unknown => json(upstream.get(`GET ${url}`));
   const out: Read = { items: [], titles: new Map(), parents: new Map(), merged: [], problems: [] };
   for (const repo of settings.repos) {
     const api = `${base}/repos/${repo}`;
@@ -594,13 +737,16 @@ function readGithub(upstream: Upstream, settings: Extract<IntegrationSettings, {
       if (!isRecord(i) || i['pull_request'] !== undefined || typeof i['title'] !== 'string') continue;
       const milestone = isRecord(i['milestone']) ? `${repo}#milestone:${String(i['milestone']['number'])}` : undefined;
       const labels = Array.isArray(i['labels']) ? i['labels'].flatMap((l) => (isRecord(l) && typeof l['name'] === 'string' ? [l['name']] : [])) : [];
+      const body = typeof i['body'] === 'string' ? i['body'] : '';
       const item: Item = {
         key: `${repo}#${String(i['number'])}`,
         url: typeof i['html_url'] === 'string' ? i['html_url'] : `https://github.com/${repo}/issues/${String(i['number'])}`,
         title: i['title'],
-        body: typeof i['body'] === 'string' ? i['body'] : '',
+        body,
         labels: [...labels].sort(),
         open: i['state'] !== 'closed',
+        titleExact: exact(i['title'], 512) && fit(i['title'], 500) === i['title'],
+        bodyExact: exact(body, 65_536),
       };
       if (milestone !== undefined) item.parent = milestone;
       out.items.push(item);
@@ -623,7 +769,7 @@ function readJira(upstream: Upstream, settings: Extract<IntegrationSettings, { k
     const jql = encodeURIComponent(`project in ("${project}") ORDER BY updated ASC, key ASC`).replace(/\(/g, '%28').replace(/\)/g, '%29');
     const path = settings.deployment === 'cloud' ? '/search/jql' : '/search';
     const paging = settings.deployment === 'cloud' ? '' : '&startAt=0';
-    const page = json(upstream.get(`${api}${path}?jql=${jql}${paging}&maxResults=100&fields=${fields}`));
+    const page = json(upstream.get(`GET ${api}${path}?jql=${jql}${paging}&maxResults=100&fields=${fields}`));
     if (!isRecord(page) || !Array.isArray(page['issues'])) {
       out.problems.push({ scope: project, message: 'no recorded fixture matches this project' });
       continue;
@@ -647,6 +793,8 @@ function readJira(upstream: Upstream, settings: Extract<IntegrationSettings, { k
         body: description,
         labels: Array.isArray(f['labels']) ? f['labels'].filter((l): l is string => typeof l === 'string').sort() : [],
         open: category !== 'done',
+        titleExact: exact(summary, 512) && fit(summary, 500) === summary,
+        bodyExact: descriptionExact(f['description'], description),
       };
       if (isRecord(f['parent']) && typeof f['parent']['key'] === 'string') item.parent = f['parent']['key'];
       out.items.push(item);
@@ -669,6 +817,7 @@ function sync(hub: Hub, rec: Record): void {
   const settings = rec.integration.settings;
   const upstream = upstreamOf(hub);
   const read = settings.kind === 'github' ? readGithub(upstream, settings) : readJira(upstream, settings);
+  read.items = read.items.map((item) => withOverlay(hub, item));
   const counts: SyncCounts = { changes: read.items.length + read.merged.length, applied: 0, conflicts: 0, skipped: 0, malformed: 0 };
   const member = rec.member;
   const owner = rec.integration.added_by;
