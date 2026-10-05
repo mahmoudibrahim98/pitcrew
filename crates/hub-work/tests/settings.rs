@@ -88,12 +88,12 @@ fn workspace_persistence_failure_keeps_the_live_name_and_recipes_replay() {
         serde_json::from_value::<SavePersona>(json!({"name":"Updated recipe", "engine":"codex", "model":"synthetic-model", "instructions":"Synthetic instructions", "permission_mode":"plan"})).unwrap()
     };
     assert_eq!(
-        work.save_persona(&person(WRITER), old.id, input())
+        work.save_default_persona(&person(WRITER), old.id, input())
             .unwrap_err()
             .code(),
         ErrorCode::Forbidden
     );
-    let saved = work.save_persona(&sam, old.id, input()).unwrap();
+    let saved = work.save_default_persona(&sam, old.id, input()).unwrap();
     work.store().rebuild(Directory::NAME).unwrap();
     assert!(work.personas().unwrap().contains(&saved));
 }

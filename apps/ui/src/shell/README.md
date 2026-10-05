@@ -295,6 +295,11 @@ does nothing, and the palette leaves it out entirely:
 inside a `DataProvider` pointed at a mock hub on a free port, checks the stub's nav entry appears
 and routes, and that a feature route replaces a placeholder. Copy it for your feature.
 
+Creation entries now come from their owning features; the shell has no placeholder create forms.
+`CreateEntry.projectContext` restricts an entry to routes with a project parameter in both the
+menu and palette. The Projects feature uses it for Workstream, and its project-page button opens
+the same registered dialog. The shell retains modal trapping, Close/Escape and opener restoration.
+
 ## Desktop updates
 
 The root lazily mounts `DesktopUpdates` once in a desktop webview. It listens before reading
@@ -314,3 +319,4 @@ preference; its page is loaded lazily. Integrations keeps its existing deep link
 inside Settings instead of the Projects layout. Updates is listed only in the desktop app.
 Native notification preferences remain controlled by the tray; hook removal awaits retained
 uninstall plans in the CLI. See `src/settings/README.md` for persistence and existing API reuse.
+Create forms may mark their initial input with `data-create-focus` and React `autoFocus`: the shell focuses it when content is ready, including lazy forms, while preserving focus trapping and return to the opener.

@@ -88,6 +88,15 @@ Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
 
+Directory creation/editing cases cover all four POST/PUT routes, device-only access, bounded
+fields, unknown members/targets, forged metadata, persona-linked membership, lead inclusion,
+deduplication, event authors and unchanged revisions on refusal. Atomic-project cases prove an
+invalid first workstream or key conflict creates neither a project nor a workstream, and a valid
+request creates both. Both targets run these cases.
+
+Directory conformance also dispatches a task through the member created by New agent, exercising
+the recipe/member ownership link against both servers.
+
 Hook-install conformance writes agent configurations. It is disabled unless
 `PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed
 synthetic targets. Do not set it when pointing the suite at an existing hub.

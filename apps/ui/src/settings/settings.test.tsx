@@ -72,8 +72,11 @@ it('reviews hook installation before confirmation and shows installed status',as
 it('edits default agents and offers section commands in the palette',async()=>{
   const view=open('agents');
   const fields=await screen.findAllByLabelText('Default agent name');
-  fireEvent.change(fields[0]!,{target:{value:'Updated recipe'}});
-  const form=fields[0]!.closest('form')!;
+  const field=fields[0];
+  if (field===undefined) throw new Error('Missing default agent field');
+  fireEvent.change(field,{target:{value:'Updated recipe'}});
+  const form=field.closest('form');
+  if (form===null) throw new Error('Missing default agent form');
   fireEvent.click(within(form).getByRole('button',{name:'Save changes'}));
   await screen.findByText('Saved.');
   expect((await view.api.personas()).some(p=>p.name==='Updated recipe')).toBe(true);

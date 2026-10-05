@@ -1,21 +1,19 @@
 // The shell's own feature: Home, Inbox, My tasks and the Agent console in the sidebar, the
 // placeholder pages the Projects and Agent console features replace, the shell's palette
-// commands, and placeholder "+ New" dialogs.
+// commands. Features own their "+ New" dialogs.
 
 import { createRoute, lazyRouteComponent, type AnyRoute } from '@tanstack/react-router';
 import { useMe, useSessions, useTasks } from '../data/index.ts';
 import {
   Badge,
-  Button,
   CheckCircleIcon,
   ConsoleIcon,
-  DialogFooter,
   HomeIcon,
   InboxIcon,
   useTheme,
 } from '../design/index.ts';
 import { isOpenTask, useMyOpenAsks } from './data.ts';
-import type { CreateEntry, Feature } from './feature.ts';
+import type { Feature } from './feature.ts';
 import { OpenWorkstream } from './pages/open.tsx';
 import type { WorkspaceRoute } from './routes.tsx';
 import { useShell } from './store.ts';
@@ -63,31 +61,6 @@ function ConsoleCount() {
     </span>
   );
 }
-
-function placeholder(what: string) {
-  function PlaceholderDialog({ close }: { close(): void }) {
-    return (
-      <>
-        <p className="px-4 py-4 text-sm text-ink-2">
-          Creating {what} is not available yet. This dialog is a placeholder.
-        </p>
-        <DialogFooter>
-          <Button variant="primary" onClick={close}>
-            Close
-          </Button>
-        </DialogFooter>
-      </>
-    );
-  }
-  return PlaceholderDialog;
-}
-
-const CREATE: CreateEntry[] = [
-  { id: 'task', label: 'Task', order: 10, dialog: placeholder('a task') },
-  { id: 'agent', label: 'Agent', order: 20, dialog: placeholder('an agent') },
-  { id: 'project', label: 'Project', order: 30, dialog: placeholder('a project') },
-  { id: 'team', label: 'Team', order: 40, dialog: placeholder('a team') },
-];
 
 type PageName = keyof typeof import('./pages/placeholders.tsx');
 
@@ -189,5 +162,5 @@ export const shellFeature: Feature = {
       run: () => useTheme.getState().setTheme('system'),
     },
   ],
-  create: CREATE,
+
 };

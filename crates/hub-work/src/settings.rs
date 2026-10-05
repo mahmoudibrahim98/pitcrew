@@ -125,7 +125,7 @@ impl WorkService {
     /// Edit an existing default-agent recipe for future sessions.
     /// # Errors
     /// Unknown recipe, unauthorized owner, invalid fields or database error.
-    pub fn save_persona(
+    pub fn save_default_persona(
         &self,
         caller: &Caller,
         id: PersonaId,

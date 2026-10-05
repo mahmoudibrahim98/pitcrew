@@ -142,11 +142,27 @@ describe('TaskDrawer', () => {
     expect(within(run).getByText('Waiting')).toBeTruthy();
   });
 
+  it('excludes all persona-less service actors from Dispatch to', async () => {
+    const transport: typeof fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      if (String(input).endsWith('/v1/members')) {
+        const members = await response.json();
+        return new Response(JSON.stringify([...members, { id: '01J00000000000000000000003', kind: 'agent', name: 'Synthetic sync', handle: '@sync', owner: demo.sam }]), { headers: { 'Content-Type': 'application/json' } });
+      }
+      return response;
+    };
+    renderWithHub(drawer(demo.pap6), hub, { fetch: transport });
+    const dialog = await screen.findByRole('dialog', { name: 'Aggregate the results table' });
+    const select = within(dialog).getByRole('combobox', { name: 'Dispatch to' });
+    await within(select).findByRole('option', { name: /@writer/ });
+    expect(within(select).queryByRole('option', { name: /@sync|@office/ })).toBeNull();
+  });
+
   it('dispatches to an agent, and shows the hub’s refusal for a done task', async () => {
     renderWithHub(drawer(demo.pap7), hub);
     const dialog = await screen.findByRole('dialog', { name: 'Set up the submission checklist' });
     const run = within(dialog).getByRole('region', { name: 'Agent run' });
-    await within(run).findByRole('option', { name: '@writer' });
+    await within(run).findByRole('option', { name: /@writer/ });
     fireEvent.click(within(run).getByRole('button', { name: 'Dispatch' }));
     const alert = await within(run).findByRole('alert');
     expect(alert.textContent).toBe('Couldn’t dispatch: PAP-7 is done; reopen it before dispatching.');
