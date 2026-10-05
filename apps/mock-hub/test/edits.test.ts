@@ -166,7 +166,7 @@ describe('POST /v1/workstreams', () => {
 
   it('keeps a given status and locations', () =>
     withServer(async (server) => {
-      const locations = [{ machine: LAPTOP, path: '/work/paper/figures' }];
+      const locations = [{ machine: LAPTOP, path: process.platform === 'win32' ? 'C:/work/paper/figures' : '/work/paper/figures' }];
       const res = await call<Workstream>(server, 'POST', '/v1/workstreams', {
         token: DEVICE,
         json: { project: `prj_${ID.tooling}`, name: 'Packaging', status: 'idea', locations },
