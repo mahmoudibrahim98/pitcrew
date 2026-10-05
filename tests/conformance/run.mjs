@@ -116,6 +116,7 @@ try {
     env.PITCREW_CONFORMANCE_URL = mock.url;
     env.PITCREW_CONFORMANCE_PERSON = 'dev-device-token';
     env.PITCREW_CONFORMANCE_AGENT = 'dev-agent-token';
+    env.PITCREW_CONFORMANCE_READER = 'dev-reader-token';
     env.PITCREW_CONFORMANCE_SECOND_PERSON = 'dev-second-device-token';
   } else {
     build = spawn(
@@ -127,16 +128,25 @@ try {
     if (code !== 0) throw new Error('Daemon build failed');
     const state = join(temporary, 'state');
     await mkdir(state, { mode: 0o700 });
-    // Provision a second synthetic person's credential before the daemon owns the registry.
-    // The suite never prints either credential or opens a real user's registry.
+    // Provision a second synthetic person's credential, and a reader token (an agent that may
+    // only read: the demo's back office, for @sam), before the daemon owns the registry.
+    // The suite never prints a credential or opens a real user's registry.
     const second = `pcd_${randomBytes(32).toString('base64url')}`;
+    const reader = `pcr_${randomBytes(32).toString('base64url')}`;
+    const sha256 = (token) => createHash('sha256').update(token).digest('hex');
     await writeFile(join(state, 'tokens.json'), JSON.stringify({ version: 1, tokens: [{
       id: '01J00000000000000000000001',
-      sha256: createHash('sha256').update(second).digest('hex'),
+      sha256: sha256(second),
       caller: { member: '01JB000000000000000MEM0007', scope: 'device' },
+      created_at: 0,
+    }, {
+      id: '01J00000000000000000000002',
+      sha256: sha256(reader),
+      caller: { member: '01JB000000000000000MEM0006', scope: 'reader', on_behalf_of: '01JB000000000000000MEM0001' },
       created_at: 0,
     }] }), { mode: 0o600 });
     env.PITCREW_CONFORMANCE_SECOND_PERSON = second;
+    env.PITCREW_CONFORMANCE_READER = reader;
     const refused = join(temporary, 'not-a-socket');
     await writeFile(refused, 'Synthetic runtime refusal\n');
     // A dispatch starts its agent's CLI: stand-ins first on the daemon's PATH, never a real one.
@@ -228,6 +238,12 @@ try {
     suite = spawn(process.execPath, ['--test', 'tests/conformance/board.test.mjs'], { cwd: root, env, stdio: 'inherit' });
     const [boardCode] = await once(suite, 'exit');
     process.exitCode = process.exitCode || (boardCode ?? 1);
+  }
+  {
+    // The Orchestrator starts an agent's CLI too, and ends it: run alone, last.
+    suite = spawn(process.execPath, ['--test', 'tests/conformance/orchestrator.test.mjs'], { cwd: root, env, stdio: 'inherit' });
+    const [orchestratorCode] = await once(suite, 'exit');
+    process.exitCode = process.exitCode || (orchestratorCode ?? 1);
   }
 } finally {
   await cleanup();

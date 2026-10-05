@@ -98,7 +98,7 @@ const SECRET_NAMES = [
 const SECRET_EXACT = ['pwd', 'pw', 'pat', 'key', 'sig', 'signature'];
 const SCHEMES = ['bearer', 'basic', 'digest'];
 // `pitcrew_protocol::text::is_hidden`, but for the line separators (they become spaces).
-const HIDDEN =
+export const HIDDEN =
   /[\u00AD\u034F\u061C\u115F\u1160\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
 const GAP = /[\s"'`()[\]{}<>,;|]/u;
 

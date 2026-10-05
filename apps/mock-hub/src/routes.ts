@@ -2,10 +2,11 @@ import { hooksDiff, installHooks, parseSafety } from './onboarding.ts';
 // Every HTTP route in docs/build/contracts/api-v1.md.
 //
 // A route is a method, a path pattern and who may call it: routes marked **agent** in the
-// contract accept both token scopes, the others need a device token. Agent tokens read the whole
-// workspace but write only to their own tasks and sessions (403 otherwise). Handlers validate the
-// whole request before changing anything, and every event they append is authored by the token's
-// member, never by the request body.
+// contract accept every token scope, those marked **read** device and reader tokens, the others
+// need a device token. Agent tokens read the whole workspace but write only to their own tasks
+// and sessions (403 otherwise); a reader token only reads (anything but a GET is 403). Handlers
+// validate the whole request before changing anything, and every event they append is authored
+// by the token's member, never by the request body.
 
 import { blocksPage, daysPage } from './recaps.ts';
 import { canMove } from './rules.ts';
@@ -79,6 +80,12 @@ import {
 import { files } from './files.ts';
 import { parseImport, includesSession, eventVisible, includedRecaps } from './import.ts';
 import { boardPreview, draftAt, listDrafts, proposeBoard, reviewDraft, startDraft } from './board.ts';
+import {
+  ask as askOrchestrator,
+  cancel as cancelAnswer,
+  clear as clearConversations,
+  orchestratorOf,
+} from './orchestrator.ts';
 export const MOCK_VERSION = '0.1.0-mock';
 /** `PROTOCOL_VERSION` and `PROTOCOL_MIN` in crates/protocol/src/version.rs. */
 export const PROTOCOL_VERSION = 1;
@@ -91,6 +98,8 @@ const TOKENS = new Map<string, { member: MemberId; scope: TokenScope }>([
   ['dev-device-token', { member: DEV_DEVICE_MEMBER, scope: 'device' }],
   ['dev-second-device-token', { member: '01JB000000000000000MEM0007', scope: 'device' }],
   ['dev-agent-token', { member: DEV_AGENT_MEMBER, scope: 'agent' }],
+  // A reader (an agent that may only read), as the Orchestrator's CLI gets: @office, for @sam.
+  ['dev-reader-token', { member: '01JB000000000000000MEM0006', scope: 'reader' }],
 ]);
 
 /**
@@ -150,8 +159,11 @@ type Handler = (hub: Hub, ctx: Context) => Reply;
 interface Route {
   method: string;
   pattern: string;
-  /** `agent` routes accept both scopes; `device` routes only device tokens. */
-  access: 'agent' | 'device';
+  /**
+   * `agent` routes accept every scope; `read` routes (`GET`s marked **read**) device and reader
+   * tokens; `device` routes only device tokens. A reader only ever reads (see `handleApi`).
+   */
+  access: 'agent' | 'read' | 'device';
   handler: Handler;
 }
 
@@ -172,8 +184,15 @@ export async function handleApi(hub: Hub, request: ApiRequest): Promise<Reply> {
   }
   const caller = authenticate(hub, bearerToken(request.authorization));
   const { pattern, access, handler } = match.route;
+  // A reader token may only read: anything but a GET is refused before the route sees it.
+  if (caller.scope === 'reader' && request.method !== 'GET' && request.method !== 'HEAD') {
+    throw forbidden(`${request.method} ${request.path} is refused: this token may only read.`);
+  }
   if (access === 'device' && caller.scope !== 'device') {
     throw forbidden(`${request.method} ${pattern} needs a device token.`);
+  }
+  if (access === 'read' && caller.scope === 'agent') {
+    throw forbidden(`${request.method} ${pattern} needs a device token or a reader token.`);
   }
   const body = request.method === 'GET' ? undefined : await request.readBody();
   const param = (name: string): string => {
@@ -1469,29 +1488,29 @@ const ROUTES: Route[] = [
   route('GET', '/v1/me', 'agent', (_hub, ctx) =>
     ok(found(ctx.caller.member, 'No member yet; set up the workspace first.')),
   ),
-  route('GET', '/v1/workspace', 'device', (hub) =>
+  route('GET', '/v1/workspace', 'read', (hub) =>
     ok({ workspace: hub.workspace, rev: hub.rev, ...(hub.setupNeeded ? { setup_needed: true } : {}) }),
   ),
   route('POST', '/v1/setup', 'device', setupHub),
-  route('GET', '/v1/machines', 'device', (hub) => ok(hub.machines)),
+  route('GET', '/v1/machines', 'read', (hub) => ok(hub.machines)),
   route('POST', '/v1/machines/:id/scan', 'device', (hub, ctx) => ({
     status: 200,
     stream: startScan(hub, ctx.param('id')),
   })),
   route('GET', '/v1/members', 'agent', (hub) => ok(hub.members)),
-  route('GET', '/v1/personas', 'device', (hub) => ok(hub.personas)),
-  route('GET', '/v1/teams', 'device', (hub) => ok(hub.teams)),
+  route('GET', '/v1/personas', 'read', (hub) => ok(hub.personas)),
+  route('GET', '/v1/teams', 'read', (hub) => ok(hub.teams)),
   // Projects and workstreams.
-  route('GET', '/v1/projects', 'device', (hub) => ok(hub.projects)),
-  route('GET', '/v1/projects/:id', 'device', (hub, ctx) =>
+  route('GET', '/v1/projects', 'read', (hub) => ok(hub.projects)),
+  route('GET', '/v1/projects/:id', 'read', (hub, ctx) =>
     ok(found(hub.findProject(ctx.param('id')), `No project ${ctx.param('id')}.`)),
   ),
   route('POST', '/v1/projects', 'device', createProject),
-  route('GET', '/v1/workstreams', 'device', listWorkstreams),
+  route('GET', '/v1/workstreams', 'read', listWorkstreams),
   route('GET', '/v1/workstreams/:id/files', 'device', (hub, ctx) => files(hub, ctx.param('id'), ctx.query, ctx.body, 'list')),
   route('GET', '/v1/workstreams/:id/files/content', 'device', (hub, ctx) => files(hub, ctx.param('id'), ctx.query, ctx.body, 'read')),
   route('PUT', '/v1/workstreams/:id/files/content', 'device', (hub, ctx) => files(hub, ctx.param('id'), ctx.query, ctx.body, 'write')),
-  route('GET', '/v1/workstreams/:id', 'device', (hub, ctx) =>
+  route('GET', '/v1/workstreams/:id', 'read', (hub, ctx) =>
     ok(found(hub.findWorkstream(ctx.param('id')), `No workstream ${ctx.param('id')}.`)),
   ),
   route('POST', '/v1/workstreams', 'device', createWorkstream),
@@ -1530,8 +1549,8 @@ const ROUTES: Route[] = [
     hub.importChoice = { filter, committed_at: Date.now() };
     return ok({ imported: hub.sessions.filter((s) => includesSession(hub.importChoice, s)).length });
   }),
-  route('GET', '/v1/sessions', 'device', listSessions),
-  route('GET', '/v1/sessions/:id', 'device', (hub, ctx) => ok(sessionAt(hub, ctx.param('id')))),
+  route('GET', '/v1/sessions', 'read', listSessions),
+  route('GET', '/v1/sessions/:id', 'read', (hub, ctx) => ok(sessionAt(hub, ctx.param('id')))),
   route('GET', '/v1/sessions/:id/transcript', 'device', getTranscript),
   route('GET', '/v1/sessions/:id/terminal', 'device', needsWebSocket),
   route('POST', '/v1/sessions', 'device', startSession),
@@ -1544,13 +1563,13 @@ const ROUTES: Route[] = [
   route('GET', '/v1/asks', 'agent', listAsks),
   route('POST', '/v1/asks', 'agent', raiseAsk),
   route('POST', '/v1/asks/:id/answer', 'agent', answerAsk),
-  route('GET', '/v1/briefs', 'device', listBriefs),
+  route('GET', '/v1/briefs', 'read', listBriefs),
   route('PUT', '/v1/briefs/:kind/:id', 'device', putBrief),
-  route('GET', '/v1/events', 'device', listEvents),
-  route('GET', '/v1/activity', 'device', listEvents),
+  route('GET', '/v1/events', 'read', listEvents),
+  route('GET', '/v1/activity', 'read', listEvents),
   // Recaps: from the fixture the recap engine wrote (recaps.ts).
-  route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(includedRecaps(hub), ctx.query))),
-  route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(includedRecaps(hub), ctx.query))),
+  route('GET', '/v1/recaps/blocks', 'read', (hub, ctx) => ok(blocksPage(includedRecaps(hub), ctx.query))),
+  route('GET', '/v1/recaps/days', 'read', (hub, ctx) => ok(daysPage(includedRecaps(hub), ctx.query))),
   route('POST', '/v1/hooks/:engine/:event', 'agent', receiveHook),
   // Board drafts (board.ts).
   route('GET', '/v1/workstreams/:id/board-draft', 'device', (hub, ctx) => ok(boardPreview(hub, ctx.param('id')))),
@@ -1567,5 +1586,17 @@ const ROUTES: Route[] = [
   route('POST', '/v1/board-drafts/:id/review', 'device', (hub, ctx) =>
     ok(reviewDraft(hub, ctx.caller.memberId, ctx.param('id'), ctx.body)),
   ),
+  // The Orchestrator (orchestrator.ts): each person's own conversations.
+  route('GET', '/v1/orchestrator', 'device', (hub, ctx) => ok(orchestratorOf(hub, ctx.caller.memberId))),
+  route('POST', '/v1/orchestrator/questions', 'device', (hub, ctx) =>
+    accepted(askOrchestrator(hub, ctx.caller.memberId, ctx.body)),
+  ),
+  route('POST', '/v1/orchestrator/conversations/:id/cancel', 'device', (hub, ctx) =>
+    ok(cancelAnswer(hub, ctx.caller.memberId, ctx.param('id'))),
+  ),
+  route('DELETE', '/v1/orchestrator/conversations', 'device', (hub, ctx) => {
+    clearConversations(hub, ctx.caller.memberId);
+    return noContent();
+  }),
   route('GET', '/v1/stream', 'device', needsWebSocket),
 ];
