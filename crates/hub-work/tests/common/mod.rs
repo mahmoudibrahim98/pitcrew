@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use pitcrew_fixtures::DemoWorkspace;
-use pitcrew_hub_work::{WorkService, agent_routes, device_routes, projections};
+use pitcrew_hub_work::{WorkService, agent_routes, device_routes, projections, read_routes};
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::ids::MemberId;
 use pitcrew_store::{Store, StoreOptions};
@@ -24,6 +24,8 @@ pub const WRITER: &str = "01JB000000000000000MEM0002";
 pub const RUNNER: &str = "01JB000000000000000MEM0003";
 pub const REVIEWER: &str = "01JB000000000000000MEM0004";
 pub const BUILDER: &str = "01JB000000000000000MEM0005";
+/// The back office, `@office`, @sam's agent.
+pub const OFFICE: &str = "01JB000000000000000MEM0006";
 pub const PAPER: &str = "01JB000000000000000PRJ0001";
 pub const TOOLING: &str = "01JB000000000000000PRJ0002";
 pub const SUBMISSION: &str = "01JB000000000000000WST0001";
@@ -52,6 +54,15 @@ pub fn agent(id: &str) -> Caller {
     Caller {
         member: member(id),
         scope: TokenScope::Agent,
+        on_behalf_of: Some(member(SAM)),
+    }
+}
+
+/// A reader token (an agent that may only read), acting for @sam.
+pub fn reader(id: &str) -> Caller {
+    Caller {
+        member: member(id),
+        scope: TokenScope::Reader,
         on_behalf_of: Some(member(SAM)),
     }
 }
@@ -90,10 +101,12 @@ async fn not_found() -> Response {
         .into_response()
 }
 
-/// The routes as `pitcrew-api` mounts them: agent routes as they are, device routes behind a
-/// device-only guard, a JSON 404 for anything else, and the service as an extension.
+/// The routes as `pitcrew-api` mounts them: agent routes as they are, the reads a reader may make
+/// too (each handler refuses agents itself), device routes behind a device-only guard, a JSON 404
+/// for anything else, and the service as an extension.
 pub fn app(work: &Arc<WorkService>) -> Router {
     agent_routes()
+        .merge(read_routes())
         .merge(device_routes().layer(middleware::from_fn(require_device)))
         .layer(axum::Extension(Arc::clone(work)))
         .fallback(not_found)

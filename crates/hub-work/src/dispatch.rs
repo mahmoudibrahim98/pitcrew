@@ -60,6 +60,7 @@ use pitcrew_protocol::model::{
     PermissionMode, Session, SessionState, Task, TaskStatus,
 };
 use pitcrew_protocol::runner::RunnerCommand;
+use pitcrew_protocol::transcript::TranscriptPage;
 use pitcrew_store::sql::Connection;
 use serde::Deserialize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -186,9 +187,9 @@ pub trait Dispatcher: Send + Sync + std::fmt::Debug {
     fn start(&self, request: &DispatchRequest) -> std::result::Result<(), DispatchError>;
 
     /// Starts a session the hub stored for an agent outside a dispatch: a board draft's
-    /// (`crate::board`). Called as [`Dispatcher::start`] is, with the session already stored
-    /// (`starting`, the agent named); on an error the hub ends it. The default refuses, as
-    /// [`DispatchError::Unavailable`].
+    /// (`crate::board`) or the Orchestrator's (`crate::orchestrator`). Called as
+    /// [`Dispatcher::start`] is, with the session already stored (`starting`, the agent named); on
+    /// an error the hub ends it. The default refuses, as [`DispatchError::Unavailable`].
     ///
     /// # Errors
     ///
@@ -198,6 +199,71 @@ pub trait Dispatcher: Send + Sync + std::fmt::Debug {
         Err(DispatchError::Unavailable(
             "this hub's runner link starts only dispatched sessions".into(),
         ))
+    }
+
+    /// A private folder on `machine` for sessions that run in nobody's project (the
+    /// Orchestrator's), `name` among the link's own: made if missing, private to the runner's
+    /// user, holding the agent CLIs' settings a session that only reads needs. Answers its path,
+    /// for [`SessionRequest::cwd`]. Called under the command lock: answer at once, and never call
+    /// back into the service. The default refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError`]: no such folder can be made there.
+    fn scratch(
+        &self,
+        machine: &MachineId,
+        name: &str,
+    ) -> std::result::Result<String, DispatchError> {
+        let _ = (machine, name);
+        Err(DispatchError::Unavailable(
+            "this hub's runner link has no scratch folders".into(),
+        ))
+    }
+
+    /// Runs `command` on `machine`'s runner for a session the hub started: typing a follow-up
+    /// (`SendText`), Esc (`Interrupt`), or ending it (`EndSession`). Called without the lock;
+    /// blocking. The default refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError`]: the machine is unreachable, the runner refused, or the command failed.
+    fn command(
+        &self,
+        machine: &MachineId,
+        command: &RunnerCommand,
+    ) -> std::result::Result<(), DispatchError> {
+        let _ = (machine, command);
+        Err(DispatchError::Unavailable(
+            "this hub's runner link runs no session commands".into(),
+        ))
+    }
+
+    /// A page of `session`'s transcript on `machine`, as `GET /v1/sessions/{id}/transcript` reads
+    /// it (`before`, `limit`): an empty page at its start while the runner has not found the
+    /// transcript. Called without the lock; blocking, bounded by the runner. The default refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError`]: the machine is unreachable, or the transcript cannot be read now.
+    fn transcript(
+        &self,
+        machine: &MachineId,
+        session: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> std::result::Result<TranscriptPage, DispatchError> {
+        let _ = (machine, session, before, limit);
+        Err(DispatchError::Unavailable(
+            "this hub's runner link reads no transcripts".into(),
+        ))
+    }
+
+    /// Whether `engine`'s CLI is installed on `machine` (on its runner's `PATH`); `None` when the
+    /// link cannot tell. Called under the command lock: answer at once. The default cannot tell.
+    fn installed(&self, machine: &MachineId, engine: Engine) -> Option<bool> {
+        let _ = (machine, engine);
+        None
     }
 }
 
@@ -837,6 +903,36 @@ impl WorkService {
 
 /// A person runs only their own agents: `forbidden` unless `caller` owns `agent`. An agent with
 /// no owner is no one's to run.
+/// The agent a session the caller asks for runs as: `named`, a member that must be an agent
+/// (`invalid` for an unknown one or a person) of the caller's own (`forbidden` otherwise); else the
+/// caller's back office ([`crate::OFFICE_HANDLE`]), or `invalid`, saying to name one to `what`.
+pub(crate) fn own_agent(
+    conn: &Connection,
+    caller: &Caller,
+    named: Option<&MemberId>,
+    what: &str,
+) -> Result<Member> {
+    let agent = match named {
+        Some(id) => query::member(conn, id)?
+            .ok_or_else(|| WorkError::invalid(format!("agent: no member {id}.")))?,
+        None => query::member_with_handle(conn, crate::office::OFFICE_HANDLE)?
+            .filter(|m| m.owner == Some(caller.member))
+            .ok_or_else(|| {
+                WorkError::invalid(format!(
+                    "Name an agent to {what}: this hub has no back office of yours."
+                ))
+            })?,
+    };
+    if agent.kind != MemberKind::Agent {
+        return Err(WorkError::invalid(format!(
+            "agent must be an agent; {} is a person.",
+            agent.handle
+        )));
+    }
+    require_owner(caller, &agent)?;
+    Ok(agent)
+}
+
 pub(crate) fn require_owner(caller: &Caller, agent: &Member) -> Result<()> {
     if agent.owner == Some(caller.member) {
         return Ok(());

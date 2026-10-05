@@ -29,9 +29,8 @@
 //! there are few, and they need no table of their own. A running draft whose session has ended is
 //! [`DraftState::Ended`].
 
-use crate::dispatch::{DispatchError, SessionRequest, refused, require_owner};
+use crate::dispatch::{DispatchError, SessionRequest, own_agent, refused};
 use crate::error::{Result, WorkError};
-use crate::office::OFFICE_HANDLE;
 use crate::query::{self, SessionFilter, TaskFilter};
 use crate::recap::{BlockFilter, RecapIndex};
 use crate::service::WorkService;
@@ -46,8 +45,7 @@ use pitcrew_protocol::board::{
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{DraftId, MemberId, SessionId, TaskId, TaskKey, WorkstreamId};
 use pitcrew_protocol::model::{
-    Engine, LinkBasis, Liveness, Machine, MemberKind, Session, SessionState, Task, TaskStatus,
-    Workstream,
+    Engine, LinkBasis, Liveness, Machine, Session, SessionState, Task, TaskStatus, Workstream,
 };
 use pitcrew_store::sql::{Connection, params};
 use sha2::{Digest as _, Sha256};
@@ -240,25 +238,7 @@ impl WorkService {
         let (draft, request, dispatcher) = {
             let _guard = self.lock();
             let (agent, place, persona) = self.read(|c| {
-                let agent = match &start.agent {
-                    Some(id) => query::member(c, id)?
-                        .ok_or_else(|| WorkError::invalid(format!("agent: no member {id}.")))?,
-                    None => query::member_with_handle(c, OFFICE_HANDLE)?
-                        .filter(|m| m.owner == Some(caller.member))
-                        .ok_or_else(|| {
-                            WorkError::invalid(
-                                "Name an agent to draft the board: this hub has no back office \
-                                 of yours.",
-                            )
-                        })?,
-                };
-                if agent.kind != MemberKind::Agent {
-                    return Err(WorkError::invalid(format!(
-                        "agent must be an agent; {} is a person.",
-                        agent.handle
-                    )));
-                }
-                require_owner(caller, &agent)?;
+                let agent = own_agent(c, caller, start.agent.as_ref(), "draft the board")?;
                 if made.digest != start.digest {
                     return Err(WorkError::conflict(
                         "The workstream has changed since its preview: preview it again, and \

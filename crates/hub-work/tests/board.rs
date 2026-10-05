@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use common::{RUNNER, SAM, SEED_RUNS, SUBMISSION, WRITER, agent, call, demo, expect, open, person};
 use pitcrew_hub_work::{
     DispatchError, DispatchRequest, Dispatcher, SessionRequest, TaskFilter, WorkService,
-    agent_routes, board_agent_routes, board_device_routes, device_routes,
+    agent_routes, board_agent_routes, board_device_routes, device_routes, read_routes,
 };
 use pitcrew_protocol::board::{DRAFTED_LABEL, MAX_PROPOSAL_BYTES};
 use pitcrew_protocol::events::{Event, EventBody};
@@ -88,6 +88,7 @@ async fn require_device(request: axum::extract::Request, next: Next) -> Response
 fn app(work: &Arc<WorkService>) -> Router {
     agent_routes()
         .merge(board_agent_routes())
+        .merge(read_routes())
         .merge(
             device_routes()
                 .merge(board_device_routes())
