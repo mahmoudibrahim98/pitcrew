@@ -15,7 +15,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use pitcrew_desktop::daemon::LocalConnector;
 use pitcrew_desktop::daemon::endpoint::Endpoint;
 use pitcrew_desktop::gateway::{Connector, Delivery, Sink, SinkClosed};
@@ -132,6 +132,8 @@ pub struct Seen {
     pub flooded: Vec<usize>,
     /// Each live stream's `since`, in the order they opened.
     pub streams: Vec<Option<String>>,
+    /// Bodies of `PUT /v1/integrations/{id}/credential`, with the id.
+    pub credentials: Vec<(String, String)>,
     /// When each live stream opened.
     pub stream_times: Vec<Instant>,
     /// `GET /v1/asks` calls.
@@ -367,6 +369,7 @@ fn router(fake: Fake) -> Router {
         .route("/v1/query", get(query))
         .route("/v1/big", get(big))
         .route("/v1/plain", get(plain))
+        .route("/v1/integrations/{id}/credential", put(credential))
         .route("/v1/stream", any(stream))
         .route("/v1/sessions/{id}/terminal", any(terminal))
         .fallback(not_found)
@@ -543,6 +546,24 @@ async fn live(mut socket: WebSocket, since: Option<String>, fake: Fake) {
             },
         }
     }
+}
+
+/// Records an integration's credential, and answers 204 (or 409 for the id `gh`, as the daemon
+/// does for a `gh_cli` integration).
+async fn credential(State(fake): State<Fake>, Path(id): Path<String>, body: Bytes) -> Response {
+    if id == "gh" {
+        return api_error(
+            StatusCode::CONFLICT,
+            "conflict",
+            "This integration keeps no secret.",
+        );
+    }
+    fake.seen
+        .lock()
+        .unwrap()
+        .credentials
+        .push((id, String::from_utf8_lossy(&body).into_owned()));
+    (StatusCode::NO_CONTENT, "").into_response()
 }
 
 async fn plain() -> Response {

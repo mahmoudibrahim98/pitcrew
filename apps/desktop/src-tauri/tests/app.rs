@@ -282,8 +282,24 @@ fn only_the_main_window_may_call_the_gateway_and_nothing_else() {
         )
         .is_err()
     );
+    assert!(
+        invoke(
+            &other,
+            "gateway_integration_credential",
+            json!({ "workspace": WORKSPACE_ID, "integration": "01J9ZQ3", "secret": "synthetic" })
+        )
+        .is_err()
+    );
     // The main window: the gateway, and listening to events; no other core command.
     assert!(invoke(&main, "gateway_workspaces", json!({})).is_ok());
+    assert!(
+        invoke(
+            &main,
+            "gateway_integration_credential",
+            json!({ "workspace": WORKSPACE_ID, "integration": "01J9ZQ3", "secret": "synthetic" })
+        )
+        .is_ok()
+    );
     for (cmd, args) in [
         (
             "plugin:event|emit",

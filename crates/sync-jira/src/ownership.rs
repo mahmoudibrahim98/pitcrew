@@ -14,35 +14,76 @@
 use crate::change::UpstreamChange;
 use pitcrew_protocol::ids::TaskId;
 use pitcrew_protocol::model::{ExternalRef, Mover, Task, TaskStatus};
-pub use pitcrew_sync_github::ownership::{FieldOwner, FieldOwnership, Intent};
+use pitcrew_sync_github::ownership::plan_scope_closed;
+pub use pitcrew_sync_github::ownership::{
+    FieldOwner, FieldOwnership, Intent, LinkedWorkstream, Outward, outward,
+};
+
+/// The field-ownership table for Jira epics mirrored as the workstreams that link them
+/// (`Workstream::external`): the same rules as GitHub's milestones. [`plan_workstream`] follows
+/// it.
+pub const EPIC_FIELD_OWNERSHIP: &[FieldOwnership] = &[
+    FieldOwnership {
+        field: "name",
+        owner: FieldOwner::Hub,
+        outward: Outward::Never,
+        note: "A person named the workstream; an epic's new summary is shown on the link only, \
+               and never renames the workstream.",
+    },
+    FieldOwnership {
+        field: "status",
+        owner: FieldOwner::Mirrored,
+        outward: Outward::Never,
+        note: "An epic moved to a done status proposes `shipped`, from idea, active or paused \
+               only, and never while one of the workstream's tasks is in progress: that raises \
+               a conflict ask instead. A shipped or dropped workstream is left as it is.",
+    },
+];
+
+/// Turns an epic's [`UpstreamChange`] into the actions it implies for one workstream that links
+/// that epic, following [`EPIC_FIELD_OWNERSHIP`]. Every other change gives none: issues go through
+/// [`plan`].
+#[must_use]
+pub fn plan_workstream(change: &UpstreamChange, linked: &LinkedWorkstream<'_>) -> Vec<Intent> {
+    match change {
+        UpstreamChange::EpicClosed { source, .. } => plan_scope_closed(linked, source, "its epic"),
+        // The hub owns the name: a rename is shown on the link, not applied.
+        _ => vec![],
+    }
+}
 
 /// The field-ownership table for Jira issues mirrored as tasks.
 pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "title",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue summary always overwrites the task's title.",
     },
     FieldOwnership {
         field: "body",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue description always overwrites the task's description (ADF converted to \
                plain text for Cloud; already plain text for Data Center).",
     },
     FieldOwnership {
         field: "labels",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "Jira labels always overwrite the task's labels.",
     },
     FieldOwnership {
         field: "milestone",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue's epic (fields.parent, or the configured epic-link custom field on Data \
                Center) always overwrites the task's linked workstream reference.",
     },
     FieldOwnership {
         field: "status",
         owner: FieldOwner::Mirrored,
+        outward: Outward::AskToCloseOrReopen,
         note: "Moved only through TaskStatus::can_move(.., Mover::Sync): IssueDone proposes \
                `done`; IssueReopened proposes `todo`, unconditionally — not gated on the hub's \
                own current status, the same way GitHub's IssueReopened is unconditional — so a \
@@ -53,6 +94,7 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "assignee",
         owner: FieldOwner::Hub,
+        outward: Outward::Never,
         note: "The hub's assignee is never changed by sync. Upstream assignee changes are still \
                recorded as UpstreamChange::IssueReassigned for visibility, but `plan` emits no \
                intent for them.",
@@ -77,6 +119,9 @@ fn propose_move_or_conflict(
     what: &str,
 ) -> Vec<Intent> {
     match current {
+        // Already there (a sync read again after a restart, or a person moved it first): nothing
+        // to do, and nothing to ask.
+        Some(t) if t.status == to => vec![],
         Some(t) if t.status.can_move(to, Mover::Sync) => {
             vec![Intent::ProposeMove {
                 task: t.id,
@@ -223,8 +268,7 @@ pub fn plan(change: &UpstreamChange, current: Option<&Task>) -> Vec<Intent> {
             propose_move_or_conflict(current, source, TaskStatus::Todo, "reopened an issue")
         }
 
-        // Epics map to workstreams, not tasks; `plan`'s signature here only takes a task, so epic
-        // changes currently produce no task intent. See "What I did not do".
+        // Epics map to workstreams, not tasks: see `plan_workstream`.
         EpicCreated { .. } | EpicRenamed { .. } | EpicClosed { .. } => vec![],
     }
 }
@@ -267,6 +311,66 @@ mod tests {
 
     fn at() -> JiraTimestamp {
         JiraTimestamp::new("2026-01-01T00:00:00.000+0000")
+    }
+
+    #[test]
+    fn a_move_to_where_the_task_already_is_gives_nothing() {
+        let done = task(TaskStatus::Done);
+        let change = UpstreamChange::IssueDone {
+            source: external_ref(),
+            at: at(),
+            resolution: None,
+        };
+        assert!(plan(&change, Some(&done)).is_empty());
+    }
+
+    #[test]
+    fn a_closed_epic_ships_its_workstream_unless_work_is_in_progress() {
+        use pitcrew_protocol::ids::WorkstreamId;
+        use pitcrew_protocol::model::{Health, Workstream, WorkstreamStatus};
+        let w = Workstream {
+            id: WorkstreamId::new(),
+            project: ProjectId::new(),
+            name: "Billing".into(),
+            status: WorkstreamStatus::Active,
+            health: Health::OnTrack,
+            locations: vec![],
+            external: vec![],
+        };
+        let epic = ExternalRef {
+            system: ExternalSystem::Jira,
+            key: "DEMO-5".into(),
+            url: None,
+        };
+        let closed = UpstreamChange::EpicClosed {
+            source: epic.clone(),
+            at: at(),
+        };
+        let idle = LinkedWorkstream {
+            workstream: &w,
+            work_in_progress: false,
+        };
+        assert_eq!(
+            plan_workstream(&closed, &idle),
+            vec![Intent::ProposeWorkstreamStatus {
+                workstream: w.id,
+                to: WorkstreamStatus::Shipped
+            }]
+        );
+        let busy = LinkedWorkstream {
+            workstream: &w,
+            work_in_progress: true,
+        };
+        assert!(matches!(
+            plan_workstream(&closed, &busy).as_slice(),
+            [Intent::WorkstreamConflictAsk { .. }]
+        ));
+        let renamed = UpstreamChange::EpicRenamed {
+            source: epic,
+            at: at(),
+            title: "Billing v2".into(),
+        };
+        assert!(plan_workstream(&renamed, &idle).is_empty());
     }
 
     #[test]

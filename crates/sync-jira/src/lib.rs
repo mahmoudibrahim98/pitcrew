@@ -1,10 +1,10 @@
 //! # pitcrew-sync-jira
 //!
 //! Read Jira issues and epics, for Jira Cloud and Jira Data Center, safely and incrementally, and
-//! turn what changed upstream into typed [`UpstreamChange`]s. This crate is read-only and never
-//! writes to Jira — applying changes to the hub, the write-approval queue and outward writes are
-//! later briefs. Mirrors `pitcrew_sync_github` closely; see "Shape" below for what is reused
-//! directly rather than forked.
+//! turn what changed upstream into typed [`UpstreamChange`]s; and build the requests an approved
+//! outward write is sent as ([`write`]). The sync only reads: a write is sent only by the hub,
+//! after a person approved it (api-v1.md, "Outward writes"). Mirrors `pitcrew_sync_github`
+//! closely; see "Shape" below for what is reused directly rather than forked.
 //!
 //! **Owned by stream G.** Build against `pitcrew-protocol` and `pitcrew-sync-github` only, never
 //! another stream's internals.
@@ -22,7 +22,11 @@
 //!   `Transport` it is given.
 //! - [`change::UpstreamChange`]: what changed upstream, each carrying an `ExternalRef` and the
 //!   upstream time.
-//! - [`ownership::plan`]: turns one `UpstreamChange` into abstract hub `Intent`s.
+//! - [`ownership::plan`]: turns one `UpstreamChange` into abstract hub `Intent`s;
+//!   [`ownership::plan_workstream`] does the same for an epic and a workstream that links it.
+//! - [`probe::probe`]: one read of the account and each project, for "test this connection".
+//! - [`write::send`]: one approved write (create an issue, comment, edit one, or move it into Done
+//!   or To Do through its workflow), sent once.
 //!
 //! ## Reuse, not a fork
 //!
@@ -69,17 +73,22 @@ pub mod client;
 pub mod deployment;
 pub mod jql;
 pub mod ownership;
+pub mod probe;
 pub mod state;
 pub mod sync;
 pub mod time;
 mod wire;
+pub mod write;
 
 pub use auth::JiraAuth;
 pub use change::UpstreamChange;
 pub use client::{ClientError, JiraClient};
 pub use deployment::{Deployment, JiraCloud, JiraDataCenter, PageState};
 pub use jql::{InvalidProjectRef, ProjectRef};
-pub use ownership::{FieldOwner, FieldOwnership, ISSUE_FIELD_OWNERSHIP, Intent, plan};
+pub use ownership::{
+    EPIC_FIELD_OWNERSHIP, FieldOwner, FieldOwnership, ISSUE_FIELD_OWNERSHIP, Intent,
+    LinkedWorkstream, Outward, outward, plan, plan_workstream,
+};
 pub use state::{EpicSnapshot, IssueSnapshot, ProjectState, StatusCategory, SyncState};
 // `sync::sync` (the function) is not re-exported at the crate root to avoid shadowing the `sync`
 // module itself; call it as `pitcrew_sync_jira::sync::sync(..)`.

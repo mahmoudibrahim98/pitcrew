@@ -4,7 +4,7 @@
 
 use crate::adf::adf_to_text;
 use crate::bounds::{MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels, strip_hidden};
-use crate::state::{EpicSnapshot, IssueSnapshot, StatusCategory};
+use crate::state::{EpicSnapshot, IssueSnapshot, StatusCategory, SyncState};
 use crate::time::JiraTimestamp;
 use crate::wire::{WireIssue, looks_like_issue_key};
 use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
@@ -34,6 +34,37 @@ fn item_ref(site_base: &str, key: &str) -> Option<ExternalRef> {
         url: Some(format!("{site_base}/browse/{key}")),
         key: key.to_string(),
     })
+}
+
+impl SyncState {
+    /// The issue `source` (`DEMO-12`), not done, as a first read would report it, built from its
+    /// last snapshot: an [`UpstreamChange::IssueCreated`] in `epic`. For a caller that starts
+    /// mirroring an issue it did not mirror before, because a later read moved it under an epic
+    /// the caller follows ([`UpstreamChange::IssueReparented`]): the move alone carries none of
+    /// the issue's fields. `None` when this state has no snapshot of the issue, or it is done.
+    ///
+    /// Call it on the state a sync returned, so the snapshot is the one that read just took.
+    #[must_use]
+    pub fn created_from_snapshot(
+        &self,
+        source: &ExternalRef,
+        epic: Option<&ExternalRef>,
+    ) -> Option<UpstreamChange> {
+        let (project, _) = source.key.split_once('-')?;
+        let snapshot = self
+            .projects
+            .get(project)?
+            .issue_snapshots
+            .get(&source.key)?;
+        (snapshot.category != StatusCategory::Done).then(|| UpstreamChange::IssueCreated {
+            source: source.clone(),
+            at: snapshot.updated.clone(),
+            title: snapshot.title.clone(),
+            body: snapshot.body.clone(),
+            labels: snapshot.labels.clone(),
+            epic: epic.cloned(),
+        })
+    }
 }
 
 /// What changed upstream, discovered by one sync call. Each change carries the [`ExternalRef`] it
@@ -150,12 +181,31 @@ pub(crate) fn description_text(description: &Option<Value>) -> String {
     }
 }
 
+/// Whether `text` (what [`description_text`] made of `description`) is the whole description, so
+/// writing `text` back changes nothing else: no description and no text; a plain string (Data
+/// Center) equal to it, nothing hidden stripped and nothing cut; or an Atlassian Document Format
+/// document that is exactly [`crate::write::adf`] of it, plain paragraphs of unformatted text.
+/// Lists, code, links, mentions, marks, empty paragraphs or attributes make it lossy.
+#[must_use]
+pub fn description_is_lossless(description: Option<&Value>, text: &str) -> bool {
+    match description {
+        None | Some(Value::Null) => text.is_empty(),
+        Some(Value::String(s)) => s == text,
+        Some(doc @ Value::Object(_)) => crate::write::adf(text) == *doc,
+        Some(_) => false,
+    }
+}
+
 fn snapshot_of(issue: &WireIssue, epic_link_field: Option<&str>) -> IssueSnapshot {
     let mut labels = issue.fields.labels.clone();
     labels.sort();
+    let title = cap_chars(&issue.fields.summary, MAX_TITLE_CHARS);
+    let body = description_text(&issue.fields.description);
     IssueSnapshot {
-        title: cap_chars(&issue.fields.summary, MAX_TITLE_CHARS),
-        body: description_text(&issue.fields.description),
+        title_lossless: title == issue.fields.summary,
+        body_lossless: description_is_lossless(issue.fields.description.as_ref(), &body),
+        title,
+        body,
         category: StatusCategory::from_key(&issue.fields.status.status_category.key),
         // Resolution and assignee names are short "names" in the sense R10 means (round 2
         // review): never length-capped (they're already bounded by Jira's own field shapes), but
@@ -339,6 +389,97 @@ mod tests {
             }
         }))
         .expect("valid wire issue")
+    }
+
+    #[test]
+    fn a_snapshot_says_whether_its_summary_and_description_are_whole() {
+        let snap = |summary: &str, description: Value| {
+            let mut wire = issue("2026-01-01T00:00:00.000+0000", "new");
+            wire.fields.summary = summary.to_string();
+            wire.fields.description = Some(description);
+            diff_issue("https://jira.example.com", &wire, None, None)
+                .expect("well-formed")
+                .1
+        };
+        let paragraph =
+            |text: &str| json!({"type": "paragraph", "content": [{"type": "text", "text": text}]});
+        let doc = |content: Vec<Value>| json!({"type": "doc", "version": 1, "content": content});
+        // Plain paragraphs of unformatted text read back exactly.
+        let plain = snap(
+            "Send invoices",
+            doc(vec![paragraph("Monthly."), paragraph("As a PDF.")]),
+        );
+        assert_eq!(plain.body(), "Monthly.\nAs a PDF.\n");
+        assert!(plain.title_lossless() && plain.body_lossless());
+        assert!(snap("t", doc(vec![])).body_lossless());
+        assert!(snap("t", Value::Null).body_lossless());
+        assert!(snap("t", json!("Data Center *wiki* text")).body_lossless());
+        // Formatting, lists, links, mentions and hidden characters do not.
+        let bold = json!({"type": "paragraph", "content": [{"type": "text", "text": "Monthly.",
+            "marks": [{"type": "strong"}]}]});
+        let list = json!({"type": "bulletList", "content": [{"type": "listItem", "content":
+            [paragraph("one")]}]});
+        let mention = json!({"type": "paragraph", "content": [{"type": "mention", "attrs":
+            {"id": "x", "text": "@Sam"}}]});
+        for lossy in [
+            doc(vec![bold]),
+            doc(vec![list]),
+            doc(vec![mention]),
+            doc(vec![
+                paragraph("a"),
+                json!({"type": "paragraph", "content": []}),
+                paragraph("b"),
+            ]),
+            doc(vec![paragraph("zero\u{200b}width")]),
+            json!("plain \u{200b} text"),
+        ] {
+            assert!(!snap("t", lossy.clone()).body_lossless(), "{lossy}");
+        }
+        assert!(!snap("Ship \u{200d} it", Value::Null).title_lossless());
+    }
+
+    #[test]
+    fn an_issue_reparented_later_is_created_from_its_snapshot() {
+        let mut wire = issue("2026-01-01T00:00:00.000+0000", "indeterminate");
+        wire.key = "DEMO-8".to_string();
+        let (_, snapshot) =
+            diff_issue("https://jira.example.com", &wire, None, None).expect("well-formed");
+        let mut state = SyncState::new();
+        state
+            .projects
+            .entry("DEMO".to_string())
+            .or_default()
+            .issue_snapshots
+            .insert("DEMO-8".to_string(), snapshot.clone());
+        let source = item_ref("https://jira.example.com", "DEMO-8").unwrap();
+        let epic = item_ref("https://jira.example.com", "DEMO-5").unwrap();
+        assert_eq!(
+            state.created_from_snapshot(&source, Some(&epic)),
+            Some(UpstreamChange::IssueCreated {
+                source: source.clone(),
+                at: JiraTimestamp::new("2026-01-01T00:00:00.000+0000"),
+                title: "Title".to_string(),
+                body: String::new(),
+                labels: Vec::new(),
+                epic: Some(epic.clone()),
+            })
+        );
+        // Unknown issues, and done ones, give nothing.
+        let unknown = item_ref("https://jira.example.com", "DEMO-9").unwrap();
+        assert_eq!(state.created_from_snapshot(&unknown, None), None);
+        let other_project = item_ref("https://jira.example.com", "OTHER-8").unwrap();
+        assert_eq!(state.created_from_snapshot(&other_project, None), None);
+        let done = IssueSnapshot {
+            category: StatusCategory::Done,
+            ..snapshot
+        };
+        state
+            .projects
+            .get_mut("DEMO")
+            .unwrap()
+            .issue_snapshots
+            .insert("DEMO-8".to_string(), done);
+        assert_eq!(state.created_from_snapshot(&source, Some(&epic)), None);
     }
 
     #[test]

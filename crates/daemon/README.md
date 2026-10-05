@@ -52,6 +52,7 @@ in the log when used (see "Terminals"):
 | `--ptyd-idle-exit-ms <ms>` | A pitcrew-ptyd this daemon starts exits after that long idle (its own default is 30 seconds). |
 | `--terminal-runtime pty` | The terminals run in pitcrew-ptyd even where tmux is usable (`auto`, the default, prefers tmux). |
 | `--scan-hold-ms <ms>` | Each machine scan waits that long once accepted, holding its machine, before it walks: a second scan meanwhile can be shown to get `409` (see "The machine scan"). |
+| `--integration-fixtures <dir>` | GitHub and Jira integrations read the recorded exchanges in that folder's `*.fixture` files (`apps/mock-hub/fixtures`) instead of the network (see "Integrations"). |
 
 ## The state directory
 
@@ -67,6 +68,8 @@ in the log when used (see "Terminals"):
 | `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `agents/<agent id>.token` | An agent token for each agent whose CLI the runner started (a dispatch's, or `POST /v1/sessions` with `agent`), bound to that agent and its owner, `pca_…`. The CLI is given its path (`PITCREW_TOKEN_FILE`), never the token. Minted once, reused while it verifies as exactly that. The folder is 0700, each file 0600. |
+| `integrations.json` | The GitHub and Jira connections (never a secret), each connection's sync member (`@sync` or `@tracker-sync`, an agent of the person who added it) and last sync status, the upstream titles of linked milestones and epics, and how far the outward-write planner has read the log (`writes_rev`). Private. |
+| `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream; never in the event log) and its stored secret, when it has one. The folder is 0700 (an owner-only DACL on Windows), each file 0600. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
 On Unix the directory is created 0700, and an existing one must already be ours and private; on
@@ -664,10 +667,12 @@ link) are not part of this.
 | `GET /v1/events` | `pitcrew-api`'s `Activity` over the store, with the work model's activity index (`with_refs`, through the `WorkRefs` adapter in `src/refs.rs`): `project=` and `workstream=` match events about them, their tasks and their sessions, and `task=` and `session=` also match their sessions' and dispatches' events |
 | `GET /v1/recaps/blocks`, `GET /v1/recaps/days` | `pitcrew-api`'s `Recaps` over the hub's recap index (hub-work's `RecapIndex`, implemented by its `WorkService`), through the `WorkRecaps` adapter in `src/recaps.rs`; see "Recaps" |
 | `POST /v1/machines/{id}/scan` | `src/scan.rs`, a device route, over the runner's homes with `pitcrew_ingest::scan` (see "The machine scan") |
+| `GET /v1/machines/{id}/check`, `GET /v1/machines/{id}/agents`, `GET`/`POST`/`DELETE /v1/machines/{id}/agents/{engine}/sign-in` | `src/machine_setup/`, device routes for the hub's owner only (see "Machine setup") |
 | `POST /v1/hooks/{engine}/{event}` | `pitcrew-api` into the runner's `RunnerHooks` (see "The runner"); with `--no-runner`, logged at debug (engine, event, member; never the body) |
-| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SessionTerminals` (see "Terminals") |
+| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SignInTerminals` (machine setup's sign-in terminals by their id, for the member who started each only) and then `SessionTerminals` (see "Terminals") |
 | `POST /v1/sessions`, `POST /v1/sessions/{id}/send`, `/keys`, `/interrupt`, `/end` | `src/sessions.rs`, device routes, through the runner's `RunnerCommands` (see "Terminals") |
 | `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route, from the runner's `RunnerTranscripts` (see "The runner") |
+| `/v1/integrations…`, `/v1/writes…` | `src/integrations/`, device routes (see "Integrations") |
 
 On development TCP only, the daemon answers CORS as the mock hub does: preflights from
 `http://localhost:<port>`, `http://127.0.0.1:<port>` and the Tauri app's origins get `204` and
@@ -733,6 +738,56 @@ one module and one line of the routes in `src/serve.rs`.
 - **What it logs:** one line per scan, `scanned this machine's agent homes`, with its counts and
   how long it took, at info. Never a path: the report goes to the person who asked, and nowhere
   else.
+
+## Machine setup
+
+Onboarding's machine steps on the hub's own machine (api-v1, "Machine setup"; device tokens
+only): `src/machine_setup/`, one module, wired with a few lines in `src/serve.rs` (its routes,
+its sign-in terminals before the sessions' on the terminals route, their sweep, and stopping them
+when the daemon stops).
+
+- **Who:** only the member who set the hub up (the workspace's first person). A layer over the
+  routes (`owner_only`) answers any other member's device token `403` before anything else, and
+  `409` before setup. A sign-in's terminal opens only for the member who started it
+  (`SignInTerminals::routes`, a layer over the terminals route, since `Terminals::attach` is not
+  told who asks).
+- **Which machine:** the workspace's first local one, as for the scan; an unknown or malformed id
+  is `404`, another machine `409`.
+- **The check** (`check.rs`, `tools.rs`, `disk.rs`): each tool found on the daemon's `PATH`
+  (absolute entries only; `.exe`, `.cmd`, `.bat`, `.com` on Windows) and asked only its version
+  (`--version`, `tmux -V`), all at once, each with no input, for at most 15 seconds, its output
+  capped at 64 KiB and cleaned to a line, with everything it starts: in a process group of its own
+  on Unix, a Job Object on Windows (`pitcrew_remote::job`, so `claude.cmd`'s `node.exe` goes too),
+  which a timeout kills whole, and so does dropping the run before it ends (a request given up). tmux's row says what PitCrew's terminals run in instead when it is missing
+  or older than 3.2 (pitcrew-ptyd, or nothing); it is left out on Windows. The disk row is the free
+  space of the state directory's filesystem (`statvfs` on Unix; Windows PowerShell's `DriveInfo`,
+  by its path under `%SystemRoot%`, given the folder in an environment variable); under 5 GB it
+  warns. SLURM's row is there only where `sbatch` is (a warning when `sbatch --version` fails). A
+  missing tool's row offers `install_page`;
+  **nothing here installs or fixes anything**.
+- **Accounts** (`accounts.rs`): `claude auth status`, `codex login status` and `opencode auth list`,
+  each for at most 20 seconds, and only what they say is kept: signed in or not, and a label
+  that is an e-mail address, `ChatGPT`, `API key` or provider names (Codex's line with part of a
+  key is never kept; a label that looks like a key or token is dropped). An answer not understood,
+  a CLI too old for the command, a timeout: "could not tell", with why. **No credential file is
+  opened**; the log has counts only.
+- **Sign-in** (`sign_in.rs`): the CLI's own login (`claude auth login`, `codex login`, `codex login
+  --device-auth`, `opencode auth login`) started in the terminals' runtime (tmux or pitcrew-ptyd),
+  in the person's home folder, with no variable added; `503` without a runtime (`--no-runner`, or
+  neither tmux nor pitcrew-ptyd), `409` for a CLI not on `PATH`, and `409` ("Update … first") for
+  one whose own status command did not answer in a way PitCrew understands: an older Claude Code
+  without `auth` would read `auth login` as a prompt and start an agent. Its id is a fresh
+  session-shaped id that only the terminals route knows (`SignInTerminals`): no event, session or
+  transcript. One per CLI at a time, and one start per CLI at a time (two asks at once get the same
+  terminal); an ended one stays readable for 5 minutes, then its terminal is killed and forgotten;
+  one still running after 30 minutes is stopped; `DELETE …/sign-in` stops one at once. A sweep
+  every 15 seconds does that. The ids of the open ones are kept in `sign-in-terminals.json` in the
+  state directory: the daemon stops every one when it stops (before it lets go of the runtime),
+  and at start removes those a crash left, **by that list only** (a session's terminal named like
+  one is never touched).
+- **What it logs:** counts (`checked this machine`, `read the agents' accounts from their CLIs`)
+  and a sign-in's start and removal (engine and terminal id). Never a command's output, an
+  account, or what passes through a sign-in terminal.
 
 ## Development: the UI against the daemon
 
@@ -1033,6 +1088,37 @@ own), that its place comes back when the walk panics, which machine is the hub's
 is one line of JSON, and that a walk over no home ends with its last tick and an empty report, also
 for a client that has gone. `src/cli.rs` checks that `--scan-hold-ms` parses and is hidden.
 
+`tests/machine_setup.rs` (Unix), machine setup with **stand-ins for every tool it may run** first
+on the daemon's `PATH` (`claude`, `codex`, `opencode`, `gh`, SLURM's), then the system's
+`/usr/bin:/bin` only, and **tripwires** for package managers, `sudo`, `curl` and the like that note
+it if they run: no real agent CLI ever runs.
+
+- the check's rows, in order, from what the stand-ins print (`?row=` for one); the accounts as
+  their status commands report them, with nothing of Codex's key in the answer or the log;
+  refusals (an agent `403`, no token `401`, the demo's cluster `409`, an unknown machine `404`, a
+  bad row or body `400`, an unknown CLI `404`); another person's device token (provisioned in the
+  state directory before the start) `403` on every route; without a terminal runtime a sign-in is
+  `503`; an older Claude Code without `auth` is `409`, its login never started;
+- in tmux (a private socket of the test's; skipped without tmux 3.2, unless
+  `PITCREW_REQUIRE_TMUX=1`): a sign-in runs the stand-in's own login, the same one is answered
+  while it runs, it is not a session, its terminal is served to the person and not to an agent,
+  typing the code through the terminal's WebSocket signs it in, its status then says it ended and
+  the CLI reports the account; an ended one is replaced, its old terminal gone; another person
+  cannot open its terminal or read its status; `DELETE` stops it and removes its window; a daemon
+  that stops stops its sign-in (no window left, an empty list), and one that a `SIGKILL` left is
+  removed when the daemon next starts; neither the code typed nor the account reaches the log;
+- in both, none of the tripwires ran.
+
+The unit tests in `src/machine_setup/` check the parsers of each CLI's status (JSON or a sentence,
+the exit code agreeing; Codex's key never kept; OpenCode's credentials counted), account labels
+(no key or token), finding tools (absolute entries, executables only) and bounded runs (output
+capped, a timeout stopping the process group, and so does a run given up), versions and rows
+(missing with their install page, old tmux, failing tools, SLURM missing a tool or with a failing
+`sbatch`), the disk row, and sign-ins over a fake runtime (the login's exact program, arguments,
+empty environment and window name; one at a time, and two starts at once sharing one terminal;
+an older Claude Code not started; lingering, then removed; stopped when too old, when asked and
+with the daemon; leftovers removed by the list only; no runtime `Unavailable`).
+
 `tests/recaps.rs`, with `--demo`, checks what the contract promises of any log (the seeded demo
 is not the mock's fixture):
 
@@ -1100,6 +1186,72 @@ directory's socket, or the `--listen` given; `src/setup.rs` that the listener ha
 once, and that an office loop and a runner (real, watching nothing) are kept until the stop begins
 and handed back, not kept, once it has.
 
+## Integrations
+
+GitHub and Jira (api-v1.md, "Integrations" and "Outward writes"; `src/integrations/`). A sync only
+reads; a write goes upstream only after a person approves it:
+
+- **Connections** live in `integrations.json`, never in the event log, each with its own sync
+  member: `@sync` (or `@tracker-sync`), an agent of the person who added it (hub-work's
+  `ensure_sync_member`), which authors everything that connection's sync changes. A repository
+  or Jira project is in one connection at most, on any host (`validate::scope_keys`).
+- **Credentials**: `gh auth token --hostname <host>` (always named, `github.com` included, with
+  `GH_HOST` cleared), found on the daemon's `PATH` (absolute folders only), checked with
+  `pitcrew_trust::check_trusted`, run without a terminal and read at each sync, never kept; or a
+  secret stored by `PUT …/credential` in
+  `integrations/<id>.secret` (`secret.rs`). A `Secret` prints as `Secret(***)`; no route returns
+  one and nothing logs one (`tests/integrations.rs` checks every answer, the log at debug and the
+  saved files).
+- **The loop** syncs each connection on its interval (the first one 30 seconds after a start, or
+  at once when added) and on `POST …/sync`, one at a time. It reads upstream with
+  `pitcrew-sync-github` / `pitcrew-sync-jira` over `http.rs`'s transport: HTTP/1.1 over rustls
+  (`ring`, this machine's certificates), `https://` only, a 6 MiB body cap, 20 s to connect and 60 s
+  per request, a `User-Agent`; behind `HTTPS_PROXY` (an `http://` proxy) it tunnels with
+  `CONNECT`, except for the hosts `NO_PROXY` names (`proxy.rs`). `apply.rs` then applies the
+  changes through hub-work's `SyncCommands`: issues become tasks only in a linked scope (a
+  workstream's link to the milestone or epic, else the repository or project), when first read
+  open or when a later read moves them, open, into a linked milestone or epic (from that read's
+  snapshot); issues closed before they were first seen are skipped, upstream-owned fields are
+  overwritten, moves follow `can_move(.., sync)`, a merged pull request is noted on its task, a
+  closed milestone or epic ships its workstreams, and every refusal is a conflict ask. The sync
+  state is saved after the changes are applied, so a stop in between reads them again next time
+  (every command is idempotent). A connection removed during its sync applies nothing more, and
+  its state is not written back. A rate limit waits until it lifts.
+- When a repository's or project's links change, its issues (and, on GitHub, pull requests) are
+  read again from the start at the next sync.
+- `--integration-fixtures <dir>` swaps the transport for recorded exchanges, answered by URL (a
+  `since=` cursor ignored) and read again for each request, for tests: `tests/integrations.rs`
+  and the conformance runner, which changes what upstream says by adding a file that sorts first.
+  Writes are answered from the same files.
+- **Outward writes** (`writes.rs`), on the same loop, before the syncs, woken by every append to
+  the log:
+  - the **planner** reads the log from `integrations.json`'s `writes_rev` (the log's end the first
+    time, and again, with a warning, when the saved place is beyond the log): a person's (or
+    agent's, or the office's) move across the open/closed line, or change of a field upstream owns
+    (the crates' ownership tables, both directions), on a task mirroring an issue a connection
+    syncs, becomes an approval ask from that connection's sync member with `write_proposed`
+    (hub-work's `propose_write`, once per cause). `before` is upstream's value from the sync
+    state's snapshots; nothing is proposed when upstream already has the value. Only what the hub
+    holds exactly goes back: a title or description is proposed only from a lossless read (the
+    snapshots' `title_lossless` and `body_lossless`), and labels go as the labels added and
+    removed (`label_change`). No connection's sync member's changes ever imply a write;
+  - the **executor** records a denial as not sent; checks an approved write against the task as it
+    is now; reads the issue as upstream has it now before an edit, close or reopen (`reconcile`:
+    a field changed since sends nothing, what upstream holds is not sent again) and looks upstream
+    for the earlier attempt before a retried create or comment (`find_earlier`); then
+    `start_write` (hub-work allows it only for the connection's own member's approval ask
+    answered "Send" by a person, or a person's logged retry request), sends what is left once,
+    with the connection's credential, through `pitcrew_sync_github::write` or
+    `pitcrew_sync_jira::write`; and records the result. A result the store cannot record is kept
+    in memory and recorded first at the next pass; a write still `sending` after that (the daemon
+    stopped mid-send) is finished as failed, never resent by itself; a failed one is sent again
+    only after a person's `POST …/retry`, which hub-work logs as `write_retry_requested`;
+  - routes (device only): `GET /v1/writes`, `GET /v1/writes/{id}`, `POST /v1/writes` (create an
+    issue from a task, or comment on its issue) and `POST /v1/writes/{id}/retry`.
+- `writes_tests.rs` shows the guarantee with a transport that keeps every request it was sent, over
+  a copy of the fixtures each test can change: nothing before an approval, after a denial, twice
+  for one approval or one retry, over a change upstream made since, or from a lossy copy.
+
 ## Not wired yet
 
 - Agent tokens for sessions PitCrew did not start: a CLI a person runs by hand has no agent and
@@ -1125,6 +1277,10 @@ and handed back, not kept, once it has.
 - `--demo` through the setup path (the demo still seeds its own person, machine and name).
 - Remote machines (the desktop's side of the tunnel, and a supervisor of the local daemon), the
   Tauri shell, auto-start and installers.
+- Integrations: no `https://` or SOCKS proxy and no `ALL_PROXY` (only an `http://` proxy from
+  `HTTPS_PROXY`), no HTTP/2 or connection reuse. Removing a connection keeps its workstream links
+  as plain links; an approved write of a removed connection is recorded as not sent. An approval
+  that turns stale stays open in the Inbox until answered (asks have no withdrawal event).
 - Scanning another machine of the workspace (`POST /v1/machines/{id}/scan` is `409` for one), and
   stopping a scan part-way: `pitcrew_ingest::scan` takes no cancel, so a scan whose client went
   away runs to its end. A cancel flag in its `ScanOptions` (stream A) would let the route stop it.

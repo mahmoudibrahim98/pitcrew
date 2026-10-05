@@ -42,6 +42,12 @@ export const keys = {
     lists: ['asks', 'list'] as const,
     list: (filters: AskFilters = {}) => ['asks', 'list', filters] as const,
   },
+  /** Outward writes (API v1, "Outward writes"): a task's, and one by its approval ask. */
+  writes: {
+    all: ['writes'] as const,
+    task: (task: string) => ['writes', 'task', task] as const,
+    one: (ask: string) => ['writes', 'one', ask] as const,
+  },
   /**
    * `all` is every recap key, for "invalidate every recap" (API v1, "Recaps", "Live updates").
    * Each infinite query keeps every page it has loaded under one key (`recaps.ts`'s

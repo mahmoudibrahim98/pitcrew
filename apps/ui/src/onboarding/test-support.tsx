@@ -4,6 +4,7 @@
 // needing the shell's full frame or a mock hub.
 
 import { render } from '@testing-library/react';
+import type { ReactNode } from 'react';
 import { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider } from '@tanstack/react-router';
 import { OnboardingApiProvider } from './api-context.tsx';
 import type { OnboardingApi } from './api.ts';
@@ -13,19 +14,21 @@ import { WizardShell } from './wizard-shell.tsx';
 
 export const TEST_WS = 'ws-test';
 
-export function renderWizard(api?: OnboardingApi) {
+/** `wrap` puts providers around the wizard (a stand-in sign-in terminal, say). */
+export function renderWizard(api?: OnboardingApi, wrap: (wizard: ReactNode) => ReactNode = (wizard) => wizard) {
   const theApi = api ?? createFakeOnboardingApi({ speed: 0 });
   const root = createRootRoute();
   const wizardRoute = createRoute({
     getParentRoute: () => root,
     path: 'w/$ws/wizard',
-    component: () => (
-      <OnboardingApiProvider api={theApi}>
-        <WizardProvider>
-          <WizardShell />
-        </WizardProvider>
-      </OnboardingApiProvider>
-    ),
+    component: () =>
+      wrap(
+        <OnboardingApiProvider api={theApi}>
+          <WizardProvider>
+            <WizardShell />
+          </WizardProvider>
+        </OnboardingApiProvider>,
+      ),
   });
   const homeRoute = createRoute({
     getParentRoute: () => root,

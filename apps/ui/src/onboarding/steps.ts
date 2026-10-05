@@ -1,8 +1,10 @@
 // The first-run wizard's steps, in order. A step whose calls have no backend yet
-// (`OnboardingApi.unavailable`) is left out, so against the real hub the first run is Welcome,
-// Workspace, Done; the other steps come back as their routes land. The fake has them all.
+// (`OnboardingApi.unavailable`) is left out, and so is installing the helper on a machine that
+// needs none (the hub's own, which runs the hub: `needsHelper`). Against the real hub the first
+// run is Welcome, Workspace, Machine check, Sign in, Scan, Create, Import, Done; the other steps
+// come back as their routes land. The fake has them all.
 
-import type { OnboardingApi, OnboardingCall } from './api.ts';
+import type { MachineTarget, OnboardingApi, OnboardingCall } from './api.ts';
 
 export type StepId =
   | 'welcome'
@@ -47,7 +49,7 @@ const NEEDS: Record<StepId, readonly OnboardingCall[]> = {
   workspace: ['setupWorkspace'],
   'machine-check': ['checkMachine', 'fixMachineRow'],
   'install-helper': ['launcherOptions', 'streamInstallHelper'],
-  'sign-in': ['agentAccounts', 'startSignIn'],
+  'sign-in': ['agentAccounts', 'startSignIn', 'signInRunning'],
   integrations: ['integrationStatus'],
   scan: ['streamScan'],
   // Its suggestions come from the scan.
@@ -58,6 +60,14 @@ const NEEDS: Record<StepId, readonly OnboardingCall[]> = {
   done: [],
 };
 
-export function stepsFor(api: Pick<OnboardingApi, 'unavailable'>): StepMeta[] {
-  return FIRST_RUN.filter((step) => NEEDS[step.id].every((call) => !api.unavailable.has(call)));
+/** The steps for `api`, whose machine steps are about `target` (the hub's own machine by default). */
+export function stepsFor(
+  api: Pick<OnboardingApi, 'unavailable' | 'needsHelper'>,
+  target: MachineTarget = { kind: 'local' },
+): StepMeta[] {
+  return FIRST_RUN.filter(
+    (step) =>
+      NEEDS[step.id].every((call) => !api.unavailable.has(call)) &&
+      (step.id !== 'install-helper' || api.needsHelper(target)),
+  );
 }

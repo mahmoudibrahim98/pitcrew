@@ -53,6 +53,8 @@ export const invalidationMap: InvalidationMap = {
   project_created: (d) => [keys.projects.lists, keys.projects.detail(d.project.id)],
   workstream_created: (d) => [keys.workstreams.lists, keys.workstreams.detail(d.workstream.id)],
   workstream_changed: (d) => [keys.workstreams.lists, keys.workstreams.detail(d.workstream)],
+  // Links upstream: the workstream, and the integrations that list them.
+  workstream_linked: (d) => [keys.workstreams.lists, keys.workstreams.detail(d.workstream), ['integrations']],
   task_created: () => [],
   task_moved: (d, cache) => taskAndWorkstream(d.task, cache),
   task_assigned: (d) => task(d.task),
@@ -70,6 +72,11 @@ export const invalidationMap: InvalidationMap = {
   brief_proposed: () => [keys.briefs],
   brief_accepted: () => [keys.briefs],
   decision_recorded: () => [],
+  // Outward writes: every write list and the ask's own; a created issue becomes the task's source.
+  write_proposed: () => [keys.writes.all, keys.asks.lists],
+  write_started: () => [keys.writes.all],
+  write_retry_requested: () => [keys.writes.all],
+  write_finished: (d) => (d.task === undefined ? [keys.writes.all] : [keys.writes.all, ...task(d.task)]),
 };
 
 function keysFor(body: EventBody, cache: CacheLookup): QueryKey[] {

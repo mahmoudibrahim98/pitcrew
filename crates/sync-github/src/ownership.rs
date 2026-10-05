@@ -5,8 +5,10 @@
 
 use crate::change::UpstreamChange;
 use crate::state::CloseReason;
-use pitcrew_protocol::ids::TaskId;
-use pitcrew_protocol::model::{ExternalRef, Mover, Receipt, Task, TaskStatus};
+use pitcrew_protocol::ids::{TaskId, WorkstreamId};
+use pitcrew_protocol::model::{
+    ExternalRef, Mover, Receipt, Task, TaskStatus, Workstream, WorkstreamStatus,
+};
 
 /// Who owns a field PitCrew mirrors from GitHub.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +23,20 @@ pub enum FieldOwner {
     Mirrored,
 }
 
+/// What a change made in PitCrew to a field means upstream: the table's other direction (api-v1.md,
+/// "Outward writes"). Whatever it says, nothing is sent until a person approves it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outward {
+    /// Upstream owns the field, so a person's change in PitCrew is a conflict, raised as an
+    /// approval ask to send the new value upstream (an `update`).
+    AskToSend,
+    /// A move across the open/closed line (into or out of `done` and `canceled`) raises an
+    /// approval ask to close or reopen the issue.
+    AskToCloseOrReopen,
+    /// Never sent upstream.
+    Never,
+}
+
 /// One row of the field-ownership table.
 #[derive(Clone, Copy, Debug)]
 pub struct FieldOwnership {
@@ -28,8 +44,20 @@ pub struct FieldOwnership {
     pub field: &'static str,
     /// Who owns it.
     pub owner: FieldOwner,
+    /// What a change in PitCrew to it means upstream.
+    pub outward: Outward,
     /// Why.
     pub note: &'static str,
+}
+
+/// What a change in PitCrew to `field` means upstream, by `table`; [`Outward::Never`] for a field
+/// the table does not list.
+#[must_use]
+pub fn outward(table: &[FieldOwnership], field: &str) -> Outward {
+    table
+        .iter()
+        .find(|row| row.field == field)
+        .map_or(Outward::Never, |row| row.outward)
 }
 
 /// The field-ownership table for GitHub issues mirrored as tasks.
@@ -37,26 +65,31 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "title",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue title always overwrites the task's title.",
     },
     FieldOwnership {
         field: "body",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue body always overwrites the task's description.",
     },
     FieldOwnership {
         field: "labels",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "GitHub labels always overwrite the task's labels.",
     },
     FieldOwnership {
         field: "milestone",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue's milestone always overwrites the task's linked milestone reference.",
     },
     FieldOwnership {
         field: "status",
         owner: FieldOwner::Mirrored,
+        outward: Outward::AskToCloseOrReopen,
         note: "Moved only through TaskStatus::can_move(.., Mover::Sync): an upstream close \
                proposes `done`, a reopen proposes `todo`, and in-progress work is never touched. \
                A disallowed move raises a conflict ask instead of being dropped.",
@@ -64,9 +97,30 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "assignee",
         owner: FieldOwner::Hub,
+        outward: Outward::Never,
         note: "The hub's assignee is never changed by sync. Upstream assignee changes are still \
                recorded as UpstreamChange::IssueReassigned for visibility, but `plan` emits no \
                intent for them.",
+    },
+];
+
+/// The field-ownership table for GitHub milestones mirrored as the workstreams that link them
+/// (`Workstream::external`). [`plan_workstream`] follows it.
+pub const MILESTONE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
+    FieldOwnership {
+        field: "name",
+        owner: FieldOwner::Hub,
+        outward: Outward::Never,
+        note: "A person named the workstream; an upstream rename is shown on the link only, and \
+               never renames the workstream.",
+    },
+    FieldOwnership {
+        field: "status",
+        owner: FieldOwner::Mirrored,
+        outward: Outward::Never,
+        note: "A milestone closed upstream proposes `shipped`, from idea, active or paused only, \
+               and never while one of the workstream's tasks is in progress: that raises a \
+               conflict ask instead. A shipped or dropped workstream is left as it is.",
     },
 ];
 
@@ -128,6 +182,77 @@ pub enum Intent {
         /// Plain-text reason, shown to the person who answers the ask.
         reason: String,
     },
+    /// Propose a workstream's status: a milestone (or Jira epic) it links closed upstream. The hub
+    /// re-checks that none of the workstream's tasks is in progress before applying it.
+    ProposeWorkstreamStatus {
+        /// The workstream.
+        workstream: WorkstreamId,
+        /// The proposed status (always `shipped` today).
+        to: WorkstreamStatus,
+    },
+    /// Raise something about a workstream for a person to resolve.
+    WorkstreamConflictAsk {
+        /// The workstream.
+        workstream: WorkstreamId,
+        /// The upstream item (a milestone or an epic).
+        source: ExternalRef,
+        /// Plain-text reason, shown to the person who answers the ask.
+        reason: String,
+    },
+}
+
+/// What [`plan_workstream`] needs to know about a workstream that links an upstream milestone
+/// (or a Jira epic).
+#[derive(Clone, Copy, Debug)]
+pub struct LinkedWorkstream<'a> {
+    /// The workstream.
+    pub workstream: &'a Workstream,
+    /// Whether one of its tasks is in progress.
+    pub work_in_progress: bool,
+}
+
+/// The one rule [`MILESTONE_FIELD_OWNERSHIP`] (and Jira's epic table) gives a closed milestone or
+/// epic: propose `shipped` unless work is in progress, which is a conflict instead. Shared with
+/// `pitcrew-sync-jira`.
+#[must_use]
+pub fn plan_scope_closed(
+    linked: &LinkedWorkstream<'_>,
+    source: &ExternalRef,
+    what: &str,
+) -> Vec<Intent> {
+    let workstream = linked.workstream;
+    match workstream.status {
+        WorkstreamStatus::Shipped | WorkstreamStatus::Dropped => vec![],
+        _ if linked.work_in_progress => vec![Intent::WorkstreamConflictAsk {
+            workstream: workstream.id,
+            source: source.clone(),
+            reason: format!(
+                "upstream closed {what}, but \"{}\" still has a task in progress, so a sync does \
+                 not mark it shipped",
+                workstream.name
+            ),
+        }],
+        _ => vec![Intent::ProposeWorkstreamStatus {
+            workstream: workstream.id,
+            to: WorkstreamStatus::Shipped,
+        }],
+    }
+}
+
+/// Turns a milestone's [`UpstreamChange`] into the actions it implies for one workstream that
+/// links that milestone, following [`MILESTONE_FIELD_OWNERSHIP`]. Every other change gives none:
+/// issues and pull requests go through [`plan`].
+///
+/// Pure, like [`plan`]: the hub applies the result, and re-checks the workstream's tasks first.
+#[must_use]
+pub fn plan_workstream(change: &UpstreamChange, linked: &LinkedWorkstream<'_>) -> Vec<Intent> {
+    match change {
+        UpstreamChange::MilestoneClosed { source, .. } => {
+            plan_scope_closed(linked, source, "its milestone")
+        }
+        // The hub owns the name: a rename is shown on the link, not applied.
+        _ => vec![],
+    }
 }
 
 fn no_task_conflict(source: &ExternalRef, what: &str) -> Vec<Intent> {
@@ -240,8 +365,7 @@ pub fn plan(change: &UpstreamChange, current: Option<&Task>) -> Vec<Intent> {
             propose_move_or_conflict(current, source, TaskStatus::Todo, "reopened an issue")
         }
 
-        // Milestones map to workstreams, not tasks; `plan`'s signature here only takes a task, so
-        // milestone changes currently produce no task intent. See "What I did not do".
+        // Milestones map to workstreams, not tasks: see `plan_workstream`.
         MilestoneCreated { .. } | MilestoneRenamed { .. } | MilestoneClosed { .. } => vec![],
 
         PullRequestOpened { .. } => vec![],
@@ -279,6 +403,9 @@ fn propose_move_or_conflict(
     what: &str,
 ) -> Vec<Intent> {
     match current {
+        // Already there (a sync read again after a restart, or a person moved it first): nothing
+        // to do, and nothing to ask.
+        Some(t) if t.status == to => vec![],
         Some(t) if t.status.can_move(to, Mover::Sync) => {
             vec![Intent::ProposeMove {
                 task: t.id,
@@ -438,6 +565,138 @@ mod tests {
                 milestone: None,
             }]
         );
+    }
+
+    #[test]
+    fn a_move_to_where_the_task_already_is_gives_nothing() {
+        let done = task(TaskStatus::Done);
+        let closed = UpstreamChange::IssueClosed {
+            source: external_ref(),
+            at: at(),
+            reason: CloseReason::Completed,
+        };
+        assert!(plan(&closed, Some(&done)).is_empty());
+        let todo = task(TaskStatus::Todo);
+        let reopened = UpstreamChange::IssueReopened {
+            source: external_ref(),
+            at: at(),
+        };
+        assert!(plan(&reopened, Some(&todo)).is_empty());
+    }
+
+    fn workstream(status: WorkstreamStatus) -> Workstream {
+        Workstream {
+            id: WorkstreamId::new(),
+            project: ProjectId::new(),
+            name: "Launch".into(),
+            status,
+            health: pitcrew_protocol::model::Health::OnTrack,
+            locations: vec![],
+            external: vec![],
+        }
+    }
+
+    fn milestone() -> ExternalRef {
+        ExternalRef {
+            system: ExternalSystem::Github,
+            key: "example-org/demo-repo#milestone:1".into(),
+            url: None,
+        }
+    }
+
+    #[test]
+    fn a_closed_milestone_ships_its_workstream_unless_work_is_in_progress() {
+        let closed = UpstreamChange::MilestoneClosed {
+            source: milestone(),
+            at: at(),
+        };
+        for status in [
+            WorkstreamStatus::Idea,
+            WorkstreamStatus::Active,
+            WorkstreamStatus::Paused,
+        ] {
+            let w = workstream(status);
+            let linked = LinkedWorkstream {
+                workstream: &w,
+                work_in_progress: false,
+            };
+            assert_eq!(
+                plan_workstream(&closed, &linked),
+                vec![Intent::ProposeWorkstreamStatus {
+                    workstream: w.id,
+                    to: WorkstreamStatus::Shipped
+                }],
+                "{status:?}"
+            );
+            let busy = LinkedWorkstream {
+                workstream: &w,
+                work_in_progress: true,
+            };
+            assert!(matches!(
+                plan_workstream(&closed, &busy).as_slice(),
+                [Intent::WorkstreamConflictAsk { workstream, .. }] if *workstream == w.id
+            ));
+        }
+        for status in [WorkstreamStatus::Shipped, WorkstreamStatus::Dropped] {
+            let w = workstream(status);
+            let linked = LinkedWorkstream {
+                workstream: &w,
+                work_in_progress: true,
+            };
+            assert!(plan_workstream(&closed, &linked).is_empty(), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn a_milestone_rename_never_renames_the_workstream() {
+        let w = workstream(WorkstreamStatus::Active);
+        let linked = LinkedWorkstream {
+            workstream: &w,
+            work_in_progress: false,
+        };
+        for change in [
+            UpstreamChange::MilestoneRenamed {
+                source: milestone(),
+                at: at(),
+                title: "v2 launch".into(),
+            },
+            UpstreamChange::MilestoneCreated {
+                source: milestone(),
+                at: at(),
+                title: "v1 launch".into(),
+            },
+        ] {
+            assert!(plan_workstream(&change, &linked).is_empty());
+        }
+        assert_eq!(
+            MILESTONE_FIELD_OWNERSHIP
+                .iter()
+                .find(|row| row.field == "name")
+                .map(|row| row.owner),
+            Some(FieldOwner::Hub)
+        );
+    }
+
+    #[test]
+    fn the_tables_say_what_a_change_in_pitcrew_means_upstream() {
+        for field in ["title", "body", "labels", "milestone"] {
+            assert_eq!(
+                outward(ISSUE_FIELD_OWNERSHIP, field),
+                Outward::AskToSend,
+                "{field}"
+            );
+            let row = ISSUE_FIELD_OWNERSHIP.iter().find(|r| r.field == field);
+            assert_eq!(row.map(|r| r.owner), Some(FieldOwner::Upstream));
+        }
+        assert_eq!(
+            outward(ISSUE_FIELD_OWNERSHIP, "status"),
+            Outward::AskToCloseOrReopen
+        );
+        assert_eq!(outward(ISSUE_FIELD_OWNERSHIP, "assignee"), Outward::Never);
+        assert_eq!(outward(ISSUE_FIELD_OWNERSHIP, "priority"), Outward::Never);
+        for row in MILESTONE_FIELD_OWNERSHIP {
+            assert_eq!(row.outward, Outward::Never, "{}", row.field);
+        }
     }
 
     #[test]
