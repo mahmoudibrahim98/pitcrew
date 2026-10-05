@@ -10,7 +10,7 @@
 //! Replaced, as `[redacted]` (each counts once):
 //! - a private key block (`-----BEGIN … PRIVATE KEY-----`): the whole text;
 //! - well-known token shapes, by prefix: `sk-`, `sk_live_`, `ghp_`, `github_pat_`, `glpat-`,
-//!   `xoxb-`, `AKIA…`, `AIza…`, PitCrew's own `pcd_`/`pca_`, and others ([`PREFIXES`]);
+//!   `xoxb-`, `AKIA…`, `AIza…`, PitCrew's own `pcd_`/`pca_`/`pcr_`, and others ([`PREFIXES`]);
 //! - JSON Web Tokens (`eyJ….eyJ….…`);
 //! - the value after a secret's name: `password=…`, `token: …`, `api_key=…`, `?access_token=…`,
 //!   `--password …`, and the word after `Bearer` or `Basic`;
@@ -62,6 +62,7 @@ pub const PREFIXES: &[&str] = &[
     "ya29.",
     "pcd_",
     "pca_",
+    "pcr_",
     "npm_",
     "pypi-",
     "hf_",
