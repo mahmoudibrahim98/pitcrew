@@ -676,18 +676,14 @@ async fn dry_run_import(
     Person(_): Person,
     Body(filter): Body<pitcrew_protocol::import::ImportFilter>,
 ) -> Reply<pitcrew_protocol::import::ImportDryRun> {
-    Ok(Json(pitcrew_protocol::import::ImportDryRun {
-        count: blocking(w, move |w| w.import_dry_run(filter)).await?,
-    }))
+    Ok(Json(blocking(w, move |w| w.import_dry_run(filter)).await?))
 }
 async fn put_import(
     Work(w): Work,
     Person(_): Person,
     Body(filter): Body<pitcrew_protocol::import::ImportFilter>,
 ) -> Reply<pitcrew_protocol::import::ImportResult> {
-    Ok(Json(pitcrew_protocol::import::ImportResult {
-        imported: blocking(w, move |w| w.commit_import(filter)).await?,
-    }))
+    Ok(Json(blocking(w, move |w| w.commit_import(filter)).await?))
 }
 
 async fn get_safety(Work(w): Work, Person(_): Person) -> Reply<serde_json::Value> {

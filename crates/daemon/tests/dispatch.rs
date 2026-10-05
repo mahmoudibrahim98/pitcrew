@@ -719,6 +719,8 @@ fn dispatches_a_crash_left_are_reconciled_at_start() {
                     last_activity: now,
                     terminal: None,
                     parent: None,
+                    model: None,
+                    account: None,
                 },
             },
         ],

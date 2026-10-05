@@ -4,10 +4,54 @@ use crate::query::{self, SessionFilter};
 use crate::{WorkError, WorkService};
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::SessionId;
-use pitcrew_protocol::import::{ImportChoice, ImportFilter, ImportMode};
+use pitcrew_protocol::import::{
+    ImportChoice, ImportDryRun, ImportFilter, ImportMode, ImportResult,
+};
+use pitcrew_protocol::model::Session;
+use pitcrew_store::sql::Connection;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::PoisonError;
+
+/// Sub-agents followed up their chain of parents for at most this many sessions, the session
+/// itself included: past it (or in a loop) the session is judged by itself.
+const MAX_PARENT_CHAIN: usize = 16;
+
+/// The session whose inclusion decides `session`'s: a sub-agent follows its parent, up the chain,
+/// to the first session without one. A parent the hub does not know, a loop, or a chain past
+/// [`MAX_PARENT_CHAIN`] stops the climb where it is.
+fn deciding<'a>(
+    session: &'a Session,
+    by_id: &impl Fn(&SessionId) -> Option<&'a Session>,
+) -> &'a Session {
+    let mut at = session;
+    for _ in 1..MAX_PARENT_CHAIN {
+        let Some(parent) = at.parent.as_ref().and_then(by_id) else {
+            break;
+        };
+        if parent.id == session.id {
+            break;
+        }
+        at = parent;
+    }
+    at
+}
+
+/// Whether `session` is included, as a sub-agent through its parent.
+fn included(c: &Connection, choice: &ImportChoice, session: &Session) -> Result<bool> {
+    let mut at = session.clone();
+    for _ in 1..MAX_PARENT_CHAIN {
+        let Some(parent) = at.parent else {
+            break;
+        };
+        match query::session(c, &parent)? {
+            Some(p) if p.id != session.id => at = p,
+            _ => break,
+        }
+    }
+    Ok(choice.includes(&at))
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ImportState {
@@ -43,29 +87,43 @@ impl WorkService {
             .clone()
     }
 
-    /// Counts indexed sessions, without changing the choice.
+    /// Counts indexed sessions, without changing the choice: sessions, and apart from them the
+    /// sub-agents that come with them.
     /// # Errors
     /// Invalid filter or database errors.
-    pub fn import_dry_run(&self, filter: ImportFilter) -> Result<usize> {
+    pub fn import_dry_run(&self, filter: ImportFilter) -> Result<ImportDryRun> {
         filter.validate().map_err(WorkError::invalid)?;
-        self.import_count(&ImportChoice {
+        let (count, subagents) = self.import_count(&ImportChoice {
             filter,
             committed_at: Some(self.now()),
-        })
+        })?;
+        Ok(ImportDryRun { count, subagents })
     }
 
-    fn import_count(&self, choice: &ImportChoice) -> Result<usize> {
-        Ok(self
-            .read(|c| query::sessions(c, &SessionFilter::default()))?
-            .iter()
-            .filter(|s| choice.includes(s))
-            .count())
+    /// Included sessions without a parent, and included sub-agents (sessions with one, which
+    /// follow it).
+    fn import_count(&self, choice: &ImportChoice) -> Result<(usize, usize)> {
+        let sessions = self.read(|c| query::sessions(c, &SessionFilter::default()))?;
+        let by_id: HashMap<SessionId, &Session> = sessions.iter().map(|s| (s.id, s)).collect();
+        let lookup = |id: &SessionId| by_id.get(id).copied();
+        let (mut count, mut subagents) = (0, 0);
+        for s in &sessions {
+            if !choice.includes(deciding(s, &lookup)) {
+                continue;
+            }
+            if s.parent.is_some() {
+                subagents += 1;
+            } else {
+                count += 1;
+            }
+        }
+        Ok((count, subagents))
     }
 
     /// Stores a choice atomically before publishing it to readers.
     /// # Errors
     /// Invalid filter, database or persistence errors.
-    pub fn commit_import(&self, filter: ImportFilter) -> Result<usize> {
+    pub fn commit_import(&self, filter: ImportFilter) -> Result<ImportResult> {
         filter.validate().map_err(WorkError::invalid)?;
         let _write = self.lock();
         let mut state = self.import.lock().unwrap_or_else(PoisonError::into_inner);
@@ -73,7 +131,7 @@ impl WorkService {
             filter,
             committed_at: Some(self.now()),
         };
-        let count = self.import_count(&choice)?;
+        let (imported, subagents) = self.import_count(&choice)?;
         if let Some(file) = &state.file {
             let parent = file
                 .parent()
@@ -90,7 +148,10 @@ impl WorkService {
                 .map_err(|e| WorkError::internal(format!("saving import choice: {e}")))?;
         }
         state.choice = choice;
-        Ok(count)
+        Ok(ImportResult {
+            imported,
+            subagents,
+        })
     }
 
     /// Whether an indexed session is included. Unknown sessions remain visible to events until
@@ -99,7 +160,10 @@ impl WorkService {
     /// Database errors.
     pub fn session_included(&self, id: &SessionId) -> Result<bool> {
         let choice = self.import_choice();
-        self.read(|c| Ok(query::session(c, id)?.is_none_or(|s| choice.includes(&s))))
+        self.read(|c| match query::session(c, id)? {
+            None => Ok(true),
+            Some(s) => included(c, &choice, &s),
+        })
     }
 
     /// Applies inclusion to any session fields in an event, including transcript receipts.
@@ -136,7 +200,7 @@ impl WorkService {
             }
             for id in ids {
                 if let Some(s) = query::session(c, &id)?
-                    && !choice.includes(&s)
+                    && !included(c, choice, &s)?
                 {
                     return Ok(false);
                 }

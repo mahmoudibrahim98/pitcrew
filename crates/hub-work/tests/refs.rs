@@ -294,6 +294,8 @@ fn links_count_from_when_they_are_made_and_firm_links_stay() {
         last_activity: 1_790_900_000_000,
         terminal: None,
         parent: None,
+        model: None,
+        account: None,
     };
     let discovered = append(
         &work,

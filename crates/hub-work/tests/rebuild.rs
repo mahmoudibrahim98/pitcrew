@@ -257,6 +257,7 @@ fn workload(work: &WorkService) {
             session: ses2,
             title: Some("Seed 3 rerun".into()),
             branch: None,
+            model: Some("synthetic-model".into()),
         },
     );
     raw(

@@ -28,8 +28,8 @@ pub struct Sessions;
 impl Sessions {
     /// The projection's name.
     pub const NAME: &'static str = "work.sessions";
-    /// 4: imported links are firm, as in the runner.
-    const VERSION: u32 = 4;
+    /// 4: imported links are firm, as in the runner. 5: a session's model and account.
+    const VERSION: u32 = 5;
 }
 
 /// Whether a link made by a dispatch, a person or the agent itself.
@@ -86,13 +86,14 @@ impl Projection for Sessions {
                 session,
                 title,
                 branch,
+                model,
             } => {
                 exec(
                     tx,
                     "UPDATE work_sessions SET title = COALESCE(?2, title),
-                       branch = COALESCE(?3, branch)
+                       branch = COALESCE(?3, branch), model = COALESCE(?4, model)
                      WHERE id = ?1",
-                    params![session.text(), title, branch],
+                    params![session.text(), title, branch, model],
                 )?;
                 Ok(())
             }
@@ -173,8 +174,9 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
         tx,
         "INSERT INTO work_sessions (id, rev, engine, native_id, machine, cwd, branch, title, agent,
            workstream, task, link_basis, state, status_line, started, last_activity, terminal,
-           parent)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+           parent, model, account)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+           ?21, ?22)
          ON CONFLICT (id) DO UPDATE SET engine = excluded.engine, native_id = excluded.native_id,
            machine = excluded.machine, cwd = excluded.cwd, branch = excluded.branch,
            title = excluded.title, agent = COALESCE(excluded.agent, agent),
@@ -184,7 +186,8 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
            state = CASE WHEN state = ?20 THEN state ELSE excluded.state END,
            status_line = CASE WHEN state = ?20 THEN status_line ELSE excluded.status_line END,
            started = excluded.started, last_activity = excluded.last_activity,
-           terminal = excluded.terminal, parent = excluded.parent",
+           terminal = excluded.terminal, parent = excluded.parent,
+           model = COALESCE(excluded.model, model), account = COALESCE(excluded.account, account)",
         params![
             s.id.text(),
             rev,
@@ -206,6 +209,8 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
             opt_text(s.parent.as_ref()),
             keep_link,
             enum_text(&SessionState::Ended)?,
+            s.model,
+            s.account,
         ],
     )?;
     Ok(())

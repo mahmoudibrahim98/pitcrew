@@ -659,7 +659,7 @@ pub fn is_own_task(conn: &Connection, task: &Task, member: &MemberId) -> Result<
 
 const SESSION_COLS: &str = "id, engine, native_id, machine, cwd, branch, title, agent, workstream, \
                             task, link_basis, state, status_line, started, last_activity, \
-                            terminal, parent";
+                            terminal, parent, model, account";
 
 fn session_row(r: &Row<'_>) -> sql::Result<Session> {
     Ok(Session {
@@ -680,6 +680,8 @@ fn session_row(r: &Row<'_>) -> sql::Result<Session> {
         last_activity: r.get(14)?,
         terminal: opt_col(r, 15)?,
         parent: opt_col(r, 16)?,
+        model: r.get(17)?,
+        account: r.get(18)?,
     })
 }
 

@@ -187,6 +187,8 @@ pub fn session(
         last_activity: 0,
         terminal: None,
         parent: None,
+        model: None,
+        account: None,
     }
 }
 

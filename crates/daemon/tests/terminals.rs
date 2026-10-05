@@ -69,6 +69,8 @@ fn session_of(agent: Option<MemberId>) -> Session {
         last_activity: 1,
         terminal: None,
         parent: None,
+        model: None,
+        account: None,
     }
 }
 

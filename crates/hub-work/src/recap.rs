@@ -1416,6 +1416,8 @@ mod tests {
                 last_activity: t0,
                 terminal: None,
                 parent: None,
+                model: None,
+                account: None,
             };
             events.push(event(t0 - DAY_MS, EventBody::SessionDiscovered { session }));
         }
