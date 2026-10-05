@@ -232,7 +232,8 @@ try {
   // inclusion (and restores it), then integrations.test.mjs, which syncs, appending events that
   // the main suite's exact-revision checks must not see, and writes.test.mjs last, on its own: it
   // connects the same repository integrations.test.mjs does. Every phase runs; the first failure
-  // decides the exit code.
+  // decides the exit code. Files share one mutable hub: run them serially so scan-created
+  // agents cannot interleave with the API suite's exact-revision privacy barriers.
   for (const files of [
     ['tests/conformance/onboarding.test.mjs'],
     [
@@ -246,7 +247,7 @@ try {
     ['tests/conformance/writes.test.mjs'],
     ['tests/conformance/settings.test.mjs'],
   ]) {
-    suite = spawn(process.execPath, ['--test', ...files], {
+    suite = spawn(process.execPath, ['--test', '--test-concurrency=1', ...files], {
       cwd: root,
       env,
       stdio: 'inherit',
