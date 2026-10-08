@@ -25,3 +25,19 @@ it('keeps failed dispatches ended on rediscovery in the detail, list and active 
   expect(qc.getQueryData<Session>(keys.sessions.detail(session.id))?.state).toBe('working');
   qc.clear();
 });
+
+it('keeps a recorded model and account a re-statement leaves out, as the hub does', () => {
+  const qc = new QueryClient();
+  const session: Session = { id: '01JB000000000000000SES0002', engine: 'claude', native_id: 'a1',
+    machine: '01JB000000000000000MCH0001', cwd: '/home/sam/work', state: 'working', started: 1, last_activity: 1,
+    parent: '01JB000000000000000SES0003', recorded: { model: 'model-a', account: '~/.claude' } };
+  qc.setQueryData(keys.sessions.detail(session.id), session);
+  qc.setQueryData(keys.sessions.list(), [session]);
+  const restated: Session = { ...session };
+  delete restated.recorded;
+  applyPatches(qc, [{ body: { type: 'session_discovered', data: { session: { ...restated, state: 'idle' } } } }]);
+  expect(qc.getQueryData<Session>(keys.sessions.detail(session.id))).toEqual({ ...session, state: 'idle' });
+  applyPatches(qc, [{ body: { type: 'session_discovered', data: { session: { ...restated, recorded: { model: 'model-b' } } } } }]);
+  expect(qc.getQueryData<Session[]>(keys.sessions.list())?.[0]?.recorded).toEqual({ model: 'model-b', account: '~/.claude' });
+  qc.clear();
+});

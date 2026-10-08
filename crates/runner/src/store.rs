@@ -26,6 +26,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0003_folder_claims.sql"),
     include_str!("../migrations/0004_session_titles.sql"),
     include_str!("../migrations/0005_unclaimed.sql"),
+    include_str!("../migrations/0006_lineage_pending.sql"),
 ];
 
 const DB_FILE: &str = "runner.sqlite3";
@@ -209,6 +210,27 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    /// Sub-agents stated with no parent before the runner kept the parents transcripts name,
+    /// still to be looked up once (migration 0006).
+    pub(crate) fn lineage_pending(&self) -> Result<Vec<SessionId>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id FROM lineage_pending ORDER BY session_id")?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.iter().map(|id| parse_id(id)).collect()
+    }
+
+    /// `session`'s parent was looked up: it leaves [`Store::lineage_pending`].
+    pub(crate) fn lineage_done(&self, session: SessionId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM lineage_pending WHERE session_id = ?1",
+            [session.0.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub(crate) fn set_title(&self, session: SessionId, title: &str) -> Result<(), StoreError> {
         self.conn.execute("INSERT INTO session_titles VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET title = excluded.title", params![session.to_string(), title])?;
         Ok(())
@@ -1552,6 +1574,52 @@ mod tests {
     }
 
     #[test]
+    fn an_older_index_lists_its_sub_agents_without_parents_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let meta = |native: &str, is_subagent: bool| {
+            Some(SessionMeta {
+                native_id: native.into(),
+                is_subagent,
+                ..SessionMeta::default()
+            })
+        };
+        let mut session = row("/t/s.jsonl");
+        session.discovered = true;
+        session.meta = meta("s", false);
+        // Stated with no parent: listed.
+        let mut orphan = row("/t/agent-old.jsonl");
+        orphan.discovered = true;
+        orphan.meta = meta("old", true);
+        orphan.facts.parent = Some(Parent::None);
+        // Stated with its parent, or not stated yet: its discovery names it.
+        let mut nested = row("/t/s/subagents/b.jsonl");
+        nested.discovered = true;
+        nested.meta = meta("b", true);
+        nested.facts.parent = Some(Parent::Session(session.session));
+        let mut unread = row("/t/c.jsonl");
+        unread.meta = meta("c", true);
+        for r in [&session, &orphan, &nested, &unread] {
+            store.insert(r).expect("insert");
+            store
+                .commit(&Commit::Full(Box::new(r.clone())))
+                .expect("full");
+        }
+        // As an older runner left its index: before migration 0006.
+        store
+            .conn
+            .execute_batch("DROP TABLE lineage_pending; PRAGMA user_version = 5;")
+            .expect("older");
+        drop(store);
+        let store = Store::open(dir.path()).expect("reopen");
+        assert_eq!(store.lineage_pending().expect("list"), vec![orphan.session]);
+        store.lineage_done(orphan.session).expect("done");
+        drop(store);
+        let store = Store::open(dir.path()).expect("reopen");
+        assert!(store.lineage_pending().expect("list").is_empty());
+    }
+
+    #[test]
     fn an_index_from_a_newer_runner_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open");
@@ -1566,7 +1634,7 @@ mod tests {
                 err,
                 StoreError::TooNew {
                     found: 99,
-                    known: 5
+                    known: 6
                 }
             ),
             "{err}"

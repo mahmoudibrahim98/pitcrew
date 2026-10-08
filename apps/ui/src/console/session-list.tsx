@@ -1,12 +1,14 @@
 // The session list: every session, grouped by project and workstream plus Unsorted, virtualised.
-// Arrow keys, Home, End and Page keys move through sessions (and select them, if the caller wants
-// the selection to follow); Enter or a click selects one.
+// A sub-agent is nested under its parent, collapsed ("2 sub-agents"): Right arrow or a click on the
+// count shows them, Left arrow hides them. Arrow keys, Home, End and Page keys move through
+// sessions (and select them, if the caller wants the selection to follow); Enter or a click
+// selects one.
 
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type MouseEvent } from 'react';
 import { ContextMenu } from 'radix-ui';
 import { LinkSessionDialog } from './link-session.tsx';
-import { ApiError, useMembers, type Member, type Session } from '../data/index.ts';
+import { ApiError, sessionsById, subagentsByParent, useMembers, type Member, type Session } from '../data/index.ts';
 import { StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useConsoleSessions } from './data.ts';
@@ -16,7 +18,15 @@ import { ENGINE_LABEL, relativeTime, sessionTitle, STATE, useNow } from './forma
 export type ListRow =
   | { type: 'project'; key: string; label: string; count: number }
   | { type: 'workstream'; key: string; label: string; count: number }
-  | { type: 'session'; key: string; session: Session };
+  | {
+      type: 'session';
+      key: string;
+      session: Session;
+      /** Its sub-agents, nested under it. */
+      subagents: number;
+      /** A sub-agent's row, under its parent's. */
+      nested: boolean;
+    };
 
 const NO_WORKSTREAM = '';
 
@@ -28,11 +38,20 @@ function bySessionOrder(a: Session, b: Session): number {
 
 /**
  * Rows for the list: each project (in the workspace's order) with its workstreams, then Unsorted
- * for sessions in no project. Only groups with sessions appear.
+ * for sessions in no project. Only groups with sessions appear. A sub-agent whose parent is in
+ * the list is not a session of the group: it is nested under its parent, shown (oldest first)
+ * only when its parent is in `expanded`; groups count their sessions without sub-agents.
  */
-export function groupSessions(sessions: readonly Session[], places: SessionPlaces): ListRow[] {
+export function groupSessions(
+  sessions: readonly Session[],
+  places: SessionPlaces,
+  expanded: ReadonlySet<string> = new Set(),
+): ListRow[] {
+  const children = subagentsByParent(sessions);
+  const nestedIds = new Set([...children.values()].flat().map((s) => s.id));
   const groups = new Map<string, Map<string, Session[]>>();
   for (const session of sessions) {
+    if (nestedIds.has(session.id)) continue;
     const { project, workstream } = placeOf(session, places);
     const projectKey = project?.id ?? UNSORTED;
     const workstreamKey = project === undefined ? NO_WORKSTREAM : (workstream?.id ?? NO_WORKSTREAM);
@@ -49,8 +68,15 @@ export function groupSessions(sessions: readonly Session[], places: SessionPlace
   const rows: ListRow[] = [];
   const count = (byWorkstream: Map<string, Session[]>) =>
     [...byWorkstream.values()].reduce((sum, list) => sum + list.length, 0);
+  const pushSession = (session: Session, nested: boolean, seen: Set<string>) => {
+    if (seen.has(session.id)) return; // a loop of parents: shown once
+    seen.add(session.id);
+    const subs = children.get(session.id) ?? [];
+    rows.push({ type: 'session', key: session.id, session, subagents: subs.length, nested });
+    if (expanded.has(session.id)) for (const sub of subs) pushSession(sub, true, seen);
+  };
   const pushSessions = (list: Session[]) => {
-    for (const session of list.sort(bySessionOrder)) rows.push({ type: 'session', key: session.id, session });
+    for (const session of list.sort(bySessionOrder)) pushSession(session, false, new Set());
   };
 
   for (const project of places.projects) {
@@ -111,7 +137,27 @@ export interface SessionListViewProps {
 export function SessionListView(props: SessionListViewProps) {
   'use no memo'; // TanStack Virtual's instance changes under the React Compiler's memoisation.
   const { sessions, places, selectedId, onSelect, onActiveChange } = props;
-  const rows = useMemo(() => groupSessions(sessions, places), [sessions, places]);
+  // Parents whose sub-agents show. A selected sub-agent's parent always does, so it is in view.
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  const shown = useMemo(() => {
+    const byId = sessionsById(sessions);
+    const open = new Set(expanded);
+    let at = selectedId === undefined ? undefined : byId.get(selectedId);
+    for (let i = 0; at?.parent !== undefined && i < 16; i += 1) {
+      open.add(at.parent);
+      at = byId.get(at.parent);
+    }
+    return open;
+  }, [expanded, sessions, selectedId]);
+  const rows = useMemo(() => groupSessions(sessions, places, shown), [sessions, places, shown]);
+  const setOpen = (id: string, open: boolean) =>
+    setExpanded((current) => {
+      if (current.has(id) === open) return current;
+      const next = new Set(current);
+      if (open) next.add(id);
+      else next.delete(id);
+      return next;
+    });
   const handles = useMemo(
     () => new Map((props.members ?? []).map((m) => [m.id, m.handle] as const)),
     [props.members],
@@ -188,6 +234,26 @@ export function SessionListView(props: SessionListViewProps) {
       case 'End':
         moveTo(sessionIndexes.at(-1));
         break;
+      case 'ArrowRight': {
+        // Shows the active session's sub-agents.
+        const row = rows[activeRow];
+        if (row?.type !== 'session' || row.subagents === 0) return;
+        setOpen(row.session.id, true);
+        break;
+      }
+      case 'ArrowLeft': {
+        // Hides them; on a sub-agent, goes to its parent.
+        const row = rows[activeRow];
+        if (row?.type !== 'session') return;
+        if (row.nested && row.session.parent !== undefined) {
+          moveTo(rows.findIndex((r) => r.type === 'session' && r.session.id === row.session.parent));
+        } else if (row.subagents > 0) {
+          setOpen(row.session.id, false);
+        } else {
+          return;
+        }
+        break;
+      }
       case 'Enter':
       case ' ': {
         const row = rows[activeRow];
@@ -243,6 +309,10 @@ export function SessionListView(props: SessionListViewProps) {
               {row.type === 'session' ? (
                 <SessionRow
                   session={row.session}
+                  subagents={row.subagents}
+                  nested={row.nested}
+                  expanded={shown.has(row.session.id)}
+                  onToggle={(open) => setOpen(row.session.id, open)}
                   handle={row.session.agent === undefined ? undefined : handles.get(row.session.agent)}
                   onLink={props.onLink === undefined ? undefined : () => props.onLink?.(row.session)}
                   onOpen={props.onOpen === undefined ? undefined : (where) => props.onOpen?.(row.session, where)}
@@ -283,6 +353,12 @@ function GroupHeader({ row }: { row: Extract<ListRow, { type: 'project' | 'works
 
 function SessionRow(props: {
   session: Session;
+  /** Its sub-agents, nested under it. */
+  subagents: number;
+  /** A sub-agent's row. */
+  nested: boolean;
+  expanded: boolean;
+  onToggle: (open: boolean) => void;
   handle: string | undefined;
   now: number;
   selected: boolean;
@@ -296,6 +372,12 @@ function SessionRow(props: {
   const opened = useRef(false);
   const starting = session.state === 'starting';
   const state = STATE[session.state];
+  const { subagents, expanded, onToggle } = props;
+  // A click on the count shows or hides the sub-agents; it does not select the session.
+  const toggle = (event: MouseEvent<HTMLSpanElement>) => {
+    event.stopPropagation();
+    onToggle(!expanded);
+  };
   const row = (
     <div
       id={optionId(session.id)}
@@ -303,9 +385,11 @@ function SessionRow(props: {
       aria-selected={props.selected}
       data-session={session.id}
       data-state={session.state}
+      data-subagent={props.nested ? '' : undefined}
       onClick={props.onClick}
       className={cx(
         'mx-1 flex h-[52px] cursor-pointer flex-col justify-center gap-0.5 rounded-md px-3',
+        props.nested && 'ml-6 border-l border-line',
         props.selected ? 'bg-accent-soft' : 'hover:bg-hover',
         // The keyboard's place in the list, shown while the list has keyboard focus.
         props.active && 'group-focus-visible:ring-2 group-focus-visible:ring-accent group-focus-visible:ring-inset',
@@ -313,7 +397,7 @@ function SessionRow(props: {
     >
       <div className="flex min-w-0 items-center gap-2">
         <span className="shrink-0 font-mono text-[10px] tracking-wide text-ink-2 uppercase">
-          {ENGINE_LABEL[session.engine]}
+          {props.nested ? `${ENGINE_LABEL[session.engine]} sub-agent` : ENGINE_LABEL[session.engine]}
         </span>
         <span className={cx('min-w-0 flex-1 truncate text-sm font-medium', session.state === 'ended' && 'text-ink-2')}>
           {sessionTitle(session)}
@@ -337,10 +421,22 @@ function SessionRow(props: {
             )}
           </>
         )}
+        {subagents > 0 && (
+          // Not a button: an option holds no control of its own. The keyboard's way is Right/Left.
+          <span
+            data-subagents={subagents}
+            onClick={toggle}
+            title={expanded ? 'Hide its sub-agents (Left arrow)' : 'Show its sub-agents (Right arrow)'}
+            className="ml-auto shrink-0 cursor-pointer text-ink-2 hover:text-ink"
+          >
+            <span aria-hidden>{expanded ? '▾' : '▸'} </span>
+            {subagents} {subagents === 1 ? 'sub-agent' : 'sub-agents'}
+          </span>
+        )}
       </div>
     </div>
   );
-  if (props.onLink === undefined && props.onOpen === undefined) return row;
+  if (props.onLink === undefined && props.onOpen === undefined && subagents === 0) return row;
   const item = 'rounded-sm px-2 py-1.5 text-sm outline-none data-highlighted:bg-hover';
   const { onOpen } = props;
   const open = (where: OpenWhere) => {
@@ -363,6 +459,11 @@ function SessionRow(props: {
               <ContextMenu.Item onSelect={() => open('tab')} className={item}>Open in a new tab</ContextMenu.Item>
               <ContextMenu.Item onSelect={() => open('side')} className={item}>Open to the side</ContextMenu.Item>
             </>
+          )}
+          {subagents > 0 && (
+            <ContextMenu.Item onSelect={() => onToggle(!expanded)} className={item}>
+              {expanded ? 'Hide its sub-agents' : `Show its ${subagents === 1 ? 'sub-agent' : `${subagents} sub-agents`}`}
+            </ContextMenu.Item>
           )}
           {props.onLink !== undefined && <ContextMenu.Item onSelect={props.onLink} className={item}>Link to…</ContextMenu.Item>}
         </ContextMenu.Content>

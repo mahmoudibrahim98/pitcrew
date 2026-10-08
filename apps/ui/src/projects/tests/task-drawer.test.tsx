@@ -153,7 +153,8 @@ describe('TaskDrawer', () => {
     };
     renderWithHub(drawer(demo.pap6), hub, { fetch: transport });
     const dialog = await screen.findByRole('dialog', { name: 'Aggregate the results table' });
-    const select = within(dialog).getByRole('combobox', { name: 'Dispatch to' });
+    // The select renders once the drawer's data has loaded, after its title: waited for.
+    const select = await within(dialog).findByRole('combobox', { name: 'Dispatch to' });
     await within(select).findByRole('option', { name: /@writer/ });
     expect(within(select).queryByRole('option', { name: /@sync|@office/ })).toBeNull();
   });

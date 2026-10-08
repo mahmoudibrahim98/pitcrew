@@ -18,7 +18,29 @@ export function parseImport(value: unknown): ImportFilter {
   }
   return { mode: value['mode'] as ImportFilter['mode'], ...(since === undefined ? {} : { since }), engines, folders };
 }
-export function includesSession(choice: ImportChoice, session: Session): boolean {
+/** Sub-agents are followed up their chain of parents for at most this many sessions. */
+const MAX_PARENT_CHAIN = 16;
+/**
+ * The top of `session`'s chain of parents: the first session whose parent the hub does not know
+ * (none, or one it never saw), `session` itself when that is it. Undefined when the chain ends
+ * nowhere (a loop, or one too long): the session then stands on its own, as clients show it.
+ */
+export function rootOf(hub: Pick<Hub, 'findSession'>, session: Session): Session | undefined {
+  let at = session;
+  for (let i = 0; i < MAX_PARENT_CHAIN; i += 1) {
+    const parent = at.parent === undefined ? undefined : hub.findSession(at.parent);
+    if (parent === undefined) return at;
+    at = parent;
+  }
+  return undefined;
+}
+/** The session whose inclusion decides `session`'s: the top of its chain, else itself. */
+export function deciding(hub: Pick<Hub, 'findSession'>, session: Session): Session {
+  return rootOf(hub, session) ?? session;
+}
+/** Whether `session` is included; with `hub`, a sub-agent exactly when its parent is. */
+export function includesSession(choice: ImportChoice, session: Session, hub?: Pick<Hub, 'findSession'>): boolean {
+  if (hub !== undefined) session = deciding(hub, session);
   const f = choice.filter;
   if (f.mode === 'all') return true;
   if (f.mode === 'none') return choice.committed_at !== null && session.started > choice.committed_at;
@@ -51,13 +73,13 @@ export function eventVisible(hub: Hub, event: Event, person?: string): boolean {
   }
   return ids.every((id) => {
     const session = hub.findSession(id);
-    return session === undefined || includesSession(hub.importChoice, session);
+    return session === undefined || includesSession(hub.importChoice, session, hub);
   });
 }
 // Rebuild affected day paragraphs from retained block lines; never retain text from excluded blocks.
 export function includedRecaps(hub: Hub): DemoRecaps {
   const blocks = hub.recaps.blocks.filter(({ block }) => block.session === undefined ||
-    includesSession(hub.importChoice, hub.findSession(block.session)!));
+    includesSession(hub.importChoice, hub.findSession(block.session)!, hub));
   const byId = new Map(blocks.map((b) => [b.block.id, b]));
   return { ...hub.recaps, blocks, projects: hub.recaps.projects.map((project) => ({ ...project,
     days: project.days.flatMap((day) => {
@@ -76,4 +98,19 @@ export function includedRecaps(hub: Hub): DemoRecaps {
       return [{ ...day, blocks: retained, summary: { text, spans } }];
     }),
   })) };
+}
+/**
+ * Included sessions, and apart from them included sub-agents: sessions nested under the top of
+ * their chain of parents. One naming a parent the hub never saw, or in a loop, is a session.
+ */
+export function importCounts(hub: Hub, choice: ImportChoice): { sessions: number; subagents: number } {
+  let sessions = 0;
+  let subagents = 0;
+  for (const s of hub.sessions) {
+    const top = deciding(hub, s);
+    if (!includesSession(choice, top)) continue;
+    if (top.id === s.id) sessions += 1;
+    else subagents += 1;
+  }
+  return { sessions, subagents };
 }

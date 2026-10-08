@@ -21,7 +21,7 @@ export function ImportStep() {
   const { state, patch, next } = useWizard();
   const api = useOnboardingApi();
   const [busy, setBusy] = useState(false);
-  const [preview, setPreview] = useState<{ key: string; count: number }>();
+  const [preview, setPreview] = useState<{ key: string; count: number; subagents?: number | undefined }>();
   const [error, setError] = useState<string>();
 
   const filter = useMemo(() => ({
@@ -36,7 +36,7 @@ export function ImportStep() {
     let live = true;
     void api.importSessions(filter).then((result) => {
       if (live) {
-        setPreview({ key: JSON.stringify(filter), count: result.count });
+        setPreview({ key: JSON.stringify(filter), count: result.count, subagents: result.subagents });
         setError(undefined);
       }
     }).catch((cause: unknown) => {
@@ -133,7 +133,11 @@ export function ImportStep() {
       <p className="mt-3 text-sm text-ink-2" aria-live="polite">
         {!ready
           ? 'Counting…'
-          : `This will import ${preview.count} session${preview.count === 1 ? '' : 's'}.`}
+          : `This will import ${preview.count} session${preview.count === 1 ? '' : 's'}${
+              preview.subagents === undefined || preview.subagents === 0
+                ? ''
+                : `, with ${preview.subagents} sub-agent${preview.subagents === 1 ? '' : 's'} nested under them`
+            }.`}
       </p>
 
       <p className="mt-2 text-xs text-ink-2">Sessions stay in place. You can change this choice later. Start fresh includes only sessions started after confirmation.</p>

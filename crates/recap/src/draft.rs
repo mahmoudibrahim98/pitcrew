@@ -7,7 +7,7 @@ use crate::directory::Directory;
 use crate::summary::{Clause, Draft, DraftKind, Sentence};
 use crate::text::{NAME_CHARS, basename, clean, push_first};
 use pitcrew_protocol::events::BriefTarget;
-use pitcrew_protocol::ids::{MemberId, TaskId, WorkstreamId};
+use pitcrew_protocol::ids::{MemberId, SessionId, TaskId, WorkstreamId};
 use pitcrew_protocol::model::{
     AskKind, DispatchOutcome, Health, Receipt, TaskStatus, WorkstreamStatus,
 };
@@ -69,18 +69,37 @@ pub fn draft_paragraph(blocks: &[&Block], directory: &Directory) -> Draft {
     }
 }
 
+/// Who a clause is about: a member, or a session that runs as no agent, named by itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Actor {
+    Member(MemberId),
+    Session(SessionId),
+}
+
 /// A claim before its subject is attached.
 struct Item {
-    actor: Option<MemberId>,
+    actor: Option<Actor>,
     text: String,
     receipts: Vec<Receipt>,
 }
 
 fn block_clauses(block: &Block, dir: &Directory, detail: Detail) -> Vec<Clause> {
     let names = Names(dir);
-    let worker = block.agent.or_else(|| block.actors.first().copied());
+    // A session's work is its agent's, or else the session's own: never the person the runner's
+    // events are stamped with (api-v1.md, "Sessions": "Who did it").
+    let worker = match block.session {
+        Some(s) => Some(block.agent.map_or(Actor::Session(s), Actor::Member)),
+        None => block
+            .agent
+            .or_else(|| block.actors.first().copied())
+            .map(Actor::Member),
+    };
+    let started_by_person = block
+        .session
+        .and_then(|s| dir.session(s))
+        .is_some_and(|s| s.person_start);
     let fact_item = |f: &Fact| Item {
-        actor: actor_of(f),
+        actor: actor_of(f, worker, started_by_person),
         text: fact_text(f, &names, detail),
         receipts: f.receipts.clone(),
     };
@@ -170,12 +189,12 @@ fn block_clauses(block: &Block, dir: &Directory, detail: Detail) -> Vec<Clause> 
     }
 
     // Name the actor whenever it changes, so each clause says who did it.
-    let mut last: Option<MemberId> = None;
+    let mut last: Option<Actor> = None;
     items
         .into_iter()
         .map(|item| {
             let text = match item.actor {
-                Some(a) if Some(a) != last => format!("{} {}", names.member(a), item.text),
+                Some(a) if Some(a) != last => format!("{} {}", names.actor(a), item.text),
                 _ => item.text,
             };
             last = item.actor;
@@ -319,11 +338,17 @@ fn is_opening(kind: &FactKind) -> bool {
     )
 }
 
-/// Facts that are statements about the work rather than acts by someone.
-fn actor_of(fact: &Fact) -> Option<MemberId> {
+/// Who a fact is about. Checks and divergences are statements about the work, by no one. A
+/// session's start, waits and end are the session's doing (its agent's, or its own), except a
+/// start a person made from PitCrew, which is theirs.
+fn actor_of(fact: &Fact, worker: Option<Actor>, started_by_person: bool) -> Option<Actor> {
     match fact.kind {
         FactKind::Checks { .. } | FactKind::JobDiverged { .. } => None,
-        _ => Some(fact.by),
+        FactKind::SessionStarted { .. } if started_by_person => Some(Actor::Member(fact.by)),
+        FactKind::SessionStarted { .. }
+        | FactKind::SessionWaiting { .. }
+        | FactKind::SessionEnded => worker.or(Some(Actor::Member(fact.by))),
+        _ => Some(Actor::Member(fact.by)),
     }
 }
 
@@ -333,6 +358,16 @@ struct Names<'a>(&'a Directory);
 impl Names<'_> {
     fn member(&self, id: MemberId) -> String {
         self.0.handle(id).unwrap_or("someone").to_owned()
+    }
+
+    fn actor(&self, actor: Actor) -> String {
+        match actor {
+            Actor::Member(id) => self.member(id),
+            Actor::Session(id) => self
+                .0
+                .session_name(id)
+                .unwrap_or_else(|| "a session".to_owned()),
+        }
     }
 
     fn task(&self, id: TaskId) -> String {

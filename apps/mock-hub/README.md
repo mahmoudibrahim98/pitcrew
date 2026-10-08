@@ -242,7 +242,7 @@ src/hello.txt, a large.bin above the read cap, and an outside link that cannot b
 They enforce revisions, exclusive creation, path rules and body/file/list caps; writes persist
 only in memory. Remote and WSL locations return 501. No filesystem paths are opened.
 
-Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
+Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Its counts leave sub-agents out and report them apart (`subagents`), and a sub-agent is included exactly when the top of its chain of parents is (`import.ts`, `rootOf` and `deciding`); one naming a session the hub does not have, or in a loop, is a session of its own. The demo workspace has one sub-agent (`SES0007`, of the dispatched Codex session `SES0002`, started the day after it). The synthetic scan report suggests each project's default (`main`) workstream first, with each suggestion's `kind`. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
 
 Session-options advertises the mock local machine's three synthetic CLIs and supported modes
 (Claude plan/accept-edits, Codex accept-edits, OpenCode default; bypass disabled). Unreachable

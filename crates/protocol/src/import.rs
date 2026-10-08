@@ -50,16 +50,21 @@ pub struct ImportChoice {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ImportDryRun {
-    /// Included indexed sessions.
+    /// Included indexed sessions, sub-agents left out: they come with their parents.
     pub count: usize,
+    /// Included sub-agent sessions (those with a `parent`), nested under the sessions counted in
+    /// `count`.
+    pub subagents: usize,
 }
 
 /// Committed count.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ImportResult {
-    /// Included indexed sessions.
+    /// Included indexed sessions, sub-agents left out: they come with their parents.
     pub imported: usize,
+    /// Included sub-agent sessions, nested under the sessions counted in `imported`.
+    pub subagents: usize,
 }
 
 impl ImportFilter {

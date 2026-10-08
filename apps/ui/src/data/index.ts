@@ -29,6 +29,24 @@ export type {
   RemoteProgress,
 } from './remote.ts';
 export { AppData } from './root.tsx';
+export {
+  aboutSubagent,
+  actorName,
+  actorOf,
+  byId as sessionsById,
+  byTimeNewestFirst,
+  ENGINE_NAME,
+  eventSession,
+  isNested,
+  parentOf,
+  rootOf,
+  sessionName,
+  startedByPerson,
+  subagentsByParent,
+  topLevel,
+  withoutRestatements,
+  type Actor,
+} from './sessions.ts';
 export { setUp, SetupConflict, useSetUp, useSetup } from './setup.ts';
 export { streamPath, terminalPath, type StreamStatus } from './stream.ts';
 export {

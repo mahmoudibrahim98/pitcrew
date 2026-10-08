@@ -53,6 +53,8 @@ pub struct RecordFacts {
     pub timestamp: Option<TimestampMs>,
     /// Whether `session_meta.source` names a sub-agent.
     pub is_subagent: Option<bool>,
+    /// The parent session a sub-agent names: `source.subagent.thread_spawn.parent_thread_id`.
+    pub parent: Option<String>,
 }
 
 /// Parses one line of a Codex rollout; `offset` is the line's byte offset.
@@ -120,7 +122,21 @@ fn session_facts(p: &Map<String, Value>) -> RecordFacts {
         timestamp: str_at(p, "timestamp").and_then(parse_rfc3339_ms),
         // `"cli"`, `"exec"`, ... or `{"subagent": ...}`.
         is_subagent: p.get("source").map(|s| s.get("subagent").is_some()),
+        parent: p
+            .get("source")
+            .and_then(|s| s.get("subagent"))
+            .and_then(subagent_parent),
     }
+}
+
+/// The parent a `source.subagent` names: `{"thread_spawn": {"parent_thread_id": …}}` (Codex's
+/// spawned sub-agents). A review or compaction sub-agent (`"review"`, `"compact"`) names none.
+fn subagent_parent(subagent: &Value) -> Option<String> {
+    let spawn = subagent.get("thread_spawn")?;
+    bounded(
+        spawn.get("parent_thread_id").and_then(Value::as_str),
+        MAX_ID_BYTES,
+    )
 }
 
 fn response_item(
@@ -853,6 +869,30 @@ mod tests {
         assert!(
             matches!(&items(&msg)[..], [TranscriptItem::AssistantText { text, .. }] if text == "hello")
         );
+    }
+
+    #[test]
+    fn a_spawned_sub_agent_names_its_parent_and_a_review_names_none() {
+        let facts = |source: Value| {
+            let v = json!({"type": "session_meta", "payload": {"id": "child", "cwd": "/w",
+                           "source": source}});
+            parse_line(v.to_string().as_bytes(), 0)
+                .expect("parses")
+                .facts
+        };
+        let spawned = facts(json!({"subagent": {"thread_spawn": {
+            "parent_thread_id": "0199a000-0000-7000-8000-00000000000a", "depth": 1}}}));
+        assert_eq!(spawned.is_subagent, Some(true));
+        assert_eq!(
+            spawned.parent.as_deref(),
+            Some("0199a000-0000-7000-8000-00000000000a")
+        );
+        let review = facts(json!({"subagent": "review"}));
+        assert_eq!((review.is_subagent, review.parent), (Some(true), None));
+        let exec = facts(json!("exec"));
+        assert_eq!((exec.is_subagent, exec.parent), (Some(false), None));
+        let blank = facts(json!({"subagent": {"thread_spawn": {"parent_thread_id": " "}}}));
+        assert_eq!(blank.parent, None);
     }
 
     #[test]

@@ -16,11 +16,19 @@ async function ok(method, path, body) {
   assert.equal(response.status,200,JSON.stringify(response.body));
   return response.body;
 }
+// Counts leave sub-agents (sessions with a `parent`) out, and count them apart.
 async function agreement(filter) {
   const dry = await ok('POST','/v1/import/dry-run',filter);
   const commit = await ok('PUT','/v1/import',filter);
+  assert.ok(Number.isSafeInteger(dry.subagents) && dry.subagents >= 0, JSON.stringify(dry));
   assert.equal(dry.count,commit.imported);
-  assert.equal((await ok('GET','/v1/sessions')).length,commit.imported);
+  assert.equal(dry.subagents,commit.subagents);
+  const listed = await ok('GET','/v1/sessions');
+  assert.equal(listed.filter((s) => s.parent === undefined).length,commit.imported);
+  assert.equal(listed.filter((s) => s.parent !== undefined).length,commit.subagents);
+  // A sub-agent is listed exactly when its parent is.
+  const ids = new Set(listed.map((s) => s.id));
+  assert.ok(listed.every((s) => s.parent === undefined || ids.has(s.parent)));
   assert.equal((await ok('GET','/v1/import')).filter.mode,filter.mode);
   return commit.imported;
 }
@@ -32,12 +40,22 @@ test('device-only reversible import: modes, dimensions, visibility and full rest
   const total = await agreement(all);
   assert.ok(total > 0);
   const sessions = await ok('GET','/v1/sessions');
-  const chosen = sessions[0];
+  const chosen = sessions.find((s) => s.parent === undefined);
   const blocks = await ok('GET','/v1/recaps/blocks');
   const filter = {mode:'filtered',engines:[chosen.engine],folders:[chosen.cwd]};
-  const expected = sessions.filter((s) => s.engine === chosen.engine &&
+  const expected = sessions.filter((s) => s.parent === undefined && s.engine === chosen.engine &&
     (s.cwd === chosen.cwd || s.cwd.startsWith(chosen.cwd.replace(/\/$/,'') + '/')));
   assert.equal(await agreement(filter),expected.length);
+  // A sub-agent started on a later day than its parent: since that day, it matches and its parent
+  // does not, so neither is listed or counted.
+  const byId = new Map(sessions.map((s) => [s.id,s]));
+  const day = (ms) => new Date(ms).toISOString().slice(0,10);
+  const late = sessions.find((s) => s.parent !== undefined && byId.has(s.parent) &&
+    day(byId.get(s.parent).started) < day(s.started));
+  assert.ok(late, 'the fixtures have a sub-agent started a day after its parent');
+  await agreement({mode:'filtered',since:day(late.started)});
+  assert.equal((await call('GET','/v1/sessions/'+late.id)).status,404);
+  assert.ok(!(await ok('GET','/v1/sessions')).some((s) => s.id === late.id));
   assert.equal(await agreement({mode:'filtered',since:'9999-12-31'}),0);
   assert.equal((await ok('GET','/v1/events?session='+chosen.id)).events.length,0);
   assert.equal((await call('GET','/v1/sessions/'+chosen.id)).status,404);
@@ -58,5 +76,5 @@ test('device-only reversible import: modes, dimensions, visibility and full rest
   }
   assert.equal((await call('PUT','/v1/import',{mode:'filtered',folders:['']})).status,400);
   assert.equal((await call('PUT','/v1/import',{mode:'unknown'})).status,400);
-  assert.equal((await ok('GET','/v1/sessions')).length,total);
+  assert.equal((await ok('GET','/v1/sessions')).filter((s) => s.parent === undefined).length,total);
 });

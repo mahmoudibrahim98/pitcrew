@@ -80,7 +80,7 @@ import {
 } from './validate.ts';
 
 import { files } from './files.ts';
-import { parseImport, includesSession, eventVisible, includedRecaps } from './import.ts';
+import { parseImport, includesSession, eventVisible, includedRecaps, importCounts } from './import.ts';
 import * as integrations from './integrations.ts';
 import * as writes from './writes.ts';
 export const MOCK_VERSION = '0.1.0-mock';
@@ -256,7 +256,7 @@ function known<T>(value: T | undefined, message: string): T {
 const taskAt = (hub: Hub, ref: string): Task => found(hub.findTask(ref), `No task ${ref}.`);
 const sessionAt = (hub: Hub, id: string): Session => {
   const session = found(hub.findSession(id), `No session ${id}.`);
-  if (!includesSession(hub.importChoice, session)) throw notFound(`No session ${id}.`);
+  if (!includesSession(hub.importChoice, session, hub)) throw notFound(`No session ${id}.`);
   return session;
 };
 
@@ -1050,7 +1050,7 @@ const listSessions: Handler = (hub, ctx) => {
   return ok(
     hub.sessions.filter(
       (s) =>
-        includesSession(hub.importChoice, s) &&
+        includesSession(hub.importChoice, s, hub) &&
         (machine === undefined || s.machine === machine) &&
         (workstream === undefined || s.workstream === workstream) &&
         (task === undefined || s.task === task) &&
@@ -1656,15 +1656,17 @@ const ROUTES: Route[] = [
     return ok(settings);
   }),
   route('GET', '/v1/import' , 'device', (hub) => ok(hub.importChoice)),
+  // Counts leave sub-agents out (they come with their parents) and count them apart.
   route('POST', '/v1/import/dry-run', 'device', (hub, ctx) => {
     const filter = parseImport(ctx.body);
-    const count = hub.sessions.filter((s) => includesSession({ filter, committed_at: Date.now() }, s)).length;
-    return ok({ count });
+    const { sessions, subagents } = importCounts(hub, { filter, committed_at: Date.now() });
+    return ok({ count: sessions, subagents });
   }),
   route('PUT', '/v1/import', 'device', (hub, ctx) => {
     const filter = parseImport(ctx.body);
     hub.importChoice = { filter, committed_at: Date.now() };
-    return ok({ imported: hub.sessions.filter((s) => includesSession(hub.importChoice, s)).length });
+    const { sessions, subagents } = importCounts(hub, hub.importChoice);
+    return ok({ imported: sessions, subagents });
   }),
   route('GET', '/v1/sessions', 'device', listSessions),
   route('GET', '/v1/sessions/:id', 'device', (hub, ctx) => ok(sessionAt(hub, ctx.param('id')))),

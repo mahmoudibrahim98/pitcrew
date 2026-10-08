@@ -3,7 +3,7 @@
 use pitcrew_ingest::claude::{ClaudeAdapter, ReadReport};
 use pitcrew_ingest::{SkipReason, SkippedLine};
 use pitcrew_interfaces::source::{
-    Cursor, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptRef,
+    Cursor, Lineage, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptRef,
 };
 use pitcrew_protocol::model::Engine;
 use proptest::prelude::*;
@@ -337,6 +337,7 @@ fn meta_comes_from_records_not_folders() {
             model: Some("claude-x".into()),
             started: Some(1_767_225_600_000),
             is_subagent: false,
+            parent: None,
         }
     );
 
@@ -411,6 +412,10 @@ fn discovery_finds_sessions_and_subagents() {
         .map(|m| (m.native_id.as_str(), m.is_subagent))
         .collect();
     assert_eq!(flags, [("sess-0", true), ("ag-7", true), ("s-1", false)]);
+    // A sub-agent names its parent by the session id its records carry; one naming itself (an
+    // older sidechain file without an agent id) names none.
+    let parents: Vec<_> = metas.iter().map(|m| m.parent.as_deref()).collect();
+    assert_eq!(parents, [None, Some("sess-1"), None]);
 
     assert!(read_retry(|| ClaudeAdapter.discover(&home.path().join("missing"))).is_empty());
 }
@@ -803,4 +808,42 @@ fn read_page_on_200mb() {
     );
     assert!(page.items.len() >= 200);
     assert!(newest.as_millis() < 50, "newest page took {newest:?}");
+}
+
+/// A transcript's lineage, from its head as the machine scan reads it: a sub-agent and the parent
+/// its records (or its session folder) name; a session names none; an unreadable file is an error.
+#[test]
+fn lineage_reads_the_head() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = dir.path().join("sess-1.jsonl");
+    let sub = dir
+        .path()
+        .join("sess-1")
+        .join("subagents")
+        .join("agent-a.jsonl");
+    fs::create_dir_all(sub.parent().expect("parent")).expect("mkdir");
+    let record = |extra: serde_json::Value| {
+        let mut r = json!({"type": "user", "cwd": "/w", "timestamp": "2026-01-01T00:00:00Z",
+                           "message": {"content": "Go"}});
+        for (k, v) in extra.as_object().expect("object") {
+            r[k] = v.clone();
+        }
+        format!("{r}\n")
+    };
+    fs::write(&session, record(json!({"sessionId": "sess-1"}))).expect("write");
+    fs::write(
+        &sub,
+        record(json!({"sessionId": "sess-1", "agentId": "a", "isSidechain": true})),
+    )
+    .expect("write");
+    let lineage = |path: &Path| ClaudeAdapter.lineage(&tref(path));
+    assert_eq!(
+        lineage(&sub).expect("read"),
+        Some(Lineage {
+            is_subagent: true,
+            parent: Some("sess-1".into())
+        })
+    );
+    assert_eq!(lineage(&session).expect("read"), Some(Lineage::default()));
+    assert!(lineage(&dir.path().join("gone.jsonl")).is_err());
 }

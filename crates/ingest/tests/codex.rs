@@ -371,6 +371,7 @@ fn meta_comes_from_session_meta_and_turn_context() {
             model: Some("m-2".into()),
             started: Some(1_767_225_600_000),
             is_subagent: false,
+            parent: None,
         }
     );
 }

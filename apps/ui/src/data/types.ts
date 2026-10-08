@@ -222,8 +222,16 @@ export interface Session {
   started: TimestampMs;
   last_activity: TimestampMs;
   terminal?: TerminalId;
-  /** For a sub-agent's session, the session that started it. */
+  /**
+   * For a sub-agent's session, the session that started it: it is nested there, its activity is
+   * its parent's, and it is never an agent of its own (see `sessions.ts`).
+   */
   parent?: SessionId;
+  /**
+   * What its transcript records: the model it last recorded, and the CLI account home it is in
+   * (`~/.claude`), which says which account ran it.
+   */
+  recorded?: { model?: string; account?: string };
 }
 
 // ─── Transcripts (`crates/protocol/src/transcript.rs`) and session control (`runner.rs`) ─────────
@@ -614,7 +622,7 @@ export type EventBody =
       type: 'file_edited';
       data: { session: SessionId; path: string; added: number; removed: number; receipt?: Receipt };
     }
-  | { type: 'session_updated'; data: { session: SessionId; title?: string; branch?: string } }
+  | { type: 'session_updated'; data: { session: SessionId; title?: string; branch?: string; model?: string } }
   | {
       type: 'session_linked';
       data: { session: SessionId; workstream?: WorkstreamId; task?: TaskId; basis: LinkBasis };

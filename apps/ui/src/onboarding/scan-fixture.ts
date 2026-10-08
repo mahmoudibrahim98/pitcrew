@@ -36,9 +36,18 @@ export const SCAN_REPORT: WireScanReport = {
       recent_30d: 3,
       recent_90d: 3,
       workstreams: [
-        { id: '/home/sam/work/paper/drafts', name: 'drafts', session_count: 3, recent_30d: 3, recent_90d: 3 },
+        { id: '/home/sam/work/paper', kind: 'main', name: 'main', session_count: 3, recent_30d: 3, recent_90d: 3 },
+        {
+          id: '/home/sam/work/paper/drafts',
+          kind: 'folder',
+          name: 'drafts',
+          session_count: 3,
+          recent_30d: 3,
+          recent_90d: 3,
+        },
         {
           id: '/home/sam/work/paper#revision-2',
+          kind: 'branch',
           name: 'revision-2',
           branch: 'revision-2',
           session_count: 1,
@@ -55,7 +64,9 @@ export const SCAN_REPORT: WireScanReport = {
       session_count: 2,
       recent_30d: 0,
       recent_90d: 2,
-      workstreams: [],
+      workstreams: [
+        { id: '/home/sam/work/tools', kind: 'main', name: 'Main', session_count: 2, recent_30d: 0, recent_90d: 2 },
+      ],
     },
   ],
   unreadable: 0,

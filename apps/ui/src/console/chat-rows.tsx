@@ -1,9 +1,10 @@
 // One chat row per kind: prompts, assistant markdown, tool calls with their results, file edits
 // with their diffs, plans, questions and turn ends. Everything from the transcript is text.
 
+import type { MouseEvent } from 'react';
 import type { Ask, PlanItem, Session, TranscriptItemOf } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
-import { clockTime, fullTime } from './format.ts';
+import { clockTime, ENGINE_LABEL, fullTime, sessionTitle, STATE } from './format.ts';
 import { QuestionCard } from './question-card.tsx';
 import { DiffView } from './render/diff-view.tsx';
 import { Markdown } from './render/markdown.tsx';
@@ -19,6 +20,37 @@ export interface RowContext {
   asksKnown: boolean;
   expanded: ReadonlySet<string>;
   toggle: (key: string) => void;
+  /** Where a sub-agent's own transcript is, and opening it with a plain click. */
+  sessionHref?: ((session: string) => string) | undefined;
+  onOpenSession?: ((session: string) => void) | undefined;
+}
+
+/** Where a sub-agent ran: its name and state, and a link to its own transcript. */
+function SubagentRowView({ session, ctx }: { session: Session; ctx: RowContext }) {
+  const title = sessionTitle(session);
+  const href = ctx.sessionHref?.(session.id);
+  const { onOpenSession } = ctx;
+  const follow = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (onOpenSession === undefined) return;
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    onOpenSession(session.id);
+  };
+  return (
+    <div className="flex min-w-0 items-center gap-2 rounded-md border border-dashed border-line px-2.5 py-1.5 text-xs" data-subagent={session.id}>
+      <span className="shrink-0 font-semibold">Sub-agent</span>
+      <span className="min-w-0 truncate">{title}</span>
+      <span className="shrink-0 text-ink-2">
+        {ENGINE_LABEL[session.engine]} · {STATE[session.state].label}
+      </span>
+      <Time at={session.started} />
+      {href !== undefined && (
+        <a href={href} onClick={follow} className="ml-auto shrink-0 text-accent-text underline-offset-2 hover:underline">
+          Open its transcript<span className="sr-only">: {title}</span>
+        </a>
+      )}
+    </div>
+  );
 }
 
 function Time({ at }: { at: number }) {
@@ -232,5 +264,7 @@ export function ChatRowView({ row, ctx }: { row: ChatRow; ctx: RowContext }) {
           <span className="h-px flex-1 bg-line" />
         </div>
       );
+    case 'subagent':
+      return <SubagentRowView session={row.session} ctx={ctx} />;
   }
 }

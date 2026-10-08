@@ -6,7 +6,7 @@ use pitcrew_protocol::api::ErrorCode;
 use pitcrew_protocol::model::Engine;
 use pitcrew_protocol::scan::{
     EngineCount, FolderCount, HomeCount, MonthCount, ScanCounts, ScanFrame, ScanProgress,
-    ScanReport, Suggestion, WorkstreamSuggestion,
+    ScanReport, Suggestion, WorkstreamSuggestion, WorkstreamSuggestionKind,
 };
 use serde_json::{Value, json};
 
@@ -84,7 +84,26 @@ fn the_done_frame_carries_the_report_in_snake_case() {
             recent_90d: 2,
             workstreams: vec![
                 WorkstreamSuggestion {
+                    id: "/home/sam/work/paper".into(),
+                    kind: WorkstreamSuggestionKind::Main,
+                    name: "main".into(),
+                    branch: None,
+                    session_count: 2,
+                    recent_30d: 2,
+                    recent_90d: 2,
+                },
+                WorkstreamSuggestion {
+                    id: "/home/sam/work/paper-fix".into(),
+                    kind: WorkstreamSuggestionKind::Worktree,
+                    name: "fix/typos".into(),
+                    branch: None,
+                    session_count: 0,
+                    recent_30d: 0,
+                    recent_90d: 0,
+                },
+                WorkstreamSuggestion {
                     id: "/home/sam/work/paper/drafts".into(),
+                    kind: WorkstreamSuggestionKind::Folder,
                     name: "drafts".into(),
                     branch: None,
                     session_count: 2,
@@ -93,6 +112,7 @@ fn the_done_frame_carries_the_report_in_snake_case() {
                 },
                 WorkstreamSuggestion {
                     id: "/home/sam/work/paper#revision-2".into(),
+                    kind: WorkstreamSuggestionKind::Branch,
                     name: "revision-2".into(),
                     branch: Some("revision-2".into()),
                     session_count: 1,
@@ -130,7 +150,24 @@ fn the_done_frame_carries_the_report_in_snake_case() {
                     "recent_90d": 2,
                     "workstreams": [
                         {
+                            "id": "/home/sam/work/paper",
+                            "kind": "main",
+                            "name": "main",
+                            "session_count": 2,
+                            "recent_30d": 2,
+                            "recent_90d": 2,
+                        },
+                        {
+                            "id": "/home/sam/work/paper-fix",
+                            "kind": "worktree",
+                            "name": "fix/typos",
+                            "session_count": 0,
+                            "recent_30d": 0,
+                            "recent_90d": 0,
+                        },
+                        {
                             "id": "/home/sam/work/paper/drafts",
+                            "kind": "folder",
                             "name": "drafts",
                             "session_count": 2,
                             "recent_30d": 1,
@@ -138,6 +175,7 @@ fn the_done_frame_carries_the_report_in_snake_case() {
                         },
                         {
                             "id": "/home/sam/work/paper#revision-2",
+                            "kind": "branch",
                             "name": "revision-2",
                             "branch": "revision-2",
                             "session_count": 1,

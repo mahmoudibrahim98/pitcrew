@@ -178,8 +178,17 @@ export interface ScanCounts {
   byMonth: { month: string; count: number }[];
 }
 
+/**
+ * What a suggested workstream stands for (api-v1.md, "Machine scan"): `main` is the project's
+ * default workstream at its root, always created with the project so every session under it is
+ * linked; `worktree` a linked git worktree, named after its branch.
+ */
+export type SuggestedWorkstreamKind = 'main' | 'worktree' | 'folder' | 'branch';
+
 export interface SuggestedWorkstream {
   id: string;
+  /** Absent from the fake's suggestions, which predate kinds: then a folder or a branch. */
+  kind?: SuggestedWorkstreamKind;
   name: string;
   branch?: string;
   sessionCount: number;
@@ -231,10 +240,14 @@ export interface ImportFilter {
 export interface ImportDryRunResult {
   /** How many sessions this filter would import; read in place, never moved (ADR-0010). */
   count: number;
+  /** Sub-agent sessions that come with them, nested under their parents (not in `count`). */
+  subagents?: number;
 }
 
 export interface ImportResult {
   imported: number;
+  /** Sub-agent sessions imported with them (not in `imported`). */
+  subagents?: number;
 }
 
 export interface HooksDiffFile {

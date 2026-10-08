@@ -281,6 +281,10 @@ export interface Session {
   started: TimestampMs;
   last_activity: TimestampMs;
   terminal?: TerminalId;
+  /** For a sub-agent, the session that started it: it is nested there, never an agent of its own. */
+  parent?: SessionId;
+  /** What its transcript records: the model, and the CLI account home it is in (`~/.claude`). */
+  recorded?: { model?: string; account?: string };
 }
 
 export interface Dispatch {
@@ -390,7 +394,7 @@ export type EventBody =
       data: { session: SessionId; workstream?: WorkstreamId; task?: TaskId; basis: LinkBasis };
     }
   | { type: 'session_ended'; data: { session: SessionId } }
-  | { type: 'session_updated'; data: { session: SessionId; title?: string; branch?: string } }
+  | { type: 'session_updated'; data: { session: SessionId; title?: string; branch?: string; model?: string } }
   | { type: 'machine_added'; data: { machine: Machine } }
   | { type: 'member_added'; data: { member: Member } }
   | { type: 'persona_saved'; data: { persona: Persona } }
@@ -675,9 +679,13 @@ export interface ScanCounts {
   last_activity?: TimestampMs;
 }
 
+/** `main`: the project's default workstream, at its root; `worktree`: a linked git worktree. */
+export type WorkstreamSuggestionKind = 'main' | 'worktree' | 'folder' | 'branch';
+
 export interface WorkstreamSuggestion {
-  /** A folder's own path, or `<project path>#<branch>`. */
+  /** A folder's own path (the project's for `main`, the worktree's), or `<project path>#<branch>`. */
   id: string;
+  kind: WorkstreamSuggestionKind;
   name: string;
   branch?: string;
   session_count: number;

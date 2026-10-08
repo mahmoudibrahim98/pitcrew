@@ -3,6 +3,7 @@ import type { Engine } from "./Engine.ts";
 import type { LinkBasis } from "./LinkBasis.ts";
 import type { MachineId } from "./MachineId.ts";
 import type { MemberId } from "./MemberId.ts";
+import type { Recorded } from "./Recorded.ts";
 import type { SessionId } from "./SessionId.ts";
 import type { SessionState } from "./SessionState.ts";
 import type { TaskId } from "./TaskId.ts";
@@ -78,6 +79,13 @@ last_activity: number,
  */
 terminal?: TerminalId, 
 /**
- * For a sub-agent's session, the session that started it.
+ * For a sub-agent's session, the session that started it. A sub-agent is shown nested under
+ * its parent, never as an agent of its own; one whose parent could not be found has none,
+ * and is shown as a session of its own.
  */
-parent?: SessionId, };
+parent?: SessionId, 
+/**
+ * What its transcript records about it, once the runner has read it: the model and the
+ * account home. Boxed, since every `session_discovered` carries a whole session.
+ */
+recorded?: Recorded, };

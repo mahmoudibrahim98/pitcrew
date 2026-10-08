@@ -110,8 +110,12 @@ the last scan that finished (a selection the scan did not have is refused: scan 
   workspace's keys (`GET /v1/projects`) and the batch's own, with the smallest free number from 2
   (`PAP2`); a `409` from the hub (another client took it meanwhile) tries the next.
 - **A workstream** is `POST /v1/workstreams` in its (possibly moved) project, with one location: a
-  sub-folder suggestion's own folder (its `id` is its path), or a branch suggestion's project root
-  on that branch. A moved workstream keeps its place.
+  sub-folder, worktree or main suggestion's own folder (its `id` is its path), or a branch
+  suggestion's project root on that branch. A moved workstream keeps its place.
+- **The main workstream** (`kind: 'main'`, the project's root) always comes with its project, in
+  it: the Create step shows it ticked and fixed, and `createFromScan` makes it even when a
+  selection leaves it out. So every session found under the project is linked by folder, a
+  worktree's to its worktree's workstream (named after its branch), and nothing stays unsorted.
 - The template (Research, Software, Blank) is not sent: the contract has no templates yet.
 - What one run created is remembered, so pressing Create again after a failure part-way creates
   only the rest.
@@ -208,7 +212,7 @@ is its only implementation. Types are in `api.ts`, reusing `Engine`, `Project`, 
 | `integrationStatus()` | `() → IntegrationStatus[]` | Proposed. Stream G owns the real connections. |
 | `streamScan(target, onEvent)` | `(ScanTarget, cb) → Streamed` | **Real**: `POST /v1/machines/{id}/scan` on the hub's own machine. Streams `progress`, ends with `done` carrying counts and suggested projects/workstreams, or `error` with why. |
 | `createFromScan(selection)` | `ProjectSelection[] → { projects, workstreams }` | **Real**: `POST /v1/projects` and `POST /v1/workstreams` from the last scan's suggestions (see "Creating from the scan"). |
-| `importSessions(filter)` / `commitImport(filter)` | `ImportFilter → { count }` / `{ imported }` | **Real**: `POST /v1/import/dry-run`, then `PUT /v1/import` (sessions read in place, never moved). |
+| `importSessions(filter)` / `commitImport(filter)` | `ImportFilter → { count, subagents? }` / `{ imported, subagents? }` | **Real**: `POST /v1/import/dry-run`, then `PUT /v1/import` (sessions read in place, never moved). Sub-agents are counted apart, nested under their parents: "This will import 10 sessions, with 4 sub-agents nested under them." |
 | `hooksDiff()` / `installHooks(preview)` | `() → HooksDiff` / `HooksDiff → void` | **Real**: `POST /v1/machines/{id}/hooks/diff`, then `…/hooks/install` with the preview's `revision`. The diff is always shown before installing. |
 | `readSafety()` / `saveSafety(settings)` | `() → SafetySettings` / `SafetySettings → void` | **Real**: `GET` and `PUT /v1/safety`. |
 

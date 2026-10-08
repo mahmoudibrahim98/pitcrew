@@ -409,7 +409,6 @@ fn apply(block: &mut Block, event: &Event, task: Option<TaskId>, dir: &Directory
                 inc(&mut b.counts.tools_failed);
             }
             push_first(&mut b.tool_receipts, [&ev, receipt], cfg.max_receipts);
-            b.agent = b.agent.or(Some(event.author));
             if let Some(check) = classify(tool, target) {
                 facts.check(check, *failed, &[&ev, receipt]);
             }
@@ -424,12 +423,10 @@ fn apply(block: &mut Block, event: &Event, task: Option<TaskId>, dir: &Directory
             ..
         } => {
             let b = &mut *facts.block;
-            b.agent = b.agent.or(Some(event.author));
             edit_file(b, path, *added, *removed, &ev, cfg);
         }
         EventBody::TurnEnded { receipt, .. } => {
             let b = &mut *facts.block;
-            b.agent = b.agent.or(Some(event.author));
             inc(&mut b.counts.turns);
             push_first(&mut b.turn_receipts, [&ev, receipt], cfg.max_receipts);
         }

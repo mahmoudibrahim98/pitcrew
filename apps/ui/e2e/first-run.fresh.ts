@@ -147,7 +147,8 @@ test('the first run, from an empty workspace to Home as the new person', async (
   expect(after.setup_needed).toBeUndefined();
 
   // The projects at the scan's roots, keyed from their names, and their workstreams where the scan
-  // found them: a folder, or the project's root on a branch.
+  // found them: each project's main one at its root (always made), a folder, or the root on a
+  // branch.
   const machines = (await (await request.get(`${FIRST_RUN_HUB}/v1/machines`, { headers: AUTH })).json()) as { id: string }[];
   const machine = machines[0]?.id;
   const projects = (await (await request.get(`${FIRST_RUN_HUB}/v1/projects`, { headers: AUTH })).json()) as {
@@ -167,8 +168,10 @@ test('the first run, from an empty workspace to Home as the new person', async (
   }[];
   const [dp, lt] = projects.map((p) => p.id);
   expect(workstreams.map((w) => [w.project, w.name, w.locations])).toEqual([
+    [dp, 'main', [{ machine, path: '/home/sam/work/diffusion-paper' }]],
     [dp, 'paper', [{ machine, path: '/home/sam/work/diffusion-paper/paper' }]],
     [dp, 'revision-2', [{ machine, path: '/home/sam/work/diffusion-paper', branch: 'revision-2' }]],
+    [lt, 'main', [{ machine, path: '/home/sam/work/lab-tools' }]],
     [lt, 'parsers', [{ machine, path: '/home/sam/work/lab-tools', branch: 'parsers' }]],
   ]);
 

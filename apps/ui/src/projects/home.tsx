@@ -3,13 +3,16 @@
 
 import { Button, StatusPill } from '../design/index.ts';
 import { useMoveCursor, useReadCursors } from '../data/cursors.ts';
-import { AuthorAvatar } from './activity.tsx';
+import { sessionsById, useSessions } from '../data/index.ts';
+import { ActorAvatar } from './activity.tsx';
 import { AgentsNow } from './agents.tsx';
+import { changesSince } from './attribution.ts';
 import {
   sameTarget,
   useActivity,
   useBriefs,
   useInbox,
+  useMe,
   useMemberMap,
   useNames,
   useProjects,
@@ -17,7 +20,7 @@ import {
   useWorkstreams,
   withRevisions,
 } from './data.ts';
-import { ASK_KIND, PROJECT_STATUS, describeEvent, formatWhen } from './format.ts';
+import { ASK_KIND, PROJECT_STATUS, formatWhen } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { ErrorNote, MaybeLink, Panel } from './ui.tsx';
 
@@ -128,6 +131,10 @@ function NeedsYou() {
   );
 }
 
+/**
+ * What others did since the person last looked, newest first: their own actions are left out, and
+ * each session's events (its sub-agents' included) fold into one line (`attribution.ts`).
+ */
 function SinceLastLooked() {
   const cursors = useReadCursors();
   const move = useMoveCursor();
@@ -135,10 +142,17 @@ function SinceLastLooked() {
   const activity = useActivity();
   const members = useMemberMap();
   const names = useNames();
+  const me = useMe();
+  const sessions = useSessions();
   const page = activity.data;
   const all = page === undefined ? [] : withRevisions(page).filter(({ event }) => event.body.type !== 'cursor_moved');
-  const fresh = cursors.data === undefined ? [] : all.filter((e) => e.rev > lastSeen).reverse();
-  const newestShown = fresh[0]?.rev;
+  // Until the cursor, and who "me" is, are known, nothing is new: the person's own actions are
+  // left out, so a list shown before `me` would flash them.
+  const known = cursors.data !== undefined && !me.isPending;
+  const fresh = known ? all.filter((e) => e.rev > lastSeen) : [];
+  const lines = changesSince(fresh, sessionsById(sessions.data ?? []), names, me.data?.id);
+  // Marking read reaches the newest revision in the window, the person's own included.
+  const newestShown = fresh.length === 0 ? undefined : Math.max(...fresh.map((e) => e.rev));
   const more = page !== undefined && !page.at_start && page.from_rev > lastSeen + 1;
   return (
     <Panel
@@ -154,24 +168,24 @@ function SinceLastLooked() {
       {activity.error !== null && <ErrorNote error={activity.error} what="load what changed" />}
       {cursors.error !== null && <ErrorNote error={cursors.error} what="load your read cursor" />}
       {move.error !== null && <ErrorNote error={move.error} what="mark changes as read" />}
-      {page !== undefined && cursors.data !== undefined && fresh.length === 0 && (
+      {page !== undefined && known && lines.length === 0 && (
         <p className="text-sm text-ink-2">Nothing new since you last looked.</p>
       )}
-      {fresh.length > 0 && (
-        <p role="status" className="mb-2 text-sm text-ink-2">{fresh.length} new {fresh.length === 1 ? 'change' : 'changes'}{more ? ' in this window' : ''}</p>
+      {lines.length > 0 && (
+        <p role="status" className="mb-2 text-sm text-ink-2">{lines.length} new {lines.length === 1 ? 'change' : 'changes'}{more ? ' in this window' : ''}</p>
       )}
-      {fresh.length > 0 && (
+      {lines.length > 0 && (
         <ol aria-label="Changes" className="flex flex-col gap-1.5">
-          {fresh.map(({ event }) => (
-            <li key={event.id} className="flex items-start gap-2 text-sm">
-              <AuthorAvatar event={event} members={members} />
+          {lines.map((line) => (
+            <li key={line.key} className="flex items-start gap-2 text-sm">
+              <ActorAvatar actor={line.actor} members={members} />
               <p className="min-w-0 flex-1">
                 <span className="mr-2 text-xs font-medium">New</span>
-                <span className="font-medium">{names.member(event.author)}</span>{' '}
-                <span className="text-ink-2">{describeEvent(event, names)}</span>
+                <span className="font-medium">{line.who}</span>{' '}
+                <span className="text-ink-2">{line.what}</span>
               </p>
-              <time dateTime={new Date(event.at).toISOString()} className="shrink-0 text-xs text-ink-2">
-                {formatWhen(event.at)}
+              <time dateTime={new Date(line.event.at).toISOString()} className="shrink-0 text-xs text-ink-2">
+                {formatWhen(line.event.at)}
               </time>
             </li>
           ))}

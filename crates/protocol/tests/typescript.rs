@@ -144,6 +144,7 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     model::Receipt::export_all(&config)?;
     model::Scheduler::export_all(&config)?;
     model::Session::export_all(&config)?;
+    model::Recorded::export_all(&config)?;
     model::SessionState::export_all(&config)?;
     model::Subtask::export_all(&config)?;
     model::SubtaskSource::export_all(&config)?;
@@ -187,6 +188,7 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     scan::ScanReport::export_all(&config)?;
     scan::Suggestion::export_all(&config)?;
     scan::WorkstreamSuggestion::export_all(&config)?;
+    scan::WorkstreamSuggestionKind::export_all(&config)?;
     // Machine setup (api-v1.md, "Machine setup").
     machine_setup::MachineCheck::export_all(&config)?;
     machine_setup::AgentAccount::export_all(&config)?;

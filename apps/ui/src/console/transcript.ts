@@ -10,6 +10,7 @@
 import {
   TRANSCRIPT_KINDS,
   type Ask,
+  type Session,
   type TranscriptItem,
   type TranscriptItemOf,
   type TranscriptPage,
@@ -195,17 +196,23 @@ export type ChatRow =
       /** The last thing in the transcript and not answered yet. */
       open: boolean;
     }
-  | { type: 'turn'; key: string; item: TranscriptItemOf<'turn_ended'> };
+  | { type: 'turn'; key: string; item: TranscriptItemOf<'turn_ended'> }
+  /** Where a sub-agent of this session started: a link to its own transcript. */
+  | { type: 'subagent'; key: string; session: Session };
 
 export type ChatRowType = ChatRow['type'];
 
 /**
  * Turns items into rows: tool calls paired with their results by `call_id`; a question and the
  * tool call that asked it (same record) become one question row, answered by that call's result.
+ * Each of `subagents` (this session's sub-agents) is a row where it started: before the first item
+ * at or after its start, or at the end; one that started before the loaded items waits for the
+ * page that holds its start.
  */
 export function buildRows(
   view: Pick<WindowView, 'items' | 'gapsBefore' | 'atStart'>,
   pending: readonly PendingPrompt[] = [],
+  subagents: readonly Session[] = [],
 ): ChatRow[] {
   const { items } = view;
   const results = new Map<string, TranscriptItemOf<'tool_result'>>();
@@ -228,9 +235,18 @@ export function buildRows(
 
   const rows: ChatRow[] = [];
   if (view.atStart) rows.push({ type: 'start', key: 'start' });
+  const firstAt = items[0]?.at;
+  const waiting = [...subagents]
+    .filter((s) => view.atStart || (firstAt !== undefined && s.started >= firstAt))
+    .sort((a, b) => a.started - b.started || a.id.localeCompare(b.id));
+  const subagentRow = (session: Session): ChatRow => ({ type: 'subagent', key: `subagent:${session.id}`, session });
   let offset: number | undefined;
   let index = 0;
   for (const item of items) {
+    while (waiting.length > 0 && (waiting[0]?.started ?? Infinity) <= item.at) {
+      const next = waiting.shift();
+      if (next !== undefined) rows.push(subagentRow(next));
+    }
     if (item.offset !== offset) {
       offset = item.offset;
       index = 0;
@@ -274,6 +290,7 @@ export function buildRows(
         break;
     }
   }
+  for (const session of waiting) rows.push(subagentRow(session));
   for (const prompt of pending) rows.push({ type: 'pending', key: `pending:${prompt.id}`, prompt });
   return rows;
 }

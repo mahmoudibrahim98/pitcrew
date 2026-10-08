@@ -5,6 +5,10 @@
  */
 export type ImportResult = { 
 /**
- * Included indexed sessions.
+ * Included indexed sessions, sub-agents left out: they come with their parents.
  */
-imported: number, };
+imported: number, 
+/**
+ * Included sub-agent sessions, nested under the sessions counted in `imported`.
+ */
+subagents: number, };

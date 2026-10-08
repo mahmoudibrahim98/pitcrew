@@ -60,13 +60,23 @@ describe('the synthetic report', () => {
       counts.sessions,
       'every session is in one project',
     );
-    const ids = report.suggestions.flatMap((s) => [s.id, ...s.workstreams.map((w) => w.id)]);
-    assert.equal(new Set(ids).size, ids.length, 'ids are unique');
+    const ids = report.suggestions.map((s) => s.id);
+    assert.equal(new Set(ids).size, ids.length, 'project ids are unique');
     for (const s of report.suggestions) {
       assert.equal(s.id, s.path);
+      const workstreamIds = s.workstreams.map((w) => w.id);
+      assert.equal(new Set(workstreamIds).size, workstreamIds.length, 'workstream ids are unique');
+      // The default workstream comes first, at the project's root, and only once.
+      assert.deepEqual(
+        s.workstreams.filter((w) => w.kind === 'main').map((w) => w.id),
+        [s.path],
+      );
+      assert.equal(s.workstreams[0]?.kind, 'main');
       for (const w of s.workstreams) {
         assert.ok(w.session_count <= s.session_count);
-        assert.equal(w.id, w.branch === undefined ? `${s.path}/${w.name}` : `${s.path}#${w.branch}`);
+        const id = { main: s.path, folder: `${s.path}/${w.name}`, branch: `${s.path}#${w.branch}` }[w.kind as string];
+        if (id !== undefined) assert.equal(w.id, id);
+        assert.equal(w.branch !== undefined, w.kind === 'branch');
       }
     }
     const busiest = counts.by_folder.map((f) => f.count);

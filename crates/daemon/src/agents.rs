@@ -214,6 +214,7 @@ mod tests {
                     last_activity: 1,
                     terminal: None,
                     parent,
+                    recorded: None,
                 },
             });
         }

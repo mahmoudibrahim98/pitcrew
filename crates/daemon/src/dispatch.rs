@@ -558,6 +558,7 @@ mod tests {
             last_activity: 1,
             terminal: None,
             parent: None,
+            recorded: None,
         }
     }
 

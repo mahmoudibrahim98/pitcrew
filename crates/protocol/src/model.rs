@@ -786,10 +786,42 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub terminal: Option<TerminalId>,
-    /// For a sub-agent's session, the session that started it.
+    /// For a sub-agent's session, the session that started it. A sub-agent is shown nested under
+    /// its parent, never as an agent of its own; one whose parent could not be found has none,
+    /// and is shown as a session of its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub parent: Option<SessionId>,
+    /// What its transcript records about it, once the runner has read it: the model and the
+    /// account home. Boxed, since every `session_discovered` carries a whole session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<Recorded>"))]
+    pub recorded: Option<Box<Recorded>>,
+}
+
+/// What a session's transcript records about it ([`Session::recorded`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct Recorded {
+    /// The model, as the transcript last recorded it (e.g. `claude-sonnet-4-5`); it changes with
+    /// `session_updated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub model: Option<String>,
+    /// The CLI account home its transcript is in (`~/.claude`, or a `CLAUDE_CONFIG_DIR`,
+    /// `CODEX_HOME` or OpenCode data folder): which account ran it, where a machine has several.
+    /// `~` stands for the machine user's home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub account: Option<String>,
+}
+
+impl Recorded {
+    /// `Some` when it records anything.
+    #[must_use]
+    pub fn of(model: Option<String>, account: Option<String>) -> Option<Box<Self>> {
+        (model.is_some() || account.is_some()).then(|| Box::new(Self { model, account }))
+    }
 }
 
 /// How a dispatch ended.

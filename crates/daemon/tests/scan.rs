@@ -353,8 +353,18 @@ fn a_scan_streams_progress_and_reports_the_fixtures() {
                 "session_count": 1,
                 "recent_30d": 1,
                 "recent_90d": 1,
+                // The default workstream first: the main checkout, named after the branch its
+                // session started on (this `.git` has no HEAD to read).
                 "workstreams": [{
+                    "id": path(repo),
+                    "kind": "main",
+                    "name": "main",
+                    "session_count": 1,
+                    "recent_30d": 1,
+                    "recent_90d": 1,
+                }, {
                     "id": path(&work.paper),
+                    "kind": "folder",
                     "name": "paper",
                     "session_count": 1,
                     "recent_30d": 1,
@@ -369,7 +379,14 @@ fn a_scan_streams_progress_and_reports_the_fixtures() {
                 "session_count": 1,
                 "recent_30d": 1,
                 "recent_90d": 1,
-                "workstreams": [],
+                "workstreams": [{
+                    "id": path(&work.runs),
+                    "kind": "main",
+                    "name": "Main",
+                    "session_count": 1,
+                    "recent_30d": 1,
+                    "recent_90d": 1,
+                }],
             },
             {
                 "id": path(&work.tools),
@@ -379,7 +396,15 @@ fn a_scan_streams_progress_and_reports_the_fixtures() {
                 "session_count": 1,
                 "recent_30d": 1,
                 "recent_90d": 1,
-                "workstreams": [],
+                // OpenCode records no branch, and this `.git` has no HEAD: named after the folder.
+                "workstreams": [{
+                    "id": path(&work.tools),
+                    "kind": "main",
+                    "name": "lab-tools",
+                    "session_count": 1,
+                    "recent_30d": 1,
+                    "recent_90d": 1,
+                }],
             },
         ]),
         "{report:#}"
@@ -571,7 +596,22 @@ fn a_fresh_hub_scans_its_machine_once_set_up() {
     assert_eq!(report["counts"]["sessions"], 3, "{report:#}");
     assert_eq!(report["suggestions"].as_array().unwrap().len(), 3);
     let owner = setup.json()["me"]["id"].as_str().unwrap().to_owned();
-    let members = daemon.get("/v1/members", Some(&device)).json();
+    // The back office adds `@office` once setup is done, alongside the scan: the members are
+    // compared once it has, so only what a scan adds can differ.
+    let deadline = Instant::now() + WAIT;
+    let members = loop {
+        let members = daemon.get("/v1/members", Some(&device)).json();
+        if members
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["handle"] == "@office")
+        {
+            break members;
+        }
+        assert!(Instant::now() < deadline, "no @office: {members:#}");
+        std::thread::sleep(Duration::from_millis(25));
+    };
     let personas = daemon.get("/v1/personas", Some(&device)).json();
     for engine in ["claude", "codex", "opencode"] {
         let matching: Vec<_> = members

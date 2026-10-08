@@ -90,8 +90,9 @@ function SessionDetails({
   const machine = machines.data?.find((m) => m.id === s.machine);
   const agent = s.agent === undefined ? undefined : members.data?.find((m) => m.id === s.agent);
   const persona = agent?.persona === undefined ? undefined : personas.data?.find((p) => p.id === agent.persona);
-  // The hub reports neither on a session; an agent's persona may name its model.
-  const model = persona?.model ?? (persona !== undefined ? `The CLI's default (${persona.name})` : 'Not reported');
+  // What the transcript records first; else an agent's persona may name its model.
+  const model =
+    s.recorded?.model ?? persona?.model ?? (persona !== undefined ? `The CLI's default (${persona.name})` : 'Not recorded yet');
   const linkedTask = task.data;
   const linkedWorkstream = workstream.data;
   const taskHref = linkedTask === undefined ? undefined : paths.task(ws, linkedTask.key);
@@ -128,9 +129,17 @@ function SessionDetails({
           <StatusPill tone={STATE[s.state].tone}>{STATE[s.state].label}</StatusPill>
         </Row>
         <Row term="Model">{model}</Row>
-        <Row term="Account">Not reported</Row>
+        <Row term="Account">
+          {s.recorded?.account === undefined ? (
+            <span className="text-ink-2">Not reported</span>
+          ) : (
+            <span className="font-mono text-xs" title="The CLI account home its transcript is in">
+              {s.recorded.account}
+            </span>
+          )}
+        </Row>
         <Row term="Engine">{ENGINE_LABEL[s.engine]}</Row>
-        <Row term="Agent">{agent?.handle ?? 'None (run by a person)'}</Row>
+        <Row term="Agent">{agent?.handle ?? (s.parent !== undefined ? 'None (a sub-agent of its session)' : 'None (run by a person)')}</Row>
         <Row term="Started">{fullTime(s.started)}</Row>
       </dl>
 

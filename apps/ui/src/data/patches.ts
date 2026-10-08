@@ -96,6 +96,8 @@ function rediscovered(old: Session | undefined, incoming: Session): Session {
     if (old.link_basis !== undefined) next.link_basis = old.link_basis;
   }
   if (next.agent === undefined && old.agent !== undefined) next.agent = old.agent;
+  // As the hub does: a model or account once recorded stays until a re-statement names another.
+  if (old.recorded !== undefined) next.recorded = { ...old.recorded, ...incoming.recorded };
   return next;
 }
 

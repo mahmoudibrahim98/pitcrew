@@ -82,6 +82,8 @@ export function SessionPane({ ws, sessionId, view, onView, narrow, pane }: Sessi
         onOpenWorkstream={(w) => open(workstreamHref(w))}
         compact={narrow && (shown === 'terminal' || shown === 'work')}
         linksLabel={`Linked work${suffix}`}
+        sessionHref={(id) => paths.session(ws, id)}
+        onOpenSession={(id) => open(paths.session(ws, id))}
       />
       <ViewSwitch
         value={switchValue}
@@ -129,7 +131,12 @@ export function SessionPane({ ws, sessionId, view, onView, narrow, pane }: Sessi
       {shown === 'chat' && (
         <>
           <div data-pane="chat" className="min-h-0 flex-1">
-            <ChatView sessionId={sessionId} label={`Chat${suffix}`} />
+            <ChatView
+              sessionId={sessionId}
+              label={`Chat${suffix}`}
+              sessionHref={(id) => paths.session(ws, id)}
+              onOpenSession={(id) => open(paths.session(ws, id))}
+            />
           </div>
           <div data-pane="composer" className="shrink-0">
             <Composer sessionId={sessionId} />

@@ -368,6 +368,55 @@ task must belong to that workstream (`400` otherwise, including a task without a
 Unknown body references are `400`; an unknown session in the path is `404`. A workstream-only
 link clears the session's task. Every successful link emits `session_linked`, with basis `manual`.
 
+A person links several sessions by linking each (one request per session). "Link to a project"
+is a link to the project's **default workstream**: the one with a location at the project's
+`root` (same machine and path, no branch), which creating from a scan always makes (see "Machine
+scan"). A project without one gets it first (`POST /v1/workstreams`, named `Main`, its location
+the project's root).
+
+**What a session says about itself** (`Session`, in `crates/protocol/src/model.rs`):
+- `parent`: set for a **sub-agent** (a Claude Task sub-agent, in `<session>/subagents/` or an
+  older top-level `isSidechain` file; a Codex `thread_spawn` sub-agent; an OpenCode child
+  session): the session that started it, which the runner finds from what the transcript names
+  (Claude's `sessionId`, Codex's `source.subagent.thread_spawn.parent_thread_id`, OpenCode's
+  `parent_id`) among the transcripts it watches in the same home. A sub-agent is part of its
+  parent's work: clients nest it under its parent (never list it as an agent of its own, nor count
+  it among sessions) and fold its activity into its parent's. A sub-agent whose parent is not
+  found (its transcript names none, as a Codex review sub-agent's does not, or the parent's
+  transcript is gone) has no `parent`, and is a session of its own. A sub-agent is nested under
+  the top of its chain of parents: the first session whose parent the client (or hub) does not
+  have. One whose `parent` names a session it does not have, or that is part of a loop of
+  parents, stands on its own. A runner upgraded from one that did not keep the parents
+  transcripts name states each sub-agent it had indexed with none once more, with its parent, at
+  its first start.
+- `recorded`: what its transcript records about it, once the runner has read it:
+  `{ "model"?, "account"? }`. `model` is the model the transcript last recorded (it changes with
+  `session_updated`); `account` the account home its transcript is in (`~/.claude`, `~/.codex`,
+  OpenCode's data folder, or the folder a `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or `XDG_DATA_HOME`
+  names), with `~` for the machine user's home: which account ran it, where a machine has
+  several.
+- `terminal`: set only for a session PitCrew started (it owns the terminal the CLI runs in). A
+  session the runner found on disk has none, and an agent of its own only when it is a dispatch's
+  or was started for that agent.
+
+**Who did it.** The runner's events (`session_discovered`, `session_state_changed`,
+`turn_ended`, `tool_ran`, `file_edited`, `session_updated`, `session_ended`, and its own
+`folder`/`branch` links) carry the hub's stamped `author` (the workspace's first person, whom the
+device token acts as), but they are the **session's** doing: clients name the session's agent
+when it has one (a dispatch's, or one started for an agent), and otherwise the engine and the
+session, never the author. A `session_discovered` is a person starting the session only when the
+session has no agent and either a `terminal` or no `native_id` yet (the hub's record of a start,
+made before the CLI runs; the runner states every session it finds with its CLI's id): PitCrew
+started it, for the person whose device asked. A session stated again (the start recorded, then
+its terminal, then its transcript adopted) is one start: clients show its first statement.
+
+**Order.** Clients show activity in the order things happened (`at`, newest first), not in log
+order: importing history appends old events late. The order holds within what a client has
+loaded: `GET /v1/events` pages by revision, so an old event appended late can arrive on a newer
+page than its time suggests. A time ahead of the client's clock (a machine whose clock runs fast)
+counts as now, so it cannot hold the top. `session_updated` carries `title`, `branch`
+and `model` when the runner sees them change after the session's discovery.
+
 Folder/branch linking uses this machine's workstream locations: the deepest containing folder
 wins, a matching branch wins at equal depth, and a tie between workstreams links neither.
 `dispatch`, `claimed`, `manual`, and `imported` are firm links: folder/branch inference and a
@@ -548,6 +597,9 @@ Both need a device token, like the activity log they summarise. The types are in
   "tool_receipts": Receipt[], "turn_receipts": Receipt[] }`.
   - `id` is its first event's id and `last` its last's; `start` and `end` are the times of its
     earliest and latest events.
+  - `agent` is the session's agent. A session that runs as no agent has none, and its prose
+    names the session itself ("Claude · its title"), as "Who did it" under "Sessions" says; a
+    start a person made from PitCrew is theirs.
   - `BlockKey` is `{ "kind": "session" | "workstream" | "project", "id" }`.
   - `Counts` has `events`, `tools_run`, `tools_failed`, `file_edits`, `lines_added`,
     `lines_removed`, `turns`, `asks_raised`, `asks_answered`, `task_moves` and `comments`.
@@ -695,20 +747,39 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   - `ScanCounts`: `{ "sessions", "subagent_sessions", "by_engine": [{ "engine", "count" }],
     "by_home": [{ "engine", "home", "count" }], "by_folder": [{ "path", "count" }],
     "by_month": [{ "month", "count" }], "first_activity"?, "last_activity"? }`. The `by_` lists
-    count ordinary sessions; sub-agent sessions are counted once, in `subagent_sessions`.
+    count ordinary sessions; sub-agent sessions are counted once, in `subagent_sessions`. A
+    sub-agent counts as one only when its parent was found in the same home (Claude's
+    `subagents/` folder or `isSidechain` records naming its `sessionId`, Codex's
+    `source.subagent.thread_spawn.parent_thread_id`, OpenCode's `parent_id`); one whose parent is
+    not found is an ordinary session, as the hub shows it (see "Sessions"). So `sessions` and
+    `subagent_sessions` are what importing everything shows.
     Sessions without a working directory are omitted from `by_folder`; sessions without a
     start time are omitted from `by_month`, so either list may sum to less than `sessions`.
     `by_folder` is busiest first, `by_month` (`YYYY-MM`, UTC) most recent first.
   - `Suggestion`, a suggested project: `{ "id", "name", "path", "is_git", "session_count",
     "recent_30d", "recent_90d", "workstreams": WorkstreamSuggestion[] }`. `path` is a repository
-    root (the nearest folder with a `.git`), or a folder shared by several sessions' folders that
-    have none; never the person's home, an agent home or a system folder. `id` is the path, stable
-    across scans. Most recently active first: sessions in the last 30 days, then 90, then all.
-  - `WorkstreamSuggestion`: `{ "id", "name", "branch"?, "session_count", "recent_30d",
-    "recent_90d" }`. Either a first-level sub-folder of the project with sessions in it (no
-    `branch`; `id` is the folder's own path, which is also where it is), or a branch other than
-    `main`, `master`, `trunk`, `develop` and `HEAD` (with `branch`; `id` is
-    `<project path>#<branch>`, and it is the project's `path` on that branch).
+    root, or a folder shared by several sessions' folders that have none; never the person's
+    home, an agent home or a system folder. The root of a folder in a **linked worktree** (its
+    `.git` is a file whose `gitdir:` names a folder with a `commondir`) is its repository's main
+    worktree (the folder holding the common `.git`), so a repository and all its worktrees,
+    `.claude/worktrees/*` included, are **one** project. A `.git` file without a `commondir` (a
+    submodule) is a repository of its own. `id` is the path, stable across scans. Most recently
+    active first: sessions in the last 30 days, then 90, then all.
+  - `WorkstreamSuggestion`: `{ "id", "kind", "name", "branch"?, "session_count", "recent_30d",
+    "recent_90d" }`, where `kind` is one of:
+    - `main`: the project's **default workstream**, first in every project's list (even with no
+      sessions of its own): the main checkout of a repository (named after the branch checked
+      out there, else after the folder) or the root of a folder without git (named `Main`). `id`
+      is the project's `path`, which is also where it is. Sessions in the main checkout count
+      toward it.
+    - `worktree`: a linked worktree with sessions in it, named after the branch checked out there
+      (else after its folder). `id` is the worktree's folder, which is also where it is. Its
+      sessions count toward it only (no sub-folder or branch suggestion comes from them).
+    - `folder`: a first-level sub-folder of the main checkout with sessions in it (no `branch`;
+      `id` is the folder's own path, which is also where it is).
+    - `branch`: a branch of the main checkout other than `main`, `master`, `trunk`, `develop`,
+      `HEAD` and the main checkout's own (with `branch`; `id` is `<project path>#<branch>`, and it
+      is the project's `path` on that branch).
   - `partial`, when true, means cancellation or the budget stopped the scan early. Absent means
     false, for compatibility with older servers.
   - `unreadable` counts homes, folders and transcripts skipped because they could not be read;
@@ -718,7 +789,10 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
 - **Privacy.** The report names the person's folders and branches. It goes only to the device
   token that asked, and is kept nowhere; an agent token gets `403`.
 - **Creating from a scan** is `POST /v1/projects` (`root` at the suggestion's `path`) and
-  `POST /v1/workstreams` (one location per suggested workstream, as above).
+  `POST /v1/workstreams` (one location per suggested workstream, as above). A client always
+  creates a project's `main` workstream with it, so every session found under the project is
+  linked by folder (the deepest location wins: a worktree's session goes to the worktree's
+  workstream, a root session to the default one) and none is left unsorted.
 - **Why not `/v1/stream`.** The stream is the workspace's shared feed: every device connected
   receives every frame, and a scan's paths are one person's. The answer also keeps the progress,
   the result and its failure together, and closing it is how a client stops listening.
@@ -814,8 +888,9 @@ agents, and sign in to each agent CLI with the CLI's own login. The types are in
 
 ### Session import (device tokens only)
 
-- `POST /v1/import/dry-run` accepts `ImportFilter` and returns `{ "count": N }`.
-- `PUT /v1/import` accepts the same filter, stores it durably, and returns `{ "imported": N }`.
+- `POST /v1/import/dry-run` accepts `ImportFilter` and returns `{ "count": N, "subagents": M }`.
+- `PUT /v1/import` accepts the same filter, stores it durably, and returns
+  `{ "imported": N, "subagents": M }`.
 - `GET /v1/import` returns `{ "filter": ImportFilter, "committed_at": <milliseconds or null> }`.
   Settings may change the choice with the same PUT; no re-scan is required.
 - `ImportFilter` has `mode: "all" | "filtered" | "none"`, optional `since` (`YYYY-MM-DD`,
@@ -827,7 +902,14 @@ agents, and sign in to each agent CLI with the CLI's own login. The types are in
 - All includes every indexed session. None means start fresh: sessions with `started` strictly
   after the commit time are included. Its dry run evaluates a prospective boundary at request time (normally zero). PUT counts at its commit boundary.
   Recommitting none establishes a new boundary. Before the first commit the default is all.
-- Counts include sub-agent sessions and describe indexed sessions, not a fresh filesystem scan.
+- `count` and `imported` leave sub-agent sessions (those nested under the top of their chain of
+  parents, as "What a session says about itself" defines it) out: they come with their parents,
+  and are counted in `subagents`. A sub-agent is included exactly when the top of its chain is,
+  whatever its own start, engine or folder, in session lists (`GET /v1/sessions`) as in counts
+  and reads. One naming a session the hub does not have, or in a loop, is judged and counted as a
+  session of its own. So importing everything after a scan shows the
+  scan's `sessions` and `subagent_sessions`. Counts describe indexed sessions, not a fresh
+  filesystem scan.
   A dry run and commit agree if no session was indexed between the requests. Later sessions obey
   the stored rules automatically. Excluding never deletes events or transcripts, moves or copies
   files, or stops the runner reading them. Widening the filter restores history immediately.

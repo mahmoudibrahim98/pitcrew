@@ -621,29 +621,29 @@ fn the_names_version_moves_when_prose_may_read_differently() {
     dir.add_member(&member(1, "@a2"));
     assert_eq!(v(&dir), 1);
     assert_eq!(dir.handle(a.id), Some("@a2"));
-    // Sessions are never named in prose: dropping one changes nothing written.
+    // A session that runs as no agent is named in prose by itself: dropping one moves it too.
     for n in 0..3 {
         dir.add_session(&session(new_session(n), a.id, None, None));
     }
-    assert_eq!(v(&dir), 1);
+    assert_eq!(v(&dir), 2);
     // A third member drops the one used longest ago (@b): prose that named it now says
     // "someone".
     dir.add_member(&c);
-    assert_eq!(v(&dir), 2);
+    assert_eq!(v(&dir), 3);
     assert_eq!(dir.handle(b.id), None);
     // Once a member was dropped, any member learned may be one dropped before.
     dir.add_member(&b);
-    assert_eq!(v(&dir), 3);
+    assert_eq!(v(&dir), 4);
 
     // Asks: what an answer says.
     let id = AskId(Ulid::from(9u128));
     dir.add_ask(&ask(id, AskKind::Question, a.id));
     assert_eq!(dir.ask(id), Some((AskKind::Question, a.id)));
-    assert_eq!(v(&dir), 3);
-    dir.add_ask(&ask(id, AskKind::Question, a.id));
-    assert_eq!(v(&dir), 3);
-    dir.add_ask(&ask(id, AskKind::Decision, a.id));
     assert_eq!(v(&dir), 4);
+    dir.add_ask(&ask(id, AskKind::Question, a.id));
+    assert_eq!(v(&dir), 4);
+    dir.add_ask(&ask(id, AskKind::Decision, a.id));
+    assert_eq!(v(&dir), 5);
     assert_eq!(dir.ask(AskId(Ulid::from(10u128))), None);
 
     // Tasks and workstreams, renamed by events.

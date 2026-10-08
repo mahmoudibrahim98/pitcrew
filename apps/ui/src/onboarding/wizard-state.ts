@@ -40,6 +40,11 @@ export interface CreateWorkstreamDraft {
   name: string;
   projectId: string;
   sessionCount: number;
+  /**
+   * The project's default workstream (at its root): always created with its project, in it, so
+   * sessions at the root are linked. It cannot be unticked or moved.
+   */
+  main?: boolean;
 }
 
 export type StepStatus = 'idle' | 'running' | 'done' | 'error';
@@ -167,6 +172,7 @@ export function draftsFromScan(result: ScanResult): {
         name: w.name,
         projectId: p.id,
         sessionCount: w.sessionCount,
+        ...(w.kind === 'main' ? { main: true } : {}),
       })),
     ),
   };

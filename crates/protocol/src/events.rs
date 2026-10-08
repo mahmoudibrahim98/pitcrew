@@ -175,6 +175,10 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(optional))]
         branch: Option<String>,
+        /// New model, if the transcript records another one (or its first).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        model: Option<String>,
     },
     /// A session was linked to a workstream or task.
     SessionLinked {

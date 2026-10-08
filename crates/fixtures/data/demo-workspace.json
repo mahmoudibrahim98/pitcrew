@@ -366,6 +366,21 @@
       "state": "ended",
       "started": 1790672400000,
       "last_activity": 1790677200000
+    },
+    {
+      "id": "01JB000000000000000SES0007",
+      "engine": "codex",
+      "native_id": "0199d3a0-5b1c-7e2f-8a4d-6c7b8e9f0a1b",
+      "machine": "01JB000000000000000MCH0002",
+      "cwd": "/scratch/sam/diffusion-runs",
+      "branch": "main",
+      "title": "Check the seed 3 loss curve",
+      "workstream": "01JB000000000000000WST0002",
+      "link_basis": "folder",
+      "state": "ended",
+      "started": 1790753400000,
+      "last_activity": 1790754300000,
+      "parent": "01JB000000000000000SES0002"
     }
   ],
   "dispatches": [

@@ -402,6 +402,7 @@ impl WorkService {
                 last_activity: now,
                 terminal: None,
                 parent: None,
+                recorded: None,
             };
             let mut events = Vec::with_capacity(3);
             if task.assignee.is_none() {
@@ -760,6 +761,7 @@ impl WorkService {
             last_activity: now,
             terminal: None,
             parent: None,
+            recorded: None,
         };
         self.append(&[self.by(
             caller,

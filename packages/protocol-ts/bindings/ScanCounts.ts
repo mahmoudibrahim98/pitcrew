@@ -9,14 +9,19 @@ import type { MonthCount } from "./MonthCount.ts";
  * only: a sub-agent session shares its parent's folder and month, so folding it in would double
  * those buckets without adding information. Sub-agent sessions are counted once, separately, in
  * `subagent_sessions`.
+ *
+ * A sub-agent counts as one only when its parent session was found too (in the same home), since
+ * it is shown nested under its parent: one whose transcript names no parent, or a parent the scan
+ * did not find, is shown as a session of its own, and counted as one. So these counts are what an
+ * import shows.
  */
 export type ScanCounts = { 
 /**
- * Ordinary (non-sub-agent) sessions found.
+ * Ordinary sessions found: sessions, and sub-agents whose parent was not found.
  */
 sessions: number, 
 /**
- * Sub-agent sessions found, counted separately.
+ * Sub-agent sessions found with their parent, counted separately.
  */
 subagent_sessions: number, 
 /**

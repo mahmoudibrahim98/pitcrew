@@ -43,7 +43,7 @@ use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MachineId, MemberId, SessionId, TerminalId, WorkspaceId};
-use pitcrew_protocol::model::{Engine, LinkBasis, Session, SessionState, TimestampMs};
+use pitcrew_protocol::model::{Engine, LinkBasis, Recorded, Session, SessionState, TimestampMs};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -520,6 +520,9 @@ struct Home {
     next_rediscover: Instant,
     /// Discovery is failing; warned once until it works again.
     discover_failing: bool,
+    /// How its sessions name their account (`Session::account`): the configured folder, with
+    /// `~` for the user's home.
+    account: String,
 }
 
 impl Home {
@@ -897,6 +900,7 @@ impl Watcher {
             }
             let mut home = Home {
                 engine: h.engine,
+                account: account_label(&h.path, user_home().as_deref()),
                 configured: h.path,
                 path,
                 adapter: Arc::clone(adapter),
@@ -993,8 +997,134 @@ impl Watcher {
             self.serve_due()?;
             self.check(id)?;
         }
+        self.reparent()?;
         let all: Vec<usize> = (0..self.homes.len()).collect();
         self.rediscover(&all, true)
+    }
+
+    /// Sub-agents stated with no parent before the runner kept the parents their transcripts name
+    /// (Codex's, OpenCode's, Claude's older top-level sidechains; migration 0006 lists them): once
+    /// each, at start, the head is read again as the machine scan reads it
+    /// (`SourceAdapter::lineage`), the parent is looked up as at discovery, and a sub-agent that
+    /// has one is stated again (`session_discovered`, with an id of its own, `Cause::Lineage`),
+    /// so the hub nests it. Nothing is read again from the start of a transcript.
+    ///
+    /// One leaves the list once that is settled: no parent found, or, at a later start, the
+    /// re-statement saved with its row (a crash before that states it again, with the same id). A
+    /// lookup that fails now is tried at the next start.
+    fn reparent(&mut self) -> Result<(), Hangup> {
+        let pending = match self.store_lock().lineage_pending() {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot list the sub-agents whose parents are to be looked up; tried at the next start");
+                return Ok(());
+            }
+        };
+        for session in pending {
+            if self.shared.stopping() {
+                return Err(Hangup);
+            }
+            let Some(id) = self.by_session.get(&session).copied() else {
+                continue;
+            };
+            if self.reparent_one(id)?
+                && let Err(e) = self.store_lock().lineage_done(session)
+            {
+                tracing::warn!(%session, error = %e, "cannot mark a sub-agent's parent as looked up; looked up again at the next start");
+            }
+        }
+        Ok(())
+    }
+
+    /// One sub-agent of [`Self::reparent`]: whether it is settled.
+    fn reparent_one(&mut self, id: u64) -> Result<bool, Hangup> {
+        let (workspace, owner, machine) = (self.workspace, self.owner, self.machine);
+        if !self.load(id) {
+            return Ok(false);
+        }
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return Ok(false);
+        };
+        let (engine, path, home) = (t.engine, Arc::clone(&t.path), t.home);
+        let inner = t.inner_id.clone();
+        let Some(row) = t.row() else {
+            return Ok(false);
+        };
+        match row.facts.parent {
+            // Stated again at an earlier start, and saved.
+            Some(Parent::Session(_)) => return Ok(true),
+            Some(Parent::None) | None => {}
+        }
+        let tref = TranscriptRef {
+            engine,
+            path: path.to_path_buf(),
+            inner_id: inner.as_deref().map(str::to_owned),
+            size: 0,
+            modified: 0,
+        };
+        let adapter = Arc::clone(&self.homes[home].adapter);
+        let named = match guard(|| adapter.lineage(&tref)) {
+            Ok(lineage) => lineage.and_then(|l| l.parent),
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, "cannot read a sub-agent's head; its parent is looked up at the next start");
+                return Ok(false);
+            }
+        };
+        let Ok(parent) = self.parent_of(engine, &path, inner.as_deref(), named.as_deref(), home)
+        else {
+            return Ok(false);
+        };
+        let account = self.homes.get(home).map(|h| h.account.clone());
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return Ok(false);
+        };
+        let Some(l) = t.loaded.as_deref_mut() else {
+            return Ok(false);
+        };
+        let row = &mut l.row;
+        row.facts.parent = Some(parent);
+        if let Some(meta) = &mut row.meta
+            && meta.parent.is_none()
+        {
+            meta.parent.clone_from(&named);
+        }
+        let Parent::Session(found) = parent else {
+            // No parent: nothing to state.
+            l.dirty = true;
+            t.sync();
+            return Ok(true);
+        };
+        let session = row.session;
+        let mut s = session_of(row, row.mtime, machine, Some(found), None, account);
+        // Its own folder or branch link, which a re-statement without one would clear.
+        if let Some(linked) = row.facts.linked {
+            s.workstream = Some(linked.workstream);
+            s.link_basis = Some(linked.basis);
+        }
+        let event = Event {
+            id: event_id(
+                session,
+                row.generation,
+                Cause::Lineage,
+                0,
+                discovered_id_time(row),
+            ),
+            at: s.started,
+            workspace,
+            author: owner,
+            on_behalf_of: None,
+            body: EventBody::SessionDiscovered { session: s },
+        };
+        tracing::info!(%session, parent = %found, "a sub-agent indexed before parents were kept now names its parent");
+        let commit = Commit::Full(Box::new(row.clone()));
+        let unsaved = Some(l.sending());
+        t.sync();
+        self.send(Batch {
+            events: vec![event],
+            commit,
+            unsaved,
+        })?;
+        Ok(false)
     }
 
     /// A stored path whose canonical form changed (a folder above it became a symlink) moves to
@@ -2015,12 +2145,14 @@ impl Watcher {
             return Ok(());
         };
         let (path, home) = (Arc::clone(&t.path), t.home);
+        let account = self.homes.get(home).map(|h| h.account.clone());
         let Some(row) = t.row() else {
             return Ok(());
         };
         let mut session = row.session;
         let place = |row: &Row| row.meta.as_ref().map(|m| (m.cwd.clone(), m.branch.clone()));
         let was = place(row);
+        let was_stated = stated(row);
         if let Some(meta) = chunk.meta {
             row.meta = Some(meta);
         }
@@ -2030,6 +2162,8 @@ impl Watcher {
         let engine = row.engine;
         let native = native_id(row);
         let subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
+        let named_parent = row.meta.as_ref().and_then(|m| m.parent.clone());
+        let inner_id = row.inner_id.clone();
         let started = row.meta.as_ref().and_then(|m| m.started);
 
         // The terminal the runner started a new session in, claimed before anything names the
@@ -2084,7 +2218,13 @@ impl Watcher {
         // and workstream locations.
         let (parent, held) = if first {
             let parent = if subagent {
-                self.parent_of(engine, &path, home)
+                self.parent_of(
+                    engine,
+                    &path,
+                    inner_id.as_deref(),
+                    named_parent.as_deref(),
+                    home,
+                )
             } else {
                 Ok(Parent::None)
             };
@@ -2137,7 +2277,7 @@ impl Watcher {
                 derive::expire(&mut row.facts, st.mtime, live, crate::now_ms());
             }
             let ended = changed && row.facts.state == SessionState::Ended;
-            let s = session_of(row, st.mtime, machine, parent, terminal);
+            let s = session_of(row, st.mtime, machine, parent, terminal, account.clone());
             let at = discovered_id_time(row);
             events.push((
                 None,
@@ -2161,6 +2301,25 @@ impl Watcher {
                 ));
             }
             row.discovered = true;
+        } else if let Some(update) = updated(&was_stated, &stated(row)) {
+            // What the session says about itself changed since it was stated: its title, branch
+            // or model. Timed by its activity, so a replay after a crash repeats the id.
+            row.facts.updates += 1;
+            let at = row.facts.last_activity;
+            let n = row.facts.updates;
+            events.push((
+                None,
+                event(
+                    event_id(session, row.generation, Cause::Update(n), 0, at),
+                    at,
+                    EventBody::SessionUpdated {
+                        session,
+                        title: update.title,
+                        branch: update.branch,
+                        model: update.model,
+                    },
+                ),
+            ));
         }
         if let Some((locations, stands)) = &places {
             let at = if first {
@@ -2296,7 +2455,17 @@ impl Watcher {
             return Ok(Parent::None);
         }
         let (engine, path, home) = (t.engine, Arc::clone(&t.path), t.home);
-        let parent = self.parent_of(engine, &path, home)?;
+        let inner = t.inner_id.clone();
+        // The parent the transcript names, from its row's metadata.
+        let named = if self.load(id) {
+            self.tracked
+                .get_mut(&id)
+                .and_then(Tracked::row)
+                .and_then(|row| row.meta.as_ref()?.parent.clone())
+        } else {
+            None
+        };
+        let parent = self.parent_of(engine, &path, inner.as_deref(), named.as_deref(), home)?;
         if let Some(t) = self.tracked.get_mut(&id) {
             // Saved with the row's next change (see `load`).
             t.parent = Some(parent);
@@ -2499,43 +2668,128 @@ impl Watcher {
         Ok(())
     }
 
-    /// For a Claude sub-agent's transcript (at `path`, canonical, in home `home`), its parent's
-    /// session. The parent's transcript must be a regular file, not a link, inside the same home
-    /// (see [`parent_file`]); otherwise the sub-agent has no parent. A parent not indexed yet
-    /// gets its session id now, which its discovery then keeps. An index or I/O error is a failed
-    /// lookup, never "no parent".
-    fn parent_of(&self, engine: Engine, path: &Path, home: usize) -> Result<Parent, LookupFailed> {
-        let Some(parent) = parent_transcript(path) else {
-            return Ok(Parent::None);
-        };
-        match parent_file(&parent, path, &self.homes[home].path) {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::debug!(path = %parent.display(), "a sub-agent's parent is not a plain file in its home; it has no parent");
-                return Ok(Parent::None);
+    /// The parent of a sub-agent at `path` (in home `home`), as its transcript names it
+    /// (`named`, the parent's CLI id):
+    /// - **Claude**: `<session>.jsonl` beside its `<session>/subagents/` folder, or, for an older
+    ///   top-level sidechain transcript, `<named>.jsonl` in its own folder;
+    /// - **OpenCode**: the session `named` in the same store;
+    /// - **Codex**: the rollout whose id is `named`, among the transcripts tracked in the same home,
+    ///   else in the sub-agent's own day folder.
+    ///
+    /// A parent transcript found on disk but not tracked yet gets its row now, so its session id is
+    /// the one the sub-agent names. A file that is not there, or not a plain file inside the home,
+    /// is no parent: the sub-agent then has none.
+    fn parent_of(
+        &self,
+        engine: Engine,
+        path: &Path,
+        inner_id: Option<&str>,
+        named: Option<&str>,
+        home: usize,
+    ) -> Result<Parent, LookupFailed> {
+        match engine {
+            Engine::Claude => {
+                let parent = parent_transcript(path)
+                    .or_else(|| named.and_then(|n| sibling_transcript(path, n, "jsonl")));
+                match parent {
+                    Some(parent) => self.parent_at(engine, path, &parent, None, home),
+                    None => Ok(Parent::None),
+                }
             }
-            Err(e) => {
-                tracing::warn!(path = %parent.display(), error = %e, "cannot look at a sub-agent's parent; its hooks are refused for now");
-                return Err(LookupFailed);
+            Engine::OpenCode => match (named, inner_id) {
+                (Some(named), Some(own)) if named != own && plain_id(named) => {
+                    self.parent_at(engine, path, path, Some(named), home)
+                }
+                _ => Ok(Parent::None),
+            },
+            Engine::Codex => {
+                let Some(named) = named.filter(|n| plain_id(n)) else {
+                    return Ok(Parent::None);
+                };
+                if let Some(session) = self.tracked_codex(named, home) {
+                    return Ok(Parent::Session(session));
+                }
+                match codex_rollout_beside(path, named) {
+                    Some(parent) => self.parent_at(engine, path, &parent, None, home),
+                    None => Ok(Parent::None),
+                }
+            }
+            _ => Ok(Parent::None),
+        }
+    }
+
+    /// The session of a Codex transcript tracked in home `home` whose id is `native`: one already
+    /// read, by its id, or one discovered but not read yet, by its file name
+    /// (`rollout-<time>-<id>.jsonl`).
+    fn tracked_codex(&self, native: &str, home: usize) -> Option<SessionId> {
+        let key = (Engine::Codex, Box::<str>::from(native));
+        if let Some(t) = self.by_native.get(&key).and_then(|id| self.tracked.get(id))
+            && t.home == home
+        {
+            return Some(t.session);
+        }
+        self.tracked
+            .values()
+            .find(|t| {
+                t.engine == Engine::Codex
+                    && t.home == home
+                    && t.inner_id.is_none()
+                    && t.path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|stem| names_rollout(stem, native))
+            })
+            .map(|t| t.session)
+    }
+
+    /// The session of the parent transcript at `parent` (an OpenCode store and `inner`, the
+    /// session in it), for the sub-agent at `child`: tracked, indexed, or indexed now.
+    fn parent_at(
+        &self,
+        engine: Engine,
+        child: &Path,
+        parent: &Path,
+        inner: Option<&str>,
+        home: usize,
+    ) -> Result<Parent, LookupFailed> {
+        // A session in the sub-agent's own store is the same file: it needs no other check.
+        if inner.is_none() {
+            match parent_file(parent, child, &self.homes[home].path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(path = %parent.display(), "a sub-agent's parent is not a plain file in its home; it has no parent");
+                    return Ok(Parent::None);
+                }
+                Err(e) => {
+                    tracing::warn!(path = %parent.display(), error = %e, "cannot look at a sub-agent's parent; its hooks are refused for now");
+                    return Err(LookupFailed);
+                }
             }
         }
         if let Some(t) = self
             .by_key
-            .get(&key(&parent, None))
+            .get(&key(parent, inner))
             .and_then(|id| self.tracked.get(id))
         {
             return Ok(Parent::Session(t.session));
         }
-        let found = self.store_lock().find(&parent, None);
+        let found = self.store_lock().find(parent, inner);
         match found {
             Ok(Some(row)) => Ok(Parent::Session(row.session)),
             Ok(None) => {
+                // A session a child names in its own store is indexed only if the store holds it.
+                if let Some(inner) = inner
+                    && !self.in_store(engine, parent, inner, home)?
+                {
+                    tracing::debug!(path = %parent.display(), "a sub-agent names a session its store does not hold; it has no parent");
+                    return Ok(Parent::None);
+                }
                 // A parent started for a session the hub named is that session already.
-                let named = self.named_session(engine, &parent, None);
+                let named = self.named_session(engine, parent, inner);
                 let mut row = new_row(&TranscriptRef {
                     engine,
-                    path: parent,
-                    inner_id: None,
+                    path: parent.to_path_buf(),
+                    inner_id: inner.map(str::to_owned),
                     size: 0,
                     modified: 0,
                 });
@@ -2553,6 +2807,32 @@ impl Watcher {
             }
             Err(e) => {
                 tracing::warn!(path = %parent.display(), error = %e, "cannot look up a sub-agent's parent; its hooks are refused for now");
+                Err(LookupFailed)
+            }
+        }
+    }
+
+    /// Whether the store at `path` (home `home`) holds session `inner`, as its adapter's
+    /// `lineage` tells: an adapter that cannot tell holds none.
+    fn in_store(
+        &self,
+        engine: Engine,
+        path: &Path,
+        inner: &str,
+        home: usize,
+    ) -> Result<bool, LookupFailed> {
+        let tref = TranscriptRef {
+            engine,
+            path: path.to_path_buf(),
+            inner_id: Some(inner.to_owned()),
+            size: 0,
+            modified: 0,
+        };
+        let adapter = Arc::clone(&self.homes[home].adapter);
+        match guard(|| adapter.lineage(&tref)) {
+            Ok(found) => Ok(found.is_some()),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "cannot look for a sub-agent's parent in its store; its hooks are refused for now");
                 Err(LookupFailed)
             }
         }
@@ -2884,6 +3164,11 @@ enum Cause {
     Report(u32),
     /// The n-th link.
     Link(u32),
+    /// The n-th change to what the session says about itself (`session_updated`).
+    Update(u32),
+    /// A sub-agent stated again with the parent its transcript names, once, after an upgrade
+    /// (`Watcher::reparent`).
+    Lineage,
 }
 
 /// A ULID whose time is the event's and whose random part is a hash of what caused it, so an
@@ -2912,6 +3197,11 @@ fn event_id(
             h.update([3]);
             h.update(n.to_le_bytes());
         }
+        Cause::Update(n) => {
+            h.update([4]);
+            h.update(n.to_le_bytes());
+        }
+        Cause::Lineage => h.update([5]),
     }
     h.update(seq.to_le_bytes());
     let digest = h.finalize();
@@ -2939,6 +3229,7 @@ fn session_of(
     machine: MachineId,
     parent: Option<SessionId>,
     terminal: Option<TerminalId>,
+    account: Option<String>,
 ) -> Session {
     let meta = row.meta.clone().unwrap_or_default();
     let last_activity = if row.facts.last_activity > 0 {
@@ -2964,7 +3255,38 @@ fn session_of(
         last_activity,
         terminal,
         parent,
+        recorded: Recorded::of(meta.model, account),
     }
+}
+
+/// What a session says about itself that `session_updated` carries: its title, branch and model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Stated {
+    title: Option<String>,
+    branch: Option<String>,
+    model: Option<String>,
+}
+
+fn stated(row: &Row) -> Stated {
+    row.meta.as_ref().map_or_else(Stated::default, |m| Stated {
+        title: m.title.clone(),
+        branch: m.branch.clone(),
+        model: m.model.clone(),
+    })
+}
+
+/// The values that changed from `was` to `now`, if any did. A value that went away is not a
+/// change (`session_updated` cannot clear one).
+fn updated(was: &Stated, now: &Stated) -> Option<Stated> {
+    let changed = |was: &Option<String>, now: &Option<String>| {
+        now.as_ref().filter(|n| was.as_ref() != Some(*n)).cloned()
+    };
+    let update = Stated {
+        title: changed(&was.title, &now.title),
+        branch: changed(&was.branch, &now.branch),
+        model: changed(&was.model, &now.model),
+    };
+    (update != Stated::default()).then_some(update)
 }
 
 /// A sub-agent's parent could not be looked up (the index or the filesystem failed). Its hooks
@@ -3000,6 +3322,44 @@ fn transcript_key(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// The user's home folder, where `~` points: `USERPROFILE` first on Windows, else `HOME` (as the
+/// agents find their homes).
+fn user_home() -> Option<PathBuf> {
+    let names: [&str; 2] = if cfg!(windows) {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    names
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .find(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// An account home as a session names it: `~` and the rest when it is inside `user` (spelled as
+/// configured, or after resolving links on both sides), else the whole path.
+fn account_label(home: &Path, user: Option<&Path>) -> String {
+    let inside = |home: &Path, user: &Path| {
+        home.strip_prefix(user).ok().map(|rest| {
+            if rest.as_os_str().is_empty() {
+                PathBuf::from("~")
+            } else {
+                Path::new("~").join(rest)
+            }
+        })
+    };
+    user.and_then(|user| {
+        inside(home, user).or_else(|| {
+            let (home, user) = (home.canonicalize().ok()?, user.canonicalize().ok()?);
+            inside(&home, &user)
+        })
+    })
+    .unwrap_or_else(|| home.to_path_buf())
+    .to_string_lossy()
+    .into_owned()
+}
+
 /// Whether `parent`, the transcript a sub-agent at `child` names as its parent, may be taken as
 /// one: a regular file (a link is not followed), inside `home`, and not the sub-agent itself.
 /// `child` is canonical, so the folders above `parent` are real ones; only its last part could
@@ -3013,6 +3373,42 @@ fn parent_file(parent: &Path, child: &Path, home: &Path) -> io::Result<bool> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e),
     }
+}
+
+/// Whether `id`, an id a transcript names, can be part of a file name: a plain id (letters,
+/// digits, `-`, `_` and `.`, not starting with `.`), so it never names another folder.
+fn plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// `<named>.<ext>` beside `path`, when `named` is a plain id.
+fn sibling_transcript(path: &Path, named: &str, ext: &str) -> Option<PathBuf> {
+    plain_id(named).then(|| path.with_file_name(format!("{named}.{ext}")))
+}
+
+/// Whether a Codex rollout's file stem (`rollout-<time>-<id>`) is the one of session `id`.
+fn names_rollout(stem: &str, id: &str) -> bool {
+    stem.strip_suffix(id)
+        .is_some_and(|head| head.is_empty() || head.ends_with('-'))
+}
+
+/// Codex session `id`'s rollout in the same folder as `path` (a day folder), if there is one.
+/// Reads the folder's names only; at most a day's sessions.
+fn codex_rollout_beside(path: &Path, id: &str) -> Option<PathBuf> {
+    let folder = path.parent()?;
+    let entries = std::fs::read_dir(folder).ok()?;
+    entries.filter_map(Result::ok).map(|e| e.path()).find(|p| {
+        p != path
+            && p.extension().is_some_and(|e| e == "jsonl")
+            && p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| names_rollout(stem, id))
+    })
 }
 
 /// For a Claude sub-agent transcript `<project>/<session>/subagents/<agent>.jsonl`, its parent's
@@ -3231,6 +3627,81 @@ mod tests {
     }
 
     #[test]
+    fn an_account_is_its_home_with_a_tilde_for_the_users() {
+        let user = Path::new("/home/sam");
+        assert_eq!(
+            account_label(&user.join(".claude"), Some(user)),
+            Path::new("~").join(".claude").to_string_lossy()
+        );
+        assert_eq!(account_label(user, Some(user)), "~");
+        assert_eq!(
+            account_label(Path::new("/srv/claude-work"), Some(user)),
+            Path::new("/srv/claude-work").to_string_lossy()
+        );
+        assert_eq!(
+            account_label(Path::new("/srv/claude-work"), None),
+            Path::new("/srv/claude-work").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn ids_named_by_transcripts_stay_in_their_folder() {
+        assert!(plain_id("0199a000-0000-7000-8000-00000000000a"));
+        assert!(plain_id("ses_f0e99d47fffeKy9Pf34qY6Nb3w"));
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "x y",
+            &"a".repeat(200),
+        ] {
+            assert!(!plain_id(bad), "{bad}");
+        }
+        let child = Path::new("/h/projects/p/agent-1.jsonl");
+        assert_eq!(
+            sibling_transcript(child, "sess-1", "jsonl"),
+            Some(PathBuf::from("/h/projects/p/sess-1.jsonl"))
+        );
+        assert_eq!(sibling_transcript(child, "../sess-1", "jsonl"), None);
+        assert!(names_rollout("rollout-2026-10-01T09-00-00-abc", "abc"));
+        assert!(names_rollout("abc", "abc"));
+        assert!(!names_rollout("rollout-xabc", "abc"));
+        assert!(!names_rollout("rollout-abc-d", "abc"));
+    }
+
+    #[test]
+    fn an_update_carries_what_changed_and_never_clears() {
+        let was = Stated {
+            title: Some("First prompt".into()),
+            branch: Some("main".into()),
+            model: None,
+        };
+        assert_eq!(updated(&was, &was), None);
+        let now = Stated {
+            title: Some("Custom title".into()),
+            branch: None,
+            model: Some("synthetic-model".into()),
+        };
+        assert_eq!(
+            updated(&was, &now),
+            Some(Stated {
+                title: Some("Custom title".into()),
+                branch: None,
+                model: Some("synthetic-model".into()),
+            })
+        );
+        // A value that went away is not an update.
+        let gone = Stated {
+            branch: None,
+            ..was.clone()
+        };
+        assert_eq!(updated(&was, &gone), None);
+    }
+
+    #[test]
     fn event_ids_repeat_for_the_same_origin() {
         let s = SessionId::new();
         let a = event_id(s, 0, Cause::Item(10), 0, 1000);
@@ -3242,6 +3713,10 @@ mod tests {
         assert_ne!(
             event_id(s, 0, Cause::Report(1), 0, 1000),
             event_id(s, 0, Cause::Link(1), 0, 1000)
+        );
+        assert_ne!(
+            event_id(s, 0, Cause::Link(1), 0, 1000),
+            event_id(s, 0, Cause::Update(1), 0, 1000)
         );
         assert_eq!(a.0.timestamp_ms(), 1000);
     }
@@ -4476,6 +4951,7 @@ mod tests {
             next_sweep: now,
             next_rediscover: now,
             discover_failing: false,
+            account: "/h".into(),
         };
         let sweep = Duration::from_secs(30);
         assert_eq!(home.every(sweep), sweep);

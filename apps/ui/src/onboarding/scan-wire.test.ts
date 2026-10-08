@@ -56,11 +56,23 @@ describe('toScanResult', () => {
           name: 'paper',
           path: '/home/sam/work/paper',
           workstreams: [
-            { id: '/home/sam/work/paper/drafts', name: 'drafts', sessionCount: 3 },
-            { id: '/home/sam/work/paper#revision-2', name: 'revision-2', branch: 'revision-2', sessionCount: 1 },
+            { id: '/home/sam/work/paper', kind: 'main', name: 'main', sessionCount: 3 },
+            { id: '/home/sam/work/paper/drafts', kind: 'folder', name: 'drafts', sessionCount: 3 },
+            {
+              id: '/home/sam/work/paper#revision-2',
+              kind: 'branch',
+              name: 'revision-2',
+              branch: 'revision-2',
+              sessionCount: 1,
+            },
           ],
         },
-        { id: '/home/sam/work/tools', name: 'tools', path: '/home/sam/work/tools', workstreams: [] },
+        {
+          id: '/home/sam/work/tools',
+          name: 'tools',
+          path: '/home/sam/work/tools',
+          workstreams: [{ id: '/home/sam/work/tools', kind: 'main', name: 'Main', sessionCount: 2 }],
+        },
       ],
     });
   });

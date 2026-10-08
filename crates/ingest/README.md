@@ -79,11 +79,25 @@ built for onboarding's scan step and "scan again". It is **not** an import: it n
   suggestion directories (including ancestors checked for git roots);
   `budget` defaults to ten minutes. The report has `partial: true` when stopped. In-flight
   discovery or filesystem reads must finish first; these checks cannot interrupt a hung OS call.
-- **Suggestions.** A project is the nearest `.git` ancestor of a `cwd`; cwds with no `.git` above
-  them are grouped under a shared parent once at least two of them share one, else each is its own
-  project. A project's workstreams come from its sessions' first-level sub-folders and non-default
-  branches. Both are ranked by sessions in the last 30 and 90 days. The user's home directory, a
-  scanned engine home, and well-known system folders are never suggested.
+- **Sub-agents.** Each session's facts include its CLI id and, for a sub-agent, the parent it
+  names (`SessionMeta::parent`: Claude's `sessionId` on sidechain records or the folder above
+  `subagents/`, Codex's `source.subagent.thread_spawn.parent_thread_id`, OpenCode's `parent_id`).
+  A sub-agent counts as one (`subagent_sessions`, left out of suggestions) only when its parent
+  was scanned too, in the same home; otherwise it is an ordinary session, as the hub shows it.
+- **Suggestions.** A project is the nearest `.git` ancestor of a `cwd`. A `.git` **file** whose
+  `gitdir:` names a folder with a `commondir` is a linked worktree: its project is the main
+  worktree (the folder holding the common `.git`; for a bare repository, the repository folder),
+  so a repository and its worktrees are one project. Paths are resolved lexically (nothing is
+  followed), at most 4 KiB of each git file is read, and only plain files are (a link is not
+  followed). A `.git` file without a `commondir` (a submodule) is a repository of its own. cwds
+  with no `.git` above them are grouped under a shared parent once at least two of them share
+  one, else each is its own project. A project's workstreams are its default one first (`main`,
+  at its root, named after the main checkout's branch from its `HEAD`, else its sessions' usual
+  branch, else the folder; `Main` without git), one per linked worktree with sessions (named after
+  its branch), then its main-checkout sessions' first-level sub-folders and non-default branches.
+  Projects and the other workstreams are ranked by sessions in the last 30 and 90 days. The
+  user's home directory, a scanned engine home, and well-known system folders are never
+  suggested.
 - **Errors are warnings.** An unreadable home, folder or transcript is skipped and counted in
   `ScanReport::unreadable`; the rest of the scan still runs. Adapters already do not follow
   directory symlinks, so a symlink cycle cannot make the walk hang.

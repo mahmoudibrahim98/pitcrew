@@ -25,8 +25,8 @@ use crate::lines::{Backward, SkipReason};
 use crate::open::open_transcript;
 use crate::text::title;
 use pitcrew_interfaces::source::{
-    Cursor, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptPage,
-    TranscriptRef,
+    Cursor, Lineage, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem,
+    TranscriptPage, TranscriptRef,
 };
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use serde::{Deserialize, Serialize};
@@ -173,6 +173,11 @@ impl SourceAdapter for CodexAdapter {
             at_start,
         })
     }
+
+    /// From the head the machine scan reads: whether it is a sub-agent, and the parent it names.
+    fn lineage(&self, transcript: &TranscriptRef) -> Result<Option<Lineage>, SourceError> {
+        crate::scan::head_lineage(transcript)
+    }
 }
 
 /// Collects `rollout-*.jsonl` files up to `depth` folders down. Symbolic links are not followed,
@@ -231,6 +236,8 @@ struct MetaAcc {
     started: Option<TimestampMs>,
     first_prompt: Option<String>,
     subagent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
 }
 
 impl MetaAcc {
@@ -242,6 +249,7 @@ impl MetaAcc {
         changed |= set_first(&mut self.cwd, f.cwd.as_ref());
         changed |= set_first(&mut self.started, f.timestamp.as_ref());
         changed |= set_first(&mut self.subagent, f.is_subagent.as_ref());
+        changed |= set_first(&mut self.parent, f.parent.as_ref());
         changed |= set_first(&mut self.branch, f.branch.as_ref());
         changed |= set_latest(&mut self.model, f.model.as_ref());
         if self.first_prompt.is_none() {
@@ -260,6 +268,12 @@ impl MetaAcc {
                 .map(|s| id_from_stem(&s.to_string_lossy()).to_owned())
                 .unwrap_or_default()
         });
+        let is_subagent = self.subagent == Some(true);
+        // Only a sub-agent has a parent, and never itself.
+        let parent = self
+            .parent
+            .clone()
+            .filter(|p| is_subagent && *p != native_id);
         SessionMeta {
             native_id,
             cwd: self.cwd.clone(),
@@ -268,13 +282,14 @@ impl MetaAcc {
             title: self.first_prompt.clone(),
             model: self.model.clone(),
             started: self.started,
-            is_subagent: self.subagent == Some(true),
+            is_subagent,
+            parent,
         }
     }
 }
 
 /// The session id at the end of `rollout-<time>-<uuid>`, else the whole stem.
-fn id_from_stem(stem: &str) -> &str {
+pub(crate) fn id_from_stem(stem: &str) -> &str {
     let tail = stem
         .len()
         .checked_sub(36)

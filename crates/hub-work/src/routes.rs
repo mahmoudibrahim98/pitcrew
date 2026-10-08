@@ -552,15 +552,9 @@ async fn list_sessions(Work(w): Work, Person(_): Person, params: Params) -> Repl
         task: params.one("task")?,
         states: params.all("state")?,
     };
+    // A sub-agent is listed exactly when its parent is (api-v1.md, "Session import").
     Ok(Json(
-        blocking(w, move |w| {
-            let choice = w.import_choice();
-            Ok(w.sessions(&filter)?
-                .into_iter()
-                .filter(|s| choice.includes(s))
-                .collect())
-        })
-        .await?,
+        blocking(w, move |w| w.included_sessions(&filter)).await?,
     ))
 }
 
@@ -682,18 +676,14 @@ async fn dry_run_import(
     Person(_): Person,
     Body(filter): Body<pitcrew_protocol::import::ImportFilter>,
 ) -> Reply<pitcrew_protocol::import::ImportDryRun> {
-    Ok(Json(pitcrew_protocol::import::ImportDryRun {
-        count: blocking(w, move |w| w.import_dry_run(filter)).await?,
-    }))
+    Ok(Json(blocking(w, move |w| w.import_dry_run(filter)).await?))
 }
 async fn put_import(
     Work(w): Work,
     Person(_): Person,
     Body(filter): Body<pitcrew_protocol::import::ImportFilter>,
 ) -> Reply<pitcrew_protocol::import::ImportResult> {
-    Ok(Json(pitcrew_protocol::import::ImportResult {
-        imported: blocking(w, move |w| w.commit_import(filter)).await?,
-    }))
+    Ok(Json(blocking(w, move |w| w.commit_import(filter)).await?))
 }
 
 async fn create_persona(
