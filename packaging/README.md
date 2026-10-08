@@ -345,7 +345,7 @@ run programs from, and start PitCrew there. No installer, no administrator, no r
    at the top; a pull request's run has one too). Downloading needs a GitHub sign-in.
 2. Under **Artifacts**, `pitcrew-windows-x64-portable.zip`. It is the zip itself (uploaded with
    `archive: false`), kept for 30 days. Its SHA-256 is in the run's summary, with its files and
-   their sizes, and GitHub shows it as the artifact's digest.
+   their sizes, and in the upload step's log as the artifact's digest.
 3. **Before unzipping, unblock it:** Properties → **Unblock**, or
    `Unblock-File .\pitcrew-windows-x64-portable.zip`. Windows marks downloaded files, Explorer
    passes the mark on to what it unzips, and the app refuses its own programs while they carry it
