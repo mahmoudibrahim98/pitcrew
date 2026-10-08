@@ -580,8 +580,11 @@ pub fn request(
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
     head.push_str("\r\n");
+    // One write, so the request arrives whole: a server that answers from the head alone (a 403
+    // before the body) and closes would otherwise reset the connection when a separately sent body
+    // lands after it closed, and macOS then drops the answer ("Connection reset by peer").
+    head.push_str(&body);
     stream.write_all(head.as_bytes()).unwrap();
-    stream.write_all(body.as_bytes()).unwrap();
 
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).expect("read the response");
