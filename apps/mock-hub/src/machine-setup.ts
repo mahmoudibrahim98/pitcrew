@@ -264,8 +264,8 @@ function finish(setup: Setup, engine: Engine, record: SignInRecord): void {
 }
 
 /**
- * The sign-in whose terminal `ref` is, if any. It opens only for the member who started it: 403
- * for another.
+ * The sign-in whose terminal `ref` is (decoded, bare or `ses_…`), if any. It opens only for the
+ * member who started it: 403 for another.
  */
 export function signInTerminal(
   hub: Hub,
@@ -274,8 +274,10 @@ export function signInTerminal(
 ): { engine: Engine; record: SignInRecord } | undefined {
   const setup = setups.get(hub);
   if (setup === undefined) return undefined;
+  // The terminal's id as the hub reads a session id: bare, or shown with its `ses_` prefix.
+  const bare = ref.startsWith('ses_') ? ref.slice('ses_'.length) : ref;
   for (const [engine, record] of setup.signIns) {
-    if (record.view.terminal !== ref) continue;
+    if (record.view.terminal !== bare) continue;
     if (record.member !== member) {
       throw forbidden('Only the person who started this sign-in can open its terminal.');
     }
