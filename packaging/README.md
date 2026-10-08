@@ -13,7 +13,7 @@ prompt helper), the desktop installers that carry them, with checksums, SBOMs an
 | [`desktop/smoke.sh`](desktop/smoke.sh) | Starts the installed app once in a throwaway home and checks it used its own `pitcrewd` and `pitcrew-askpass` (Linux, macOS). |
 | [`portable/build.sh`](portable/build.sh) | Builds the portable Windows zip, `pitcrew-windows-x64-portable.zip` (see [The portable Windows zip](#the-portable-windows-zip)). |
 | [`portable/smoke.ps1`](portable/smoke.ps1) | Unzips it into a fresh folder on Windows and checks it there, without opening a window. |
-| [`notices.mjs`](notices.mjs) | Writes `THIRD-PARTY-NOTICES.txt`: every crate the programs link and every JavaScript package the window bundles, with their licence texts. |
+| [`notices.mjs`](notices.mjs) | Writes `THIRD-PARTY-NOTICES.txt`: every crate the programs link, the Rust standard library, every JavaScript package and build tool whose code the window bundles, with their licence texts (see [Third-party notices](#third-party-notices)). |
 | [`sha256sums.sh`](sha256sums.sh) | Writes `DIR/SHA256SUMS` over every file in `DIR`. |
 | [`verify.sh`](verify.sh) | Checks `DIR` against its `SHA256SUMS`: every hash matches, and no file is unlisted. |
 | [`sbom.sh`](sbom.sh) | Writes CycloneDX SBOMs: `pitcrewd`, `pitcrew`, `pitcrew-ptyd`, `pitcrew-askpass` and `pitcrew-desktop` (`.cdx.json`). |
@@ -21,7 +21,7 @@ prompt helper), the desktop installers that carry them, with checksums, SBOMs an
 | [`test.sh`](test.sh) | Tests `sha256sums.sh`, `verify.sh`, `sign.sh`, the desktop's staging, `desktop/check.sh` on a stand-in `.deb`, `portable/build.sh` and `notices.mjs` (bash and Node only, no Rust). |
 | [`zig-requirements.txt`](zig-requirements.txt) | Zig from PyPI for `cargo-zigbuild`, pinned by version and wheel hash. |
 | [`../.github/workflows/release.yml`](../.github/workflows/release.yml) | Runs all of the above on a `v*` tag. |
-| [`../.github/workflows/release-portable.yml`](../.github/workflows/release-portable.yml) | Builds, checks and uploads the portable Windows zip: on demand, on every push to `main`, and on pull requests that touch packaging or the desktop. |
+| [`../.github/workflows/release-portable.yml`](../.github/workflows/release-portable.yml) | Builds, checks and uploads the portable Windows zip and its Linux helpers: on demand, on every push to `main`, on pull requests that touch packaging, the desktop, the toolchain or the lockfile, and from `release.yml` for a tag. |
 
 ## The static helper
 
@@ -341,32 +341,44 @@ run programs from, and start PitCrew there. No installer, no administrator, no r
 
 ### Getting it
 
-1. On GitHub, **Actions → Portable Windows zip**, filtered to successful pushes to `main`
-   ([this query](https://github.com/mahmoudibrahim98/pitcrew/actions/workflows/release-portable.yml?query=branch%3Amain+event%3Apush+is%3Asuccess);
-   `branch:main` alone also lists pull requests whose head branch is named `main`, a fork's
-   included), and the newest run. Pull requests from this repository's branches carry a zip too,
-   for review; a fork's pull request builds and checks one but uploads nothing. Downloading needs
-   a GitHub sign-in.
-2. Under **Artifacts**, `pitcrew-windows-x64-portable.zip`. It is the zip itself (uploaded with
-   `archive: false`), kept for 30 days. Its SHA-256 is in the run's summary, with its files and
-   their sizes, and in the upload step's log as the artifact's digest.
-3. **Before unzipping, unblock it:** Properties → **Unblock**, or
-   `Unblock-File .\pitcrew-windows-x64-portable.zip`. Windows marks downloaded files, Explorer
-   passes the mark on to what it unzips, and the app refuses its own programs while they carry it
-   (`Zone.Identifier`, see "What the app's trust check needs").
-4. Unzip into a folder of its own, and start `pitcrew-desktop.exe`.
+- **A release** (a `v*` tag): `pitcrew-windows-x64-portable.zip` is attached to the release, next
+  to the installers, and listed in its `SHA256SUMS` and provenance attestation. Its app is on the
+  **release channel**: it says when a newer release is out and opens that release's page.
+- **A development build** from `main`: **Actions → Portable Windows zip**, filtered to successful
+  pushes to `main`
+  ([this query](https://github.com/mahmoudibrahim98/pitcrew/actions/workflows/release-portable.yml?query=branch%3Amain+event%3Apush+is%3Asuccess);
+  `branch:main` alone also lists pull requests whose head branch is named `main`, a fork's
+  included), the newest run, and under **Artifacts** `pitcrew-windows-x64-portable.zip`. It is the
+  zip itself (uploaded with `archive: false`), kept for 30 days, and downloading it needs a GitHub
+  sign-in. Its SHA-256 is in the run's summary, with its files and their sizes, and in the upload
+  step's log as the artifact's digest. Its app is a **development build**: it offers no updates.
+  Pull requests from this repository's branches carry a zip too, for review; a fork's pull
+  request builds and checks one but uploads nothing.
+
+Then:
+
+1. **Before unzipping, unblock it:** Properties → **Unblock**, or
+   `Unblock-File .\pitcrew-windows-x64-portable.zip` (already unzipped: `Get-ChildItem -Recurse |
+   Unblock-File` in the folder). Windows marks downloaded files, Explorer passes the mark on to
+   what it unzips, and the app refuses its own programs while they carry it (`Zone.Identifier`,
+   see "What the app's trust check needs"); its message then mentions the installer.
+2. Unzip into a folder of its own, and start `pitcrew-desktop.exe`.
+3. **To update**, quit PitCrew and unzip the new zip over the same folder. The agent hooks PitCrew
+   installs run `pitcrew.exe` by its full path, so another folder needs `pitcrew hooks install`
+   again; removing PitCrew starts with `pitcrew hooks uninstall`. `README-portable.txt` says so.
 
 The zip holds, at its root:
 
 | File | What |
 |---|---|
-| `pitcrew-desktop.exe` | The app (the release build, the UI inside). |
+| `pitcrew-desktop.exe` | The app (the release build, the UI inside, the helpers' checksums compiled in). |
 | `pitcrewd.exe`, `pitcrew-ptyd.exe`, `pitcrew-askpass.exe`, `pitcrew.exe` | The daemon, the terminal supervisor, ssh's prompt helper and the agent CLI, side by side with the app as the installer puts them. |
+| `helpers/pitcrewd-x86_64-unknown-linux-musl.xz`, `helpers/pitcrewd-aarch64-unknown-linux-musl.xz`, `helpers/manifest.json` | The static Linux helpers the app deploys to remote and HPC machines, XZ-compressed as in the installers, and their manifest (version and decoded sha256), byte for byte the one compiled into the app. None for macOS: that needs a Mac to build. |
 | `LICENSE`, `NOTICE` | PitCrew's licence (Apache-2.0). |
-| `THIRD-PARTY-NOTICES.txt` | Every crate the programs link (`cargo metadata`, normal dependencies, for `x86_64-pc-windows-msvc`) and every JavaScript package the window bundles (`apps/ui`'s production dependencies), each with its licence, source and the licence files its package carries; packages sharing a text are listed under it once. ([`notices.mjs`](notices.mjs)) |
-| `README-portable.txt` | For the person: unblocking, checking, where the data is, what differs. ([`portable/README-portable.txt`](portable/README-portable.txt)) |
-| `portable.txt` | The marker: the app is a portable copy. |
-| `SHA256SUMS` | Every other file's SHA-256, as `sha256sum --check` reads it. |
+| `THIRD-PARTY-NOTICES.txt` | What the programs are built from, with licence texts (see [Third-party notices](#third-party-notices)). |
+| `README-portable.txt` | For the person: unblocking, checking, updating, where the data is, what differs, removing. ([`portable/README-portable.txt`](portable/README-portable.txt)) |
+| `portable.txt` | The marker, with `channel=release` or `channel=main`. |
+| `SHA256SUMS` | Every other file's SHA-256 by its path (`helpers/…` included), as `sha256sum --check` reads it. |
 
 ### Checking it
 
@@ -381,61 +393,110 @@ Get-Content SHA256SUMS | ForEach-Object {
 ```
 
 Elsewhere, `sha256sum --check SHA256SUMS`. `.\pitcrew-desktop.exe --check-layout | Out-String`
-shows what the app finds next to itself without opening a window.
+shows what the app finds next to itself without opening a window: the programs, the marker and
+its channel, what `settings.json` puts in their place, each remote helper and the state folder.
 
 ### What portable mode changes
 
-The app is a portable copy when `portable.txt` is next to it (`apps/desktop/src-tauri/src/portable.rs`,
-see the desktop's README, "A portable copy"):
+The app is a portable copy when `portable.txt` is next to it, on Windows, and the installer's
+`uninstall.exe` is not (`apps/desktop/src-tauri/src/portable.rs`; see the desktop's README, "A
+portable copy"):
 
-- **Finding the programs** does not change: the layout is the installed one, so `pitcrewd`,
-  `pitcrew-askpass` (next to the app), `pitcrew-ptyd` and `pitcrew` (next to `pitcrewd`) are
-  found as installed, with the same trust check.
+- **Finding the programs and helpers** does not change: the layout is the installed one, so
+  `pitcrewd`, `pitcrew-askpass` (next to the app), `pitcrew-ptyd` and `pitcrew` (next to
+  `pitcrewd`) and `helpers/` are found as installed, with the same trust check and the compiled
+  checksums.
 - **The state** does not move: it stays where an installed PitCrew keeps it (`%LOCALAPPDATA%\PitCrew\data`,
   `%APPDATA%\org.pitcrew.desktop`, `%LOCALAPPDATA%\org.pitcrew.desktop`), never next to the
   programs, so moving between the zip and the installer keeps it. The smoke test checks nothing
-  is written into the unzipped folder.
-- **Updates** are never installed: a newer version is shown as usual, and **Update** opens the
-  workflow's successful runs for pushes to `main` instead (`event:push`; the
-  [contract](../docs/build/contracts/desktop-gateway.md#desktop-updates)).
+  is written into the unzipped folder and that `--check-layout`'s state folder is outside it.
+- **Updates** are never installed. A release's zip is offered newer releases that carry the
+  portable zip, and **Download** opens that release's page; a development build is offered none
+  (the [contract](../docs/build/contracts/desktop-gateway.md#desktop-updates)).
 - **Notifications** show as Windows PowerShell's: Windows shows toasts only for an
-  AppUserModelID a Start menu shortcut registers.
-- **Not in the zip:** `pitcrew://` links (the installer registers them), the remote helpers
-  (`helpers/`; adding a machine that needs one says so), signing, and WebView2, which Windows 10
-  and 11 include (without it the app says so, and the Evergreen Bootstrapper is
-  <https://go.microsoft.com/fwlink/p/?LinkId=2124703>).
+  AppUserModelID a Start menu shortcut registers. One clicked after PitCrew quit opens
+  PowerShell.
+- **Not in the zip:** `pitcrew://` links (the installer registers them), the macOS helper,
+  signing, and WebView2, which Windows 10 and 11 include (without it the app says so, and the
+  Evergreen Bootstrapper is <https://go.microsoft.com/fwlink/p/?LinkId=2124703>).
 
 ### How it is built
 
-[`release-portable.yml`](../.github/workflows/release-portable.yml) on `windows-2025`, as the
-release workflow's Windows jobs build (the channel from `rust-toolchain.toml`, actions pinned by
-commit SHA, `permissions: {}` and only `contents: read`, no caches):
+[`release-portable.yml`](../.github/workflows/release-portable.yml), as the release workflow
+builds (the channel from `rust-toolchain.toml`, actions pinned by commit SHA, `permissions: {}`
+and only `contents: read`, no caches). On a `v*` tag, `release.yml` calls it with the tag, then
+adds the zip to the release's files. Its jobs:
 
-```bash
-corepack pnpm install --frozen-lockfile && corepack pnpm --filter @pitcrew/ui build
-CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
-  packaging/build-release.sh x86_64-pc-windows-msvc       # Git Bash, on Windows
-packaging/portable/build.sh                              # the app, the notices, the zip
-pwsh -File packaging/portable/smoke.ps1 -Zip dist/portable/pitcrew-windows-x64-portable.zip
-```
+- `helpers` (ubuntu-24.04): `build-release.sh --zig` for both musl targets, as `release.yml`'s
+  build job, checks the helpers are static and runs the x86_64 one in `centos:7` with no network.
+- `zip` (windows-2025), after `helpers`:
 
-- **The C runtime is linked into every program** (`+crt-static` for the four, tauri-build's
-  `staticVCRuntime` for the app), so nothing needs the Visual C++ Redistributable, which is an
-  installer. The installers' programs link it dynamically, as before.
-- `portable/build.sh` builds the app with `cargo build --release --locked --features
-  custom-protocol --target x86_64-pc-windows-msvc` (no Tauri bundle, no helpers manifest compiled
-  in), writes the notices, copies the rest, writes `SHA256SUMS` and checks it, and zips the folder
-  with `zip`, or 7-Zip where `zip` is missing.
+  ```bash
+  corepack pnpm install --frozen-lockfile && corepack pnpm --filter @pitcrew/ui build
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static -C link-arg=/NODEFAULTLIB:libucrt.lib -C link-arg=/DEFAULTLIB:ucrt.lib" \
+    packaging/build-release.sh x86_64-pc-windows-msvc        # Git Bash, on Windows
+  # with the helpers' pitcrewd-*-unknown-linux-musl in dist/:
+  packaging/portable/build.sh [--channel release --version 1.2.3]
+  pwsh -File packaging/portable/smoke.ps1 -Zip dist/portable/pitcrew-windows-x64-portable.zip [-Channel release]
+  ```
+- `tests` (ubuntu-24.04) runs [`test.sh`](test.sh), which builds the zip from stand-ins.
+
+The pull-request trigger covers `packaging/**`, `apps/desktop/**`, the workflow, `Cargo.lock`,
+`rust-toolchain.toml` and `.cargo/**`. A pull request's newer push cancels its older run; every
+other run has a concurrency group of its own.
+
+- **The Visual C++ runtime is linked into every program** (`+crt-static` for the four,
+  tauri-build's `staticVCRuntime` for the app), so nothing needs the Visual C++ Redistributable,
+  which is an installer. **The UCRT stays Windows' own** (`ucrt.lib`, not `libucrt.lib`), as
+  tauri-build leaves it, so Windows Update keeps it current. The installers' programs link the
+  runtime dynamically, as before.
+- `portable/build.sh` writes the helpers' manifest (`pitcrewd --version`'s second word and each
+  helper's sha256, compact, as `desktop/build.sh` does) and builds the app with it as
+  `PITCREW_HELPERS_MANIFEST`: `cargo build --release --locked --features custom-protocol --target
+  x86_64-pc-windows-msvc` (no Tauri bundle), with `TAURI_CONFIG={"version": …}` for a release's
+  version. It refuses an app that does not hold that manifest, compresses the helpers, writes the
+  notices, `README-portable.txt` (with the version and `PORTABLE_COMMIT`, a pull request's head)
+  and `portable.txt` (with the channel), writes `SHA256SUMS` over every file and checks it, and
+  zips the folder with `zip`, or 7-Zip where `zip` is missing.
 - `portable/smoke.ps1` unzips it into a fresh folder outside the checkout and checks: exactly
-  those files, matching `SHA256SUMS` (also by `README-portable.txt`'s own lines); no program
-  importing the Visual C++ runtime (read from the PE headers); `pitcrewd`, `pitcrew` and
-  `pitcrew-ptyd` answering `--version` with one version, `pitcrew-askpass` refusing outside ssh;
-  `pitcrew-desktop --check-layout` finding its four programs and the marker (redirected, and piped
-  to `Out-String` as `README-portable.txt` says) and refusing a `pitcrewd.exe` marked as downloaded
-  until it is unblocked; `pitcrewd.exe` with a temporary state directory and the demo workspace
-  (no agent home watched) answering `GET /v1/host/info` on a loopback port with its runner's
-  terminals in the `pitcrew-ptyd` next to it (`pty`); and nothing written into the folder.
-- A separate job runs [`test.sh`](test.sh), which builds the zip from stand-ins.
+  those files, matching `SHA256SUMS` (also by `README-portable.txt`'s own lines) and `portable.txt`
+  on the expected channel; no program importing the Visual C++ runtime, and `pitcrewd` and the
+  app importing the UCRT (read from the PE headers); `pitcrewd`, `pitcrew` and `pitcrew-ptyd`
+  answering `--version` with one version, `pitcrew-askpass` refusing outside ssh; each helper
+  decoding to its manifest's sha256, the manifest being `pitcrewd`'s version and compiled into the
+  app; `pitcrew-desktop --check-layout` finding its four programs, the marker on its channel, both
+  Linux helpers and the state folder outside the zip's (redirected, and piped to `Out-String` as
+  `README-portable.txt` says) and refusing a `pitcrewd.exe` marked as downloaded until it is
+  unblocked; `pitcrewd.exe` with a temporary state directory and the demo workspace (no agent home
+  watched) answering `GET /v1/host/info` on a loopback port with its runner's terminals in the
+  `pitcrew-ptyd` next to it (`pty`); and nothing written into the folder.
+
+### Third-party notices
+
+[`notices.mjs`](notices.mjs) writes `THIRD-PARTY-NOTICES.txt`:
+
+- every crate the five programs link (`cargo metadata`, normal dependencies, for
+  `x86_64-pc-windows-msvc`), the Rust standard library (the toolchain's own
+  `share/doc/rust/COPYRIGHT-library.html`, as text), every JavaScript package the window bundles
+  (`apps/ui`'s production dependencies) and the build tools whose code is in that bundle
+  (`tailwindcss`'s preflight, `vite`'s and `rolldown`'s runtime helpers);
+- each with its licence, source and the licence files its package carries, plus any checked in
+  under [`notices-extra/<name>/`](notices-extra); packages sharing a text are listed under it
+  once.
+
+A package whose licence needs a notice with a compiled copy (anything but 0BSD, BSL-1.0,
+CC0-1.0, MIT-0, Unlicense, WTFPL, Zlib, an `OR` with one of those, or `WITH LLVM-exception`)
+and that carries no text **fails the build**. The checked-in texts are upstream's, for packages
+whose published package carries none:
+
+| `notices-extra/` | Upstream |
+|---|---|
+| `webview2-com/`, `webview2-com-sys/`, `webview2-com-macros/` `LICENSE` | `wravery/webview2-rs`, `LICENSE` (MIT) |
+| `webview2-com-sys/WebView2-SDK-LICENSE.txt` | the `Microsoft.Web.WebView2` NuGet package's `LICENSE.txt` (1.0.3650.58 and 1.0.4258.31 carry the same): `WebView2LoaderStatic.lib` is linked into the app |
+| `alloc-stdlib/LICENSE` | `dropbox/rust-alloc-no-stdlib`, `LICENSE` (BSD-3-Clause) |
+| `defmt-parser/LICENSE-MIT`, `LICENSE-APACHE` | `knurling-rs/defmt`, the same files |
+| `selectors/LICENSE` | the MPL-2.0 text Servo ships (`cssparser` 0.37.0's `LICENSE`); `servo/stylo` has no licence file |
+| `react-remove-scroll-bar/LICENSE` | `theKashey/react-remove-scroll-bar`, `LICENSE` (MIT), the author's contact address left out |
 
 ## Checksums
 
@@ -457,7 +518,8 @@ On a `v*` tag, [`release.yml`](../.github/workflows/release.yml):
 |---|---|---|---|
 | `build` | Ubuntu (musl x86_64 and aarch64, via Zig), macOS (universal), Windows (x86_64) | `contents: read` | Builds, checks the Linux binaries are static, runs the x86_64 `pitcrewd` and `pitcrew-ptyd` in `centos:7` (glibc 2.17) with no network, signs (placeholder), uploads the binaries. |
 | `desktop` | Ubuntu (x86_64), macOS (universal), Windows (x86_64) | `contents: read` | From the `build` job's binaries: builds the UI and the installers (`desktop/build.sh`), checks them (`desktop/check.sh`; on Windows a real install, upgrade and removal), starts the installed app (`desktop/smoke.sh`, Linux and macOS), signs (placeholder), uploads the installers. |
-| `manifest` | Ubuntu | `contents: read` | Runs `test.sh`, writes SBOMs and `SHA256SUMS` over everything (binaries and installers), signs `SHA256SUMS` (placeholder), verifies the directory. |
+| `portable` | Ubuntu and Windows ([`release-portable.yml`](../.github/workflows/release-portable.yml)) | `contents: read` | The portable Windows zip with the tag's version and `channel=release`, its Linux helpers, and its smoke test (see [The portable Windows zip](#the-portable-windows-zip)). |
+| `manifest` | Ubuntu | `contents: read` | Runs `test.sh`, adds the portable zip (fetched as uploaded, never extracted), writes SBOMs and `SHA256SUMS` over everything (binaries, installers and the zip), signs `SHA256SUMS` (placeholder), verifies the directory. |
 | `attest` | Ubuntu | `id-token: write`, `attestations: write` | Verifies the downloaded files against `SHA256SUMS`, then one build-provenance attestation whose subjects are every file in it. |
 | `release` | Ubuntu | `contents: write` | Verifies again, then a **draft** release with every file; a tag with a `-` is a pre-release. |
 

@@ -1,2 +1,5 @@
 This file marks a portable copy of PitCrew. Keep it next to pitcrew-desktop.exe:
-a portable copy never installs updates, and shows where to download the newest portable zip.
+a portable copy never installs updates. With channel=release (a zip from a release),
+it says when a newer release is out and opens its page; a development build
+(channel=main) offers none.
+channel=@CHANNEL@

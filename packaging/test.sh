@@ -326,44 +326,75 @@ fi
 # --- portable/build.sh: the portable Windows zip, from stand-ins (no cargo, no Windows)
 win="$tmp/win"
 mkdir -p "$win"
-for bin in pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass; do
+stub "$win/pitcrewd-x86_64-pc-windows-msvc.exe" "pitcrewd 1.2.3 (protocol 1, oldest accepted 1)"
+for bin in pitcrew pitcrew-ptyd pitcrew-askpass; do
   printf 'stand-in %s\n' "$bin" >"$win/$bin-x86_64-pc-windows-msvc.exe"
 done
-printf 'stand-in desktop\n' >"$tmp/pitcrew-desktop.exe"
+printf 'x86_64 helper\n' >"$win/pitcrewd-x86_64-unknown-linux-musl"
+printf 'aarch64 helper\n' >"$win/pitcrewd-aarch64-unknown-linux-musl"
+portable_manifest="{\"version\":\"1.2.3\",\"sha256\":{\"pitcrewd-aarch64-unknown-linux-musl\":\"$(hex "$win/pitcrewd-aarch64-unknown-linux-musl")\",\"pitcrewd-x86_64-unknown-linux-musl\":\"$(hex "$win/pitcrewd-x86_64-unknown-linux-musl")\"}}"
+# The desktop as built with that manifest compiled in.
+{ printf 'stand-in desktop\n'; printf '%s' "$portable_manifest"; printf '\n'; } >"$tmp/pitcrew-desktop.exe"
 printf 'synthetic notices\n' >"$tmp/notices.txt"
 portable_out="$tmp/portable"
 portable() {
   bash "$here/portable/build.sh" --dist "$win" --out "$portable_out" \
     --desktop "$tmp/pitcrew-desktop.exe" --notices "$tmp/notices.txt" "$@"
 }
-portable_files="LICENSE NOTICE README-portable.txt SHA256SUMS THIRD-PARTY-NOTICES.txt pitcrew-askpass.exe pitcrew-desktop.exe pitcrew-ptyd.exe pitcrew.exe pitcrewd.exe portable.txt"
+portable_files="LICENSE NOTICE README-portable.txt SHA256SUMS THIRD-PARTY-NOTICES.txt helpers pitcrew-askpass.exe pitcrew-desktop.exe pitcrew-ptyd.exe pitcrew.exe pitcrewd.exe portable.txt"
 folder="$portable_out/pitcrew-windows-x64-portable"
 if command -v zip >/dev/null 2>&1 || command -v 7z >/dev/null 2>&1; then
   check "the portable zip builds from stand-ins" 0 portable
   output_has "and names its size" "pitcrew-windows-x64-portable.zip: PitCrew "
+  output_has "and the manifest it compiles in" "PITCREW_HELPERS_MANIFEST=$portable_manifest"
   check "the folder holds exactly the zip's files" 0 \
     test "$(cd "$folder" && echo *)" = "$portable_files"
-  check "its SHA256SUMS covers every file" 0 bash "$here/verify.sh" "$folder"
+  check "and helpers/ the Linux helpers and their manifest" 0 \
+    test "$(cd "$folder/helpers" && echo *)" = "manifest.json pitcrewd-aarch64-unknown-linux-musl.xz pitcrewd-x86_64-unknown-linux-musl.xz"
+  check "the manifest is the compiled one, byte for byte" 0 test "$(cat "$folder/helpers/manifest.json")" = "$portable_manifest"
+  for helper in pitcrewd-x86_64-unknown-linux-musl pitcrewd-aarch64-unknown-linux-musl; do
+    # shellcheck disable=SC2016 # sh's own "$1"
+    check "$helper decodes to the helper built" 0 \
+      sh -c 'xz -dc "$1" | cmp -s - "$2"' _ "$folder/helpers/$helper.xz" "$win/$helper"
+  done
+  # shellcheck disable=SC2016
+  check "its SHA256SUMS covers every file, helpers/ included" 0 \
+    sh -c 'cd "$1" && sha256sum --check --strict --quiet SHA256SUMS && test "$(sed -E "s/^[0-9a-f]{64}  //" SHA256SUMS)" = "$(find . -type f ! -name SHA256SUMS | sed "s|^\./||" | LC_ALL=C sort)"' _ "$folder"
+  check "and lists a helper by its path" 0 grep -q '  helpers/pitcrewd-x86_64-unknown-linux-musl.xz$' "$folder/SHA256SUMS"
   check "the programs are the inputs, renamed" 0 cmp -s "$folder/pitcrew-ptyd.exe" "$win/pitcrew-ptyd-x86_64-pc-windows-msvc.exe"
   check "and the desktop" 0 cmp -s "$folder/pitcrew-desktop.exe" "$tmp/pitcrew-desktop.exe"
   check "the notices are the given ones" 0 cmp -s "$folder/THIRD-PARTY-NOTICES.txt" "$tmp/notices.txt"
-  check "the portable marker is there" 0 test -s "$folder/portable.txt"
+  check "a development build by default" 0 grep -q '^channel=main.$' "$folder/portable.txt"
   check "README-portable.txt names the version" 0 \
     grep -qF "PitCrew $(sed -nE 's/^  "version": "([^"]+)".*/\1/p' "$root/apps/desktop/src-tauri/tauri.conf.json"), portable" "$folder/README-portable.txt"
-  check "and has no placeholder left" 1 grep -q '@[A-Z]*@' "$folder/README-portable.txt"
+  check "and the commit given" 0 sh -c 'PORTABLE_COMMIT=0123456789abcdef0123456789abcdef01234567 "$@" >/dev/null && grep -q "commit 0123456789abcdef0123456789abcdef01234567\." "$0"' "$folder/README-portable.txt" bash "$here/portable/build.sh" --dist "$win" --out "$portable_out" --desktop "$tmp/pitcrew-desktop.exe" --notices "$tmp/notices.txt"
+  check "and has no placeholder left" 1 grep -q '@[A-Z]*@' "$folder/README-portable.txt" "$folder/portable.txt"
   # shellcheck disable=SC2016 # sh's own "$1"
   check "its lines end in CRLF, once" 0 \
     sh -c 'test "$(grep -c "$(printf "\r")\$" "$1")" = "$(wc -l <"$1" | tr -d " ")" && ! grep -q "$(printf "\r\r")" "$1"' _ "$folder/README-portable.txt"
   if command -v unzip >/dev/null 2>&1; then
     # shellcheck disable=SC2016
-    check "the zip holds the files at its root" 0 \
-      sh -c 'test "$(unzip -Z1 "$1" | sort | tr "\n" " ")" = "$2 "' _ "$portable_out/pitcrew-windows-x64-portable.zip" "$portable_files"
+    check "the zip holds the files at its root, helpers/ in its folder" 0 \
+      sh -c 'unzip -Z1 "$1" | grep -qx "pitcrewd.exe" && unzip -Z1 "$1" | grep -qx "helpers/manifest.json"' _ "$portable_out/pitcrew-windows-x64-portable.zip"
     # shellcheck disable=SC2016
     check "and they unzip to the same bytes" 0 \
-      sh -c 'mkdir "$1/unzipped" && cd "$1/unzipped" && unzip -q "$2" && bash "$3" .' _ "$tmp" "$portable_out/pitcrew-windows-x64-portable.zip" "$here/verify.sh"
+      sh -c 'mkdir "$1/unzipped" && cd "$1/unzipped" && unzip -q "$2" && sha256sum --check --strict --quiet SHA256SUMS' _ "$tmp" "$portable_out/pitcrew-windows-x64-portable.zip"
   fi
-  check "built again, it starts afresh" 0 portable
+  check "a release's zip" 0 portable --channel release --version 9.8.7-rc.1
+  check "is on the release channel" 0 grep -q '^channel=release.$' "$folder/portable.txt"
+  check "with the release's version" 0 grep -qF "PitCrew 9.8.7-rc.1, portable" "$folder/README-portable.txt"
   check "with the same files" 0 test "$(cd "$folder" && echo *)" = "$portable_files"
+  check "an unknown channel is a usage error" 2 portable --channel nightly
+  check "a version that is not one fails" 1 portable --version '1.2;rm'
+  printf 'stand-in desktop without the manifest\n' >"$tmp/other-desktop.exe"
+  check "a desktop built without these helpers' checksums fails" 1 \
+    bash "$here/portable/build.sh" --dist "$win" --out "$portable_out" \
+    --desktop "$tmp/other-desktop.exe" --notices "$tmp/notices.txt"
+  output_has "and says so" "does not hold this zip's helper manifest"
+  mv "$win/pitcrewd-aarch64-unknown-linux-musl" "$tmp/saved-aarch64"
+  check "a missing helper fails" 1 portable
+  output_has "and is named" "pitcrewd-aarch64-unknown-linux-musl"
+  mv "$tmp/saved-aarch64" "$win/pitcrewd-aarch64-unknown-linux-musl"
   rm "$win/pitcrew-askpass-x86_64-pc-windows-msvc.exe"
   check "a missing program fails" 1 portable
   output_has "and is named" "pitcrew-askpass-x86_64-pc-windows-msvc.exe"

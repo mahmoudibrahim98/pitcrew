@@ -2,25 +2,30 @@
 # it: unzipped into a fresh folder outside the checkout, never installed. The release workflow's
 # portable job runs it; see packaging/README.md, "The portable Windows zip".
 #
-#   pwsh -File packaging/portable/smoke.ps1 -Zip <pitcrew-windows-x64-portable.zip>
+#   pwsh -File packaging/portable/smoke.ps1 -Zip <pitcrew-windows-x64-portable.zip> [-Channel release|main]
 #
 # Checks:
-# - the zip holds exactly the expected files, and they match its SHA256SUMS, also with the
-#   PowerShell lines README-portable.txt gives;
+# - the zip holds exactly the expected files, helpers/ included, and they match its SHA256SUMS,
+#   also with the PowerShell lines README-portable.txt gives; portable.txt is on -Channel;
 # - no program imports the Visual C++ runtime (VCRUNTIME140.dll and the like), which this runner
-#   has but a machine that cannot run installers may lack: read from each program's PE headers;
+#   has but a machine that cannot run installers may lack, and pitcrewd and the app use Windows'
+#   own UCRT, which Windows Update keeps current: read from each program's PE headers;
 # - pitcrewd, pitcrew and pitcrew-ptyd answer --version with one version; pitcrew-askpass refuses
 #   to run outside ssh;
-# - pitcrew-desktop.exe --check-layout (no window) finds its four programs and portable.txt, also
-#   through `| Out-String` as README-portable.txt says, and refuses a pitcrewd.exe still marked as
-#   downloaded (Zone.Identifier) until it is unblocked;
+# - helpers/: the Linux helpers, decoded, match manifest.json, which is pitcrewd's version and
+#   exactly the manifest compiled into pitcrew-desktop.exe;
+# - pitcrew-desktop.exe --check-layout (no window) finds its four programs, portable.txt on its
+#   channel and both Linux helpers (the app's own lookup, with its compiled checksums), with the
+#   state directory outside the folder, also through `| Out-String` as README-portable.txt says,
+#   and refuses a pitcrewd.exe still marked as downloaded (Zone.Identifier) until it is unblocked;
 # - pitcrewd.exe, with a temporary state directory and the demo workspace (so its runner starts,
 #   watching no agent home), answers GET /v1/host/info on a loopback port, as pitcrewd, with the
 #   runner's terminals in the pitcrew-ptyd next to it (capability `pty`);
 # - nothing was written into the unzipped folder.
 # On GitHub Actions it adds the files, their sizes and the zip's SHA-256 to the job's summary.
 param(
-  [Parameter(Mandatory = $true)] [string] $Zip
+  [Parameter(Mandatory = $true)] [string] $Zip,
+  [ValidateSet('release', 'main')] [string] $Channel = 'main'
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 3
@@ -86,8 +91,12 @@ Ok "unzipped into $dir"
 
 # --- The files, and SHA256SUMS
 $programs = @('pitcrew-desktop.exe', 'pitcrewd.exe', 'pitcrew-ptyd.exe', 'pitcrew-askpass.exe', 'pitcrew.exe')
-$expected = @($programs + @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.txt', 'README-portable.txt', 'portable.txt', 'SHA256SUMS'))
-function Get-Names { @(Get-ChildItem -LiteralPath $dir -Force | ForEach-Object { $_.Name }) }
+$helpers = @('pitcrewd-aarch64-unknown-linux-musl', 'pitcrewd-x86_64-unknown-linux-musl')
+$expected = @($programs + @('LICENSE', 'NOTICE', 'THIRD-PARTY-NOTICES.txt', 'README-portable.txt', 'portable.txt', 'SHA256SUMS', 'helpers/manifest.json') + @($helpers | ForEach-Object { "helpers/$_.xz" }))
+# Every file in the folder, by its path there, with / as in SHA256SUMS.
+function Get-Names {
+  @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force | ForEach-Object { [IO.Path]::GetRelativePath($dir, $_.FullName).Replace('\', '/') })
+}
 $names = @(Get-Names)
 if (Compare-Object -ReferenceObject $expected -DifferenceObject $names -CaseSensitive) {
   Fail "the zip holds $($names -join ', '), not $($expected -join ', ')"
@@ -106,6 +115,7 @@ foreach ($name in $names) {
   if ($hash -ceq $listed[$name]) { Ok "$name matches SHA256SUMS" } else { Fail "$name does not match SHA256SUMS" }
 }
 if ($listed.Count -ne $names.Count - 1) { Fail "SHA256SUMS lists $($listed.Count) files, not $($names.Count - 1)" }
+if ([IO.File]::ReadAllText((Join-Path $dir 'portable.txt')) -cmatch "(?m)^channel=$Channel\r?$") { Ok "portable.txt says channel=$Channel" } else { Fail "portable.txt does not say channel=$Channel" }
 
 # README-portable.txt's own check, as written there, run in the folder.
 $readme = @(Get-Content -LiteralPath (Join-Path $dir 'README-portable.txt'))
@@ -130,6 +140,10 @@ foreach ($name in $programs) {
   Write-Host "  $name imports: $($imports -join ', ')"
   $runtime = @($imports | Where-Object { $_ -match '^(vcruntime|msvcp|vccorlib|concrt|vcomp)\d|^ucrtbased\.dll$' })
   if ($runtime.Count -gt 0) { Fail "$name needs the Visual C++ runtime: $($runtime -join ', ')" } else { Ok "$name needs no Visual C++ runtime" }
+  # The UCRT stays Windows' own (dynamic), as tauri-build leaves it for the app.
+  if ($name -in @('pitcrew-desktop.exe', 'pitcrewd.exe')) {
+    if (@($imports | Where-Object { $_ -match '^(api-ms-win-crt-|ucrtbase\.dll$)' }).Count -gt 0) { Ok "$name uses Windows' own UCRT" } else { Fail "$name does not import the UCRT: is it linked in statically?" }
+  }
 }
 
 # --- The programs run
@@ -144,13 +158,42 @@ Remove-Item Env:PITCREW_ASKPASS_ADDR -ErrorAction SilentlyContinue
 $r = Invoke-Program (Join-Path $dir 'pitcrew-askpass.exe') @('Password:')
 if ($r.Code -eq 2 -and $r.Text -like '*not started by PitCrew*') { Ok 'pitcrew-askpass runs (and refuses to answer outside ssh)' } else { Fail "pitcrew-askpass: exit $($r.Code): $($r.Text)" }
 
-# --- The desktop's own view of its folder, with no window
+# --- The remote helpers: each decodes to the bytes manifest.json names, and that manifest is the
+# one compiled into the app, the only checksums it trusts before deploying a helper
 $desktop = Join-Path $dir 'pitcrew-desktop.exe'
+$manifestText = [IO.File]::ReadAllText((Join-Path $dir 'helpers/manifest.json'))
+$manifest = $manifestText | ConvertFrom-Json
+$listedHelpers = @($manifest.sha256.PSObject.Properties | ForEach-Object { $_.Name } | Sort-Object)
+if (($listedHelpers -join ',') -ceq ($helpers -join ',')) { Ok "helpers/manifest.json lists $($helpers -join ' and ')" } else { Fail "helpers/manifest.json lists $($listedHelpers -join ', ')" }
+if ($manifest.version -ceq $version) { Ok "the helpers are version $version, pitcrewd's" } else { Fail "the helpers' version is $($manifest.version), not pitcrewd's $version" }
+# Git's bash, with xz, as the release workflow's Windows checks use it.
+$gitBash = if ($env:ProgramFiles) { Join-Path $env:ProgramFiles 'Git\bin\bash.exe' } else { '' }
+$bash = if ($gitBash -and (Test-Path -LiteralPath $gitBash)) { $gitBash } else { 'bash' }
+foreach ($entry in $manifest.sha256.PSObject.Properties) {
+  $decoded = Join-Path $root "$($entry.Name).decoded"
+  $env:PITCREW_CHECK_XZ = Join-Path $dir "helpers/$($entry.Name).xz"
+  $env:PITCREW_CHECK_DECODED = $decoded
+  & $bash -c 'xz -dc -- "$PITCREW_CHECK_XZ" > "$PITCREW_CHECK_DECODED"'
+  if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $decoded)) { Fail "helpers/$($entry.Name).xz does not decode"; continue }
+  $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $decoded).Hash.ToLowerInvariant()
+  $size = (Get-Item -LiteralPath $decoded).Length
+  Remove-Item -LiteralPath $decoded -Force
+  if ($hash -ceq $entry.Value) { Ok "helpers/$($entry.Name).xz decodes to its manifest's sha256 ($size bytes)" } else { Fail "helpers/$($entry.Name).xz does not decode to its manifest's sha256" }
+}
+Remove-Item Env:PITCREW_CHECK_XZ, Env:PITCREW_CHECK_DECODED -ErrorAction SilentlyContinue
+$latin1 = [Text.Encoding]::GetEncoding(28591)
+if ($latin1.GetString([IO.File]::ReadAllBytes($desktop)).Contains($manifestText)) { Ok 'helpers/manifest.json is compiled into pitcrew-desktop.exe' } else { Fail 'pitcrew-desktop.exe does not hold helpers/manifest.json (PITCREW_HELPERS_MANIFEST)' }
+
+# --- The desktop's own view of its folder, with no window
+$portableLine = if ($Channel -eq 'release') { 'portable: yes, release channel' } else { 'portable: yes, development build' }
+$defaultState = Join-Path $env:LOCALAPPDATA 'PitCrew\data'
 function Test-Layout([string] $text, [string] $how) {
-  $wanted = @('portable: yes', 'layout: ok') + @($programs | Select-Object -Skip 1 | ForEach-Object { "ok: $_" })
+  $wanted = @($portableLine, 'layout: ok', "state: $defaultState") + @($programs | Select-Object -Skip 1 | ForEach-Object { "ok: $_" }) + @($helpers | ForEach-Object { "helper ${_}: ok (" })
   $missing = @($wanted | Where-Object { $text -notmatch "(?m)^$([regex]::Escape($_))" })
   if ($text -notmatch '(?m)^WebView2: \d') { $missing += 'WebView2: <version>' }
-  if ($missing.Count -eq 0) { Ok "pitcrew-desktop --check-layout ($how) finds everything" } else { Fail "pitcrew-desktop --check-layout ($how) lacks: $($missing -join '; ')" }
+  # Where the state is, which must not be the unzipped folder.
+  if ($text -match '(?m)^state: (.+?)\r?$' -and $Matches[1].StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)) { $missing += "a state directory outside $dir" }
+  if ($missing.Count -eq 0) { Ok "pitcrew-desktop --check-layout ($how) finds everything, and the state in $defaultState" } else { Fail "pitcrew-desktop --check-layout ($how) lacks: $($missing -join '; ')" }
 }
 $r = Invoke-Program $desktop @('--check-layout')
 Write-Host $r.Text
@@ -221,7 +264,7 @@ $rows = foreach ($name in ($names | Sort-Object)) { "| ``$name`` | $((Get-Item -
 $summary = @(
   "## pitcrew-windows-x64-portable.zip",
   '',
-  "PitCrew $version, $zipSize bytes, SHA-256 ``$zipHash``.",
+  "PitCrew $version (channel=$Channel), $zipSize bytes, SHA-256 ``$zipHash``.",
   '',
   '| File | Bytes |',
   '|---|---:|'
