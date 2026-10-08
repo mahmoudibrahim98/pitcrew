@@ -59,8 +59,9 @@ unpack into a folder they are allowed to run programs from, and start PitCrew fr
 
 ## Acceptance
 
-- A `workflow_dispatch` run on the PR branch produces the zip, and its smoke test passes. Link the
-  run in the PR body.
+- The pull request's own run produces the zip, and its smoke test passes. The job runs on PRs
+  that touch packaging or the workflow; a brand-new workflow can't be dispatched by hand before it
+  is on `main`. Link the run in the PR body.
 - The workflow-security job (zizmor) passes. Every CI job passes on the pull request.
 - fmt, clippy with `-D warnings` and the desktop shell's tests pass for anything changed in
   `apps/desktop/src-tauri`.
