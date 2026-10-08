@@ -10,7 +10,8 @@ use crate::error::{Error, Kind, Result};
 use crate::http::encode;
 use crate::plan;
 use crate::{Io, MAX_STDIN};
-use pitcrew_protocol::ids::{AskId, MemberId, TaskId, TaskKey};
+use pitcrew_protocol::board::{BoardDraft, MAX_PROPOSAL_BYTES};
+use pitcrew_protocol::ids::{AskId, DraftId, MemberId, TaskId, TaskKey};
 use pitcrew_protocol::model::{Ask, AskKind, AskState, Member, MemberKind, Task, TaskStatus};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -586,6 +587,105 @@ pub(crate) fn task_ref(reference: &str) -> Result<String> {
     )))
 }
 
+/// `board submit <draft> [--file <path>]`: the proposal a board draft asks for, as JSON, from
+/// `file` (`-` or none: stdin). Checked here for its size and shape (a JSON object) before
+/// anything is sent; the daemon checks the rest (only the draft's own session token may
+/// propose), and creates nothing until a person reviews it. A person's device token is refused
+/// here, unsent.
+pub(crate) fn board_submit(
+    client: Client,
+    io: &mut Io<'_>,
+    json: bool,
+    draft: &str,
+    file: Option<&std::path::Path>,
+) -> Result<()> {
+    if client.holds_device_token() {
+        return Err(Error::invalid(
+            "a person's device token is never used to propose a board; the draft's run has its \
+             own token in PITCREW_TOKEN_FILE",
+        ));
+    }
+    let id = draft_ref(draft)?;
+    let text = match file {
+        Some(path) if path != std::path::Path::new("-") => read_proposal_file(path)?,
+        _ => {
+            if io.stdin_is_terminal {
+                return Err(Error::invalid(
+                    "give the proposal with --file proposal.json, or on stdin: {\"tasks\": \
+                     [{\"title\", \"status\", \"evidence\"}], \"note\"}",
+                ));
+            }
+            read_stdin(io)?
+        }
+    };
+    if text.len() > MAX_PROPOSAL_BYTES {
+        return Err(Error::invalid(format!(
+            "the proposal is {} bytes; at most {MAX_PROPOSAL_BYTES} are accepted",
+            text.len()
+        )));
+    }
+    let body: Value = serde_json::from_str(&text)
+        .map_err(|e| Error::invalid(format!("the proposal is not JSON: {e}")))?;
+    if !body.is_object() {
+        return Err(Error::invalid(
+            "the proposal must be a JSON object: {\"tasks\": [...], \"note\": \"...\"}",
+        ));
+    }
+    let value = client.post(&format!("/board-drafts/{}/proposal", encode(&id)), &body)?;
+    let mut out = |text: &str| {
+        io.stdout
+            .write_all(text.as_bytes())
+            .and_then(|()| io.stdout.flush())
+            .map_err(|e| Error::internal(format!("cannot write the output: {e}")))
+    };
+    if json {
+        let mut text = serde_json::to_string_pretty(&value)
+            .map_err(|e| Error::internal(format!("cannot encode the output: {e}")))?;
+        text.push('\n');
+        return out(&text);
+    }
+    let draft: BoardDraft = from_value(value)?;
+    let count = draft.proposal.as_ref().map_or(0, |p| p.tasks.len());
+    out(&format!(
+        "Proposed {count} task{} for {}. Nothing is created until a person reviews it.\n",
+        if count == 1 { "" } else { "s" },
+        draft.id
+    ))
+}
+
+/// A proposal's file: a regular file, read up to one byte past the bound (the caller says how
+/// big it was).
+fn read_proposal_file(path: &std::path::Path) -> Result<String> {
+    let shown = display::line(&path.display().to_string());
+    let meta = std::fs::metadata(path)
+        .map_err(|e| Error::invalid(format!("cannot read the proposal {shown}: {e}")))?;
+    if !meta.is_file() {
+        return Err(Error::invalid(format!(
+            "the proposal {shown} is not a file"
+        )));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| {
+            f.take(MAX_PROPOSAL_BYTES as u64 + 1)
+                .read_to_string(&mut text)
+        })
+        .map_err(|e| Error::invalid(format!("cannot read the proposal {shown}: {e}")))?;
+    Ok(text)
+}
+
+/// A board draft's id as the daemon takes it: a bare ULID, from `drf_…` or a bare ULID.
+///
+/// # Errors
+/// `invalid` for anything else.
+pub(crate) fn draft_ref(reference: &str) -> Result<String> {
+    reference
+        .trim()
+        .parse::<DraftId>()
+        .map(|id| id.0.to_string())
+        .map_err(|_| Error::invalid(format!("{reference:?} is not a board draft id (drf_…)")))
+}
+
 fn task_path(reference: &str, rest: &str) -> Result<String> {
     Ok(format!("/tasks/{}{rest}", encode(&task_ref(reference)?)))
 }
@@ -703,6 +803,23 @@ mod tests {
             let err = task_ref(bad).unwrap_err();
             assert_eq!(err.kind, Kind::Invalid, "{bad:?}");
             assert!(task_path(bad, "/move").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn draft_refs_are_ids_only() {
+        let bare = "01J00000000000000000000000";
+        assert_eq!(draft_ref(bare).unwrap(), bare);
+        assert_eq!(draft_ref(&format!(" drf_{bare} ")).unwrap(), bare);
+        for bad in [
+            "",
+            "..",
+            "PAP-1",
+            "drf_",
+            "tsk_01J0",
+            "drf_01J0000000000000000000000/x",
+        ] {
+            assert!(draft_ref(bad).is_err(), "{bad}");
         }
     }
 

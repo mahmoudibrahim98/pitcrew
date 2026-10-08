@@ -191,6 +191,8 @@ export class Hub {
   readonly turns = new Map<SessionId, number>();
   /** Identifies this event log. A new one per mock start, so clients notice the reset. */
   readonly logId: string = ulid();
+  /** Where the session tokens of board drafts are also written (`ServerOptions.sessionTokenDir`). */
+  sessionTokenDir: string | undefined = undefined;
 
   readonly #log: Event[];
   readonly #listeners = new Set<() => void>();

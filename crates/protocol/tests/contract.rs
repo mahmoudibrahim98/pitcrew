@@ -215,6 +215,7 @@ fn runner_frames_round_trip_as_single_lines() {
             account: None,
             permission_mode: PermissionMode::Default,
             session: Some(SessionId::new()),
+            confined: false,
         },
     };
     let line = encode_line(&cmd).unwrap();
@@ -234,6 +235,15 @@ fn runner_frames_round_trip_as_single_lines() {
     assert!(matches!(
         serde_json::from_value::<RunnerCommand>(older).unwrap(),
         RunnerCommand::StartSession { session: None, .. }
+    ));
+    // A start for a person is not confined, and says nothing of it; a confined one says so, and
+    // an older runner's start without the field is a person's.
+    assert!(v["command"].get("confined").is_none());
+    let mut confined = v["command"].clone();
+    confined["confined"] = serde_json::Value::Bool(true);
+    assert!(matches!(
+        serde_json::from_value::<RunnerCommand>(confined).unwrap(),
+        RunnerCommand::StartSession { confined: true, .. }
     ));
 
     let ok = RunnerToHub::CommandResult {
@@ -645,4 +655,27 @@ fn directory_edit_bodies_preserve_existing_model_fields() {
     let atomic: NewProject =
         round_trip(&json!({"key":"ATM","name":"Atomic","first_workstream":"First"}));
     assert_eq!(atomic.first_workstream.as_deref(), Some("First"));
+}
+
+/// A session token's scope names its session; the other scopes stay plain words, as stored
+/// registries and older clients have them.
+#[test]
+fn a_session_scope_names_its_session() {
+    use pitcrew_protocol::api::{Caller, TokenScope};
+    let session = SessionId::new();
+    let scope = TokenScope::Session(session);
+    let v = serde_json::to_value(scope).unwrap();
+    assert_eq!(v, serde_json::json!({ "session": session.0.to_string() }));
+    assert_eq!(serde_json::from_value::<TokenScope>(v).unwrap(), scope);
+    assert_eq!(scope.session(), Some(session));
+    for (plain, word) in [(TokenScope::Device, "device"), (TokenScope::Agent, "agent")] {
+        assert_eq!(serde_json::to_value(plain).unwrap(), word);
+        assert_eq!(plain.session(), None);
+    }
+    let caller = Caller {
+        member: pitcrew_protocol::ids::MemberId::new(),
+        scope,
+        on_behalf_of: Some(pitcrew_protocol::ids::MemberId::new()),
+    };
+    assert!(!caller.is_person());
 }
