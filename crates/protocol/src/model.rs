@@ -195,6 +195,21 @@ pub struct Member {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub persona: Option<PersonaId>,
+    /// Optional initials and colour chosen in Profile settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub avatar: Option<Avatar>,
+}
+
+/// A person's avatar preferences.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(deny_unknown_fields)]
+pub struct Avatar {
+    /// One to four visible Unicode code points.
+    pub initials: String,
+    /// A six-digit hexadecimal RGB colour.
+    pub colour: String,
 }
 
 impl Member {

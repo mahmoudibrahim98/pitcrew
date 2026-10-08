@@ -66,12 +66,6 @@ function projectsRoutes(parent: WorkspaceRoute): AnyRoute[] {
         path: 'tasks/$task',
         component: lazyRouteComponent(() => import('./task-page.tsx'), 'TaskPage'),
       }),
-      createRoute({
-        getParentRoute: () => projectsLayout,
-        path: 'settings/integrations',
-        staticData: { title: 'Integrations' },
-        component: lazyRouteComponent(() => import('./integrations/integrations-page.tsx'), 'IntegrationsPage'),
-      }),
     ]),
   ];
 }

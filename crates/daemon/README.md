@@ -1340,6 +1340,12 @@ Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
 
+## Settings after setup
+
+`GET /v1/settings` exposes the data folder, owner, daemon/protocol versions and log destination
+only to the workspace owner. `PUT /v1/settings/workspace` saves the name atomically to
+`workspace.json` before changing the live work service. Device-only profile and existing
+default-agent recipe edits come from hub-work. See api-v1.md, "Settings after setup".
 Session options expose `first_prompt_forbidden` for Windows `.cmd`/`.bat` programs. The API returns
 400 for those first prompts, with advice to start without a prompt and enter it in the terminal.
 No automatic prompt typing or shell escaping is attempted. Omitted permission mode reads the

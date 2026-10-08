@@ -588,6 +588,7 @@ async fn people_answer_asks_to_themselves_and_their_agents_only() {
             name: "Alex Doe".into(),
             owner: None,
             persona: None,
+            avatar: None,
         },
         Member {
             id: alex_agent,
@@ -596,6 +597,7 @@ async fn people_answer_asks_to_themselves_and_their_agents_only() {
             name: "Helper".into(),
             owner: Some(alex),
             persona: None,
+            avatar: None,
         },
     ] {
         append(&work, member(SAM), EventBody::MemberAdded { member: m });

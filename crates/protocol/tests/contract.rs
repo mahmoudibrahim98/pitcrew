@@ -92,6 +92,7 @@ fn agents_must_have_an_owner_people_must_not() {
         name: "Writer".into(),
         owner: Some(person),
         persona: None,
+        avatar: None,
     };
     assert!(agent.is_valid());
     agent.owner = None;
@@ -105,6 +106,7 @@ fn agents_must_have_an_owner_people_must_not() {
         name: "Me".into(),
         owner: None,
         persona: None,
+        avatar: None,
     };
     assert!(human.is_valid());
 }

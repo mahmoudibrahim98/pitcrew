@@ -75,10 +75,12 @@ where
 {
     Router::new()
         .route("/v1/workspace", get(get_workspace))
+        .route("/v1/me/profile", put(put_profile))
         .route("/v1/me/cursors", get(get_cursors))
         .route("/v1/me/cursors/{scope}", put(put_cursor))
         .route("/v1/setup", post(post_setup))
         .route("/v1/machines", get(list_machines))
+        .route("/v1/machines/{id}", put(put_machine))
         .route("/v1/personas", get(list_personas).post(create_persona))
         .route("/v1/personas/{id}", put(edit_persona))
         .route("/v1/teams", get(list_teams).post(create_team))
@@ -338,8 +340,37 @@ async fn list_machines(Work(w): Work, Person(_): Person) -> Reply<Vec<Machine>> 
     Ok(Json(blocking(w, WorkService::machines).await?))
 }
 
+async fn put_machine(
+    Work(w): Work,
+    Person(caller): Person,
+    Segments(id): Segments<pitcrew_protocol::ids::MachineId>,
+    body: RawBody,
+) -> Reply<Machine> {
+    blocking(Arc::clone(&w), move |w| {
+        w.require_owner(&caller)?;
+        w.read(|c| crate::query::machine(c, &id))?
+            .ok_or_else(|| WorkError::not_found("Unknown machine."))?;
+        Ok(())
+    })
+    .await?;
+    let input: pitcrew_protocol::settings::SaveMachine = json(body).await?;
+    Ok(Json(
+        blocking(w, move |w| w.rename_machine(&caller, id, &input.name)).await?,
+    ))
+}
+
 async fn list_personas(Work(w): Work, Person(_): Person) -> Reply<Vec<Persona>> {
     Ok(Json(blocking(w, WorkService::personas).await?))
+}
+
+async fn put_profile(
+    Work(w): Work,
+    Person(caller): Person,
+    Body(input): Body<pitcrew_protocol::settings::SaveProfile>,
+) -> Reply<Member> {
+    Ok(Json(
+        blocking(w, move |w| w.save_profile(&caller, input)).await?,
+    ))
 }
 
 async fn list_teams(Work(w): Work, Person(_): Person) -> Reply<Vec<Team>> {
@@ -720,7 +751,14 @@ async fn edit_persona(
             .ok_or_else(|| WorkError::not_found("No such persona."))
     })
     .await?;
-    let edit: PersonaEdit = json(body).await?;
+    let input: pitcrew_protocol::settings::SavePersona = json(body).await?;
+    let edit = PersonaEdit {
+        name: input.name,
+        engine: input.engine,
+        model: input.model,
+        instructions: input.instructions,
+        permission_mode: input.permission_mode,
+    };
     Ok(Json(
         blocking(w, move |w| w.save_persona(&caller, Some(id), edit)).await?,
     ))

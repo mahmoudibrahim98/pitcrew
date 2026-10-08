@@ -9,6 +9,11 @@ Run `cargo test -p pitcrew-protocol --features ts` to regenerate `packages/proto
 
 Session import types live in `import`: inclusion rules, the durable choice, and dry-run/commit counts. Regenerate the TypeScript exports with `cargo test -p pitcrew-protocol --features ts`.
 
+## Settings
+
+`Member.avatar` optionally carries visible initials and a hexadecimal RGB colour. Older
+members omit it. `settings` holds strict profile and default-agent edit requests; existing
+`member_added` and `persona_saved` events carry their durable changes.
 `api::SessionOptions` and `SessionEngine` describe machine-scoped launch availability. Their
 TypeScript bindings are exported by the same explicit regeneration test.
 

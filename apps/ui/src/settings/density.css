@@ -1,0 +1,5 @@
+:root[data-density="compact"] { --pc-density-row: 1.5rem; }
+:root[data-density="comfortable"] { --pc-density-row: 1.875rem; }
+[data-density] [data-nav], [data-density] tbody tr { height: var(--pc-density-row); }
+[data-density="compact"] tbody td { padding-block: 0.125rem; }
+[data-density="compact"] [data-settings-content] { gap: 0.5rem; }

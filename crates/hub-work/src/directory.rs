@@ -89,6 +89,7 @@ impl WorkService {
                 name: persona.name.clone(),
                 owner: Some(caller.member),
                 persona: Some(persona.id),
+                avatar: None,
             };
             events.push(self.by(caller, EventBody::MemberAdded { member }));
         } else {
@@ -198,6 +199,7 @@ impl WorkService {
                 name: persona.name.clone(),
                 owner: Some(caller.member),
                 persona: Some(persona.id),
+                avatar: None,
             };
             events.push(self.by(caller, EventBody::PersonaSaved { persona }));
             events.push(self.by(

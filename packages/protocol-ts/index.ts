@@ -6,6 +6,7 @@ export type { Ask } from './bindings/Ask.ts';
 export type { AskId } from './bindings/AskId.ts';
 export type { AskKind } from './bindings/AskKind.ts';
 export type { AskState } from './bindings/AskState.ts';
+export type { Avatar } from './bindings/Avatar.ts';
 export type { BackOfficeCaps } from './bindings/BackOfficeCaps.ts';
 export type { Block } from './bindings/Block.ts';
 export type { BlockKey } from './bindings/BlockKey.ts';

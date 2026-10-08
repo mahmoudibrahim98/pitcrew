@@ -174,6 +174,7 @@ async fn a_handle_clash_gives_409_even_without_a_person_yet() {
         name: "Back office".to_owned(),
         owner: Some(MemberId::new()),
         persona: None,
+        avatar: None,
     };
     let event = Event {
         id: EventId::new(),
@@ -268,6 +269,7 @@ async fn a_workspace_with_only_an_agent_still_needs_setup_and_accepts_a_differen
         name: "Back office".to_owned(),
         owner: Some(MemberId::new()),
         persona: None,
+        avatar: None,
     };
     let event = Event {
         id: EventId::new(),

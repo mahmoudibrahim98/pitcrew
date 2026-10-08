@@ -189,6 +189,7 @@ mod tests {
                     name: "M".into(),
                     owner,
                     persona: None,
+                    avatar: None,
                 },
             });
         }

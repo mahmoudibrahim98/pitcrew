@@ -79,6 +79,7 @@ impl World {
             name: "Lead".into(),
             owner: None,
             persona: None,
+            avatar: None,
         });
         let agents: Vec<MemberId> = (1..=4u128).map(|n| MemberId(id(4, n))).collect();
         for (i, a) in agents.iter().enumerate() {
@@ -89,6 +90,7 @@ impl World {
                 name: format!("Agent {}", i + 1),
                 owner: Some(person),
                 persona: None,
+                avatar: None,
             });
         }
         let workstreams: Vec<WorkstreamId> = (0..workstreams.max(1))

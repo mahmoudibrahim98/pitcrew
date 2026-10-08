@@ -216,6 +216,7 @@ async fn editing_requires_ownership_of_every_linked_member_but_unlinked_recipes_
         name: recipe.name.clone(),
         owner: Some(person(SAM).member),
         persona: Some(id),
+        avatar: None,
     };
     let foreign = Member {
         id: MemberId::new(),
@@ -224,6 +225,7 @@ async fn editing_requires_ownership_of_every_linked_member_but_unlinked_recipes_
         name: recipe.name.clone(),
         owner: Some(other),
         persona: Some(id),
+        avatar: None,
     };
     let append = |bodies: Vec<EventBody>| {
         let events: Vec<_> = bodies

@@ -74,10 +74,9 @@ export function DesktopUpdates({ children }: { children: ReactNode }) {
   </Updates>;
 }
 
-export function UpdateSettings() {
+export function UpdateSettings({ embedded = false }: { embedded?: boolean } = {}) {
   const updates = useContext(Updates);
-  return <Page title="Settings">
-    <section className="space-y-3 text-sm">
+  const content = <section className="space-y-3 text-sm">
       <h2 className="font-semibold">Desktop updates</h2>
       {updates === null ? <p>Updates are managed by the desktop app.</p> : <>
         <p>Checks run on startup and daily. Updates are installed only after you agree.</p>
@@ -87,6 +86,6 @@ export function UpdateSettings() {
         {updates.status?.version !== undefined && <p>Version {updates.status.version} is available.</p>}
         {updates.message && <p role="status">{updates.message}</p>}
       </>}
-    </section>
-  </Page>;
+    </section>;
+  return embedded ? content : <Page title="Settings" placeholder={false}>{content}</Page>;
 }

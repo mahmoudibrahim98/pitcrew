@@ -310,4 +310,13 @@ pre-release opt-in; browser mode explains that the desktop manages updates. Erro
 and retryable. See the desktop gateway contract and `tests/updates.test.tsx` for the IPC and
 consent checks. Tauri bindings remain dynamic imports outside the initial browser bundle.
 
+## Settings
+
+The shell serves `/w/$ws/settings` (Profile) and `/w/$ws/settings/$section` in both layouts.
+The gear stays in the sidebar footer when collapsed and in browser builds. The palette opens
+Settings or a specific section. `src/settings` owns the section list, forms and local density
+preference; its page is loaded lazily. Integrations keeps its existing deep link and is composed
+inside Settings instead of the Projects layout. Updates is listed only in the desktop app.
+Native notification preferences remain controlled by the tray; hook removal awaits retained
+uninstall plans in the CLI. See `src/settings/README.md` for persistence and existing API reuse.
 Create forms may mark their initial input with `data-create-focus` and React `autoFocus`: the shell focuses it when content is ready, including lazy forms, while preserving focus trapping and return to the opener.

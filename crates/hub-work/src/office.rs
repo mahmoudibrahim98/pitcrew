@@ -336,6 +336,7 @@ impl WorkService {
             name: OFFICE_NAME.to_owned(),
             owner: Some(owner),
             persona: None,
+            avatar: None,
         };
         self.append(&[self.event(
             owner,

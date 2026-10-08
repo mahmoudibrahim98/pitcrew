@@ -697,6 +697,7 @@ fn the_office_answers_only_its_own_questions_and_mentions() {
             name: "Alex".into(),
             owner: None,
             persona: None,
+            avatar: None,
         },
         Member {
             id: helper,
@@ -705,6 +706,7 @@ fn the_office_answers_only_its_own_questions_and_mentions() {
             name: "Helper".into(),
             owner: Some(alex),
             persona: None,
+            avatar: None,
         },
     ] {
         append(&work, SAM, None, EventBody::MemberAdded { member: m });
@@ -1218,6 +1220,7 @@ fn named(kind: MemberKind, handle: &str, owner: Option<MemberId>) -> Member {
         name: handle.trim_start_matches('@').to_owned(),
         owner,
         persona: None,
+        avatar: None,
     }
 }
 

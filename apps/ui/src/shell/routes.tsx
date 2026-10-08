@@ -11,6 +11,8 @@ import {
   type RouterHistory,
 } from '@tanstack/react-router';
 import { useApplyTheme } from '../design/index.ts';
+import { useApplyDensity } from '../settings/appearance.ts';
+import '../settings/density.css';
 import { RegistryContext } from './context.ts';
 import { shellFeature } from './core.tsx';
 import type { Feature } from './feature.ts';
@@ -28,6 +30,7 @@ const DesktopUpdates = lazy(() => import('./updates.tsx').then((m) => ({ default
 
 function Root() {
   useApplyTheme();
+  useApplyDensity();
   useGatewayNavigation();
   const content = (
     <>

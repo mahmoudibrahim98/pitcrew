@@ -64,6 +64,18 @@ fn raw(work: &WorkService, author: MemberId, obo: Option<MemberId>, body: EventB
 
 /// A bit of everything, through the commands where there is one and as raw events otherwise.
 fn workload(work: &WorkService) {
+    work.save_profile(
+        &person(SAM),
+        pitcrew_protocol::settings::SaveProfile {
+            name: "Sam Updated".into(),
+            handle: "@sam".into(),
+            avatar: pitcrew_protocol::model::Avatar {
+                initials: "SU".into(),
+                colour: "#abcdef".into(),
+            },
+        },
+    )
+    .expect("profile in replay workload");
     work.move_cursor(&person(SAM), "workspace", 1)
         .expect("read cursor");
     let sam = person(SAM);

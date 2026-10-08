@@ -83,6 +83,7 @@ percent-encoding = "=2.3.2"
 rustix = { version = "=1.1.5", features = ["fs", "process"] }
 
 [dev-dependencies]
+tower.workspace = true
 tempfile.workspace = true
 
 [lints]

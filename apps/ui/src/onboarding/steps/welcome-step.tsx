@@ -7,6 +7,7 @@ import { cx } from '../../lib/cx.ts';
 import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
 import type { Density } from '../wizard-state.ts';
+import { useAppearance } from '../../settings/appearance.ts';
 
 const THEMES: { value: ThemeChoice; label: string }[] = [
   { value: 'light', label: 'Light' },
@@ -68,7 +69,7 @@ export function WelcomeStep() {
         <legend className="text-sm font-medium text-ink">Density</legend>
         <RadioGroup.Root
           value={state.density}
-          onValueChange={(value) => patch({ density: value as Density })}
+          onValueChange={(value) => { patch({ density: value as Density }); useAppearance.getState().setDensity(value as Density); }}
           className="flex gap-2"
         >
           {DENSITIES.map((d) => (

@@ -82,6 +82,7 @@ fn hub_with_gh(script: &str) -> Hub {
         name: "Lee".into(),
         owner: None,
         persona: None,
+        avatar: None,
     });
     let store = Arc::new(
         pitcrew_store::Store::open_with(

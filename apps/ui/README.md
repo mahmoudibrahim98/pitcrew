@@ -87,3 +87,8 @@ so they stay out of the initial bundle and `pnpm size` is unaffected. xterm.js 6
 canvas renderer addon (`@xterm/addon-canvas`, which has no release compatible with `@xterm/xterm`
 ^6 — its last stable, 0.7.0, still peers on `^5.0.0`); the fallback for WebGL is xterm's built-in
 DOM renderer, not a separate addon.
+
+## Settings
+
+`src/settings` supplies browser and desktop Settings, with section deep links, the footer gear
+and palette commands. See its README for API reuse, persistence and the two deferred controls.

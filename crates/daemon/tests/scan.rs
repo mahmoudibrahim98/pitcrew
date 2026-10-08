@@ -548,7 +548,9 @@ fn a_fresh_hub_scans_its_machine_once_set_up() {
     let (tmp, state) = state_dir();
     let daemon_home = home_of(&state);
     agent_homes(&daemon_home, &Work::under(tmp.path()));
-    let daemon = Daemon::start(&state, &[]);
+    // This test checks scan provisioning alone; the office starts asynchronously after setup
+    // and can otherwise add its own member between the two idempotency snapshots.
+    let daemon = Daemon::start(&state, &["--no-office"]);
     let device = daemon.device_token();
 
     refused(

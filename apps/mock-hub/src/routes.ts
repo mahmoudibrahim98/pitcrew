@@ -83,6 +83,7 @@ import { files } from './files.ts';
 import { parseImport, includesSession, eventVisible, includedRecaps } from './import.ts';
 import * as integrations from './integrations.ts';
 import * as writes from './writes.ts';
+import * as settings from './settings.ts';
 export const MOCK_VERSION = '0.1.0-mock';
 /** `PROTOCOL_VERSION` and `PROTOCOL_MIN` in crates/protocol/src/version.rs. */
 export const PROTOCOL_VERSION = 1;
@@ -426,6 +427,7 @@ function directoryText(value: string, field: string, max: number): string {
   return text;
 }
 const savePersona = (editing = false): Handler => (hub, ctx) => {
+  if (editing && typeof ctx.body === 'object' && ctx.body !== null && Object.keys(ctx.body).some(k => !['name', 'engine', 'model', 'instructions', 'permission_mode'].includes(k))) throw invalid('Supply agent recipe fields only.');
   const previous = !editing ? undefined
     : found(hub.findPersona(ctx.param('id')), 'No such persona.');
   if (previous !== undefined && hub.members.some((m) => m.persona === previous.id && m.owner !== ctx.caller.memberId)) throw forbidden('A person may edit only personas whose members they own.');
@@ -1555,6 +1557,13 @@ const route = (method: string, pattern: string, access: Route['access'], handler
 });
 
 const ROUTES: Route[] = [
+  route('GET', '/v1/settings', 'device', (hub, ctx) => {
+    settings.ownerOnly(hub, ctx.caller.memberId);
+    return ok({ owner: ctx.caller.memberId, data_folder: '/home/sam/.local/share/pitcrew', logs: 'Daemon logs go to stderr; the launcher captures them.', daemon_version: MOCK_VERSION, protocol_version: PROTOCOL_VERSION });
+  }),
+  route('PUT', '/v1/settings/workspace', 'device', (hub, ctx) => ok(settings.rename(hub, ctx.caller.memberId, ctx.body))),
+  route('PUT', '/v1/machines/:id', 'device', (hub, ctx) => ok(settings.machine(hub, ctx.caller.memberId, ctx.param('id'), ctx.body))),
+  route('PUT', '/v1/me/profile', 'device', (hub, ctx) => ok(settings.profile(hub, ctx.caller.memberId, ctx.body))),
   route('GET', '/v1/me/cursors', 'device', (hub, ctx) => ok(
     [...(hub.cursors.get(ctx.caller.memberId) ?? new Map<string, number>())]
       .sort(([a], [b]) => a.localeCompare(b)).map(([scope, rev]) => ({ scope, rev })),

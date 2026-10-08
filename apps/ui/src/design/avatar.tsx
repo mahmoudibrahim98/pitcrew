@@ -3,6 +3,7 @@ import { cx } from '../lib/cx.ts';
 export interface AvatarMember {
   kind: 'human' | 'agent';
   name: string;
+  avatar?: { initials: string; colour: string };
 }
 
 type Size = 'sm' | 'md' | 'lg';
@@ -12,6 +13,12 @@ const SIZES: Record<Size, { box: string; owner: string }> = {
   md: { box: 'size-6 text-[10px]', owner: 'size-3 text-[7px]' },
   lg: { box: 'size-8 text-xs', owner: 'size-3.5 text-[8px]' },
 };
+
+function foreground(colour: string): string {
+  const channels = [1, 3, 5].map((offset) => parseInt(colour.slice(offset, offset + 2), 16) / 255);
+  const luminance = channels.reduce((sum, value, i) => sum + (value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4) * ([0.2126, 0.7152, 0.0722][i] ?? 0), 0);
+  return luminance > 0.179 ? '#000000' : '#ffffff';
+}
 
 export function initials(name: string): string {
   const words = name.trim().split(/\s+/).filter(Boolean);
@@ -52,6 +59,7 @@ export function Avatar({
     >
       <span
         aria-hidden
+        style={member.avatar === undefined ? undefined : { backgroundColor: member.avatar.colour, color: foreground(member.avatar.colour) }}
         className={cx(
           'inline-flex items-center justify-center font-semibold select-none',
           SIZES[size].box,
@@ -60,7 +68,7 @@ export function Avatar({
             : 'rounded-pill bg-ink text-bg',
         )}
       >
-        {initials(member.name)}
+        {member.avatar?.initials ?? initials(member.name)}
       </span>
       {agent && owner !== undefined && (
         <span

@@ -35,6 +35,7 @@ pub mod onboarding;
 pub mod recap;
 pub mod runner;
 pub mod scan;
+pub mod settings;
 pub mod text;
 pub mod transcript;
 pub mod version;

@@ -60,7 +60,7 @@ fn is_trimmed_space(c: char) -> bool {
 /// A name of a [`Setup`] body (api-v1.md, "The first run"): trimmed of whitespace, then 1 to
 /// `max_chars` characters (Unicode code points) with no control character anywhere. Returned
 /// trimmed, as it is stored.
-fn checked_text(value: &str, field: &str, max_chars: usize) -> Result<String> {
+pub(crate) fn checked_text(value: &str, field: &str, max_chars: usize) -> Result<String> {
     let value = value.trim_matches(is_trimmed_space);
     // The byte-length check first: a value of more bytes than 4 per character allowed is too long
     // anyway, so an oversized input costs no full character count.
@@ -79,7 +79,7 @@ fn checked_text(value: &str, field: &str, max_chars: usize) -> Result<String> {
 
 /// `@` followed by 1 to [`HANDLE_CHARS`] of `a-z 0-9 _ -`. The charset already excludes control
 /// characters.
-fn checked_handle(handle: &str) -> Result<String> {
+pub(crate) fn checked_handle(handle: &str) -> Result<String> {
     let invalid = || {
         WorkError::invalid(format!(
             "person.handle must be \"@\" followed by 1 to {HANDLE_CHARS} of a-z, 0-9, \"_\" or \
@@ -166,6 +166,7 @@ impl WorkService {
             name: checked.person_name,
             owner: None,
             persona: None,
+            avatar: None,
         };
         let machine = Machine {
             id: MachineId::new(),

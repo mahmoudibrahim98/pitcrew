@@ -604,6 +604,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         .device(crate::machine_setup::routes(machine_setup))
         .device(crate::files::routes(Arc::clone(&work), state.root()))
         .device(crate::onboarding::routes(Arc::clone(&work)))
+        .device(crate::settings::routes(Arc::clone(&work), state.root()))
         // A sign-in's terminal opens only for the member who started it.
         .device(terminals.routes(TerminalConfig::default()))
         .device(transcripts.routes())
@@ -1120,6 +1121,7 @@ mod tests {
             name: "Lee".into(),
             owner: None,
             persona: None,
+            avatar: None,
         };
         append(
             &hub.store,
@@ -1442,6 +1444,7 @@ mod tests {
             name: handle.trim_start_matches('@').to_owned(),
             owner: None,
             persona: None,
+            avatar: None,
         };
         let agent = |owner: Option<MemberId>| Member {
             kind: MemberKind::Agent,

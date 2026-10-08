@@ -199,10 +199,11 @@ fn member_row(r: &Row<'_>) -> sql::Result<Member> {
         name: r.get(3)?,
         owner: opt_col(r, 4)?,
         persona: opt_col(r, 5)?,
+        avatar: opt_json_col(r, 6)?,
     })
 }
 
-const MEMBER_COLS: &str = "id, kind, handle, name, owner, persona";
+const MEMBER_COLS: &str = "id, kind, handle, name, owner, persona, (SELECT avatar FROM work_avatars WHERE member=work_members.id)";
 
 /// Every member, people and agents.
 pub fn members(conn: &Connection) -> Result<Vec<Member>> {

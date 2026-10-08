@@ -14,7 +14,7 @@ pub struct Directory;
 impl Directory {
     /// The projection's name.
     pub const NAME: &'static str = "work.directory";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
 }
 
 impl Projection for Directory {
@@ -27,6 +27,7 @@ impl Projection for Directory {
     }
 
     fn reset(&self, tx: &Transaction<'_>) -> Result<(), BoxError> {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS work_avatars (member TEXT PRIMARY KEY, avatar TEXT NOT NULL); DELETE FROM work_avatars;")?;
         clear(
             tx,
             &[
@@ -79,6 +80,19 @@ fn machine_added(tx: &Transaction<'_>, rev: i64, m: &Machine) -> Applied {
 }
 
 fn member_added(tx: &Transaction<'_>, rev: i64, m: &Member) -> Applied {
+    if let Some(avatar) = &m.avatar {
+        exec(
+            tx,
+            "INSERT INTO work_avatars VALUES (?1, ?2) ON CONFLICT(member) DO UPDATE SET avatar=excluded.avatar",
+            params![m.id.text(), serde_json::to_string(avatar)?],
+        )?;
+    } else {
+        exec(
+            tx,
+            "DELETE FROM work_avatars WHERE member=?1",
+            params![m.id.text()],
+        )?;
+    }
     exec(
         tx,
         "INSERT INTO work_members (id, rev, kind, handle, name, owner, persona)

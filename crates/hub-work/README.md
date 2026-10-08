@@ -750,4 +750,12 @@ Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
 
+## Settings after setup
+
+Profile edits use `member_added`, preserving identity and ownership while validating names,
+unique handles and avatar initials/colour. Directory version 2 owns `work_avatars`, created
+during projection reset and rebuilt from those same events. Existing default-agent recipe
+edits reuse directory ownership checks and `persona_saved` for future sessions. Workspace
+renaming holds the command lock and calls the daemon persistence seam before changing the
+live name. Settings edit requests are strict; unchanged profiles append no event.
 Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.

@@ -268,6 +268,7 @@ fn without_tmux_the_daemon_serves_with_no_terminal_runtime() {
         name: "Kim".into(),
         owner: None,
         persona: None,
+        avatar: None,
     };
     let kims = Member {
         id: MemberId::new(),
@@ -276,6 +277,7 @@ fn without_tmux_the_daemon_serves_with_no_terminal_runtime() {
         name: "Kimbot".into(),
         owner: Some(kim.id),
         persona: None,
+        avatar: None,
     };
     let theirs = session_of(Some(kims.id));
     let mine = session_of(Some(id::WRITER.parse().unwrap()));
