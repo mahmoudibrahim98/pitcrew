@@ -1050,7 +1050,8 @@ check('cursor metadata is private in live/replay and does not consume activity p
     await replay.next();
     assert.equal((await until(replay)).filter((e) => e.body.type === 'cursor_moved').length, 0);
     for (const route of ['/v1/events', '/v1/activity']) {
-      const page = await api(`${route}?limit=3`);
+      // Other conformance files write concurrently; read the privacy barrier snapshot.
+      const page = await api(`${route}?limit=3&before=${hello.rev + 7}`);
       assert.deepEqual(page.events.map((e) => e.id), comments.map((e) => e.id));
       assert.deepEqual(page.revisions, [hello.rev + 2, hello.rev + 4, hello.rev + 6]);
       assert.equal(page.from_rev, page.revisions[0]);
@@ -1063,4 +1064,188 @@ check('cursor metadata is private in live/replay and does not consume activity p
   } finally {
     owner.ws.close(); other.ws.close(); replay?.ws.close();
   }
+});
+
+check('session launch options are machine-scoped and person-only', async () => {
+  const machines = await api('/v1/machines');
+  const local = machines.find((m) => m.kind === 'local');
+  assert.ok(local);
+  const path = `/v1/machines/${local.id}/session-options`;
+  await api(path, 403, undefined, { token: agent });
+  await api(`/v1/machines/${missing}/session-options`, 404);
+  const remote = machines.find((m) => m.kind === 'ssh');
+  if (remote) await api(`/v1/machines/${remote.id}/session-options`, 503);
+  const options = await api(path);
+  assert.ok(['unix', 'windows'].includes(options.platform));
+  assert.ok(options.engines.some((e) => e.engine === 'claude'));
+  for (const e of options.engines) {
+    assert.ok(['claude', 'codex', 'opencode'].includes(e.engine));
+    assert.ok(e.permission_modes.includes('default'));
+    assert.ok(Array.isArray(e.first_prompt_forbidden));
+    assert.ok(e.first_prompt_forbidden.every((c) => typeof c === 'string' && [...c].length === 1));
+    assert.ok(!e.permission_modes.includes('bypass_permissions'));
+    if (e.engine === 'codex') assert.ok(!e.permission_modes.includes('plan'));
+    if (e.engine === 'opencode') assert.deepEqual(e.permission_modes, ['default']);
+  }
+});
+
+check('unnamed start returns a terminal without waiting for a transcript', async () => {
+  const machines = await api('/v1/machines');
+  const machine = machines.find((m) => m.kind === 'local').id;
+  const cwd = process.env.PITCREW_FILES_ROOT;
+  assert.ok(cwd);
+  await api('/v1/sessions', 400, undefined, { method: 'POST', body: {machine, engine:'claude', cwd, title:'   '} });
+  const session = await api('/v1/sessions', 202, schemas.session, { method:'POST', body: { machine, engine:'claude', cwd, title:'Synthetic start' } });
+  assert.equal(session.title, 'Synthetic start');
+  assert.ok(session.terminal);
+  const found = await api(`/v1/sessions/${session.id}`, 200, schemas.session);
+  assert.equal(found.terminal, session.terminal);
+  await api(`/v1/sessions/${session.id}/end`, 204, undefined, { method:'POST', body:{mode:'kill'} });
+});
+
+check('invalid launch preflight leaves no sessions and saved safety is applied', async () => {
+  const machines = await api('/v1/machines');
+  const machine = machines.find((m) => m.kind === 'local').id;
+  const cwd = process.env.PITCREW_FILES_ROOT;
+  const before = (await api('/v1/sessions')).map((s) => s.id).sort();
+  for (const body of [
+    { machine, cwd, engine: 'codex', permission_mode: 'plan' },
+    { machine, cwd, engine: 'opencode', permission_mode: 'accept_edits' },
+    { machine, cwd, engine: 'claude', permission_mode: 'bypass_permissions' },
+    ...['\nTitle', 'Title\r', '\tTitle', 'Title\u0085'].map((title) => ({ machine, cwd, engine: 'claude', title })),
+  ]) await api('/v1/sessions', 400, undefined, { method: 'POST', body });
+  const remote = machines.find((m) => m.kind !== 'local');
+  if (remote) await api('/v1/sessions', 503, undefined, { method: 'POST', body: { machine: remote.id, engine: 'claude', cwd } });
+  const original = await api('/v1/safety');
+  const { saved: _saved, ...settings } = original;
+  try {
+    await api('/v1/safety', 200, undefined, { method: 'PUT', body: { ...settings, permission_mode: 'plan' } });
+    await api('/v1/sessions', 400, undefined, { method: 'POST', body: { machine, cwd, engine: 'codex' } });
+  } finally {
+    await api('/v1/safety', 200, undefined, { method: 'PUT', body: settings });
+  }
+  assert.deepEqual((await api('/v1/sessions')).map((s) => s.id).sort(), before);
+});
+
+check('two person starts without prompts share a folder and have different terminals', async () => {
+  const machine = (await api('/v1/machines')).find((m) => m.kind === 'local').id;
+  const body = { machine, cwd: process.env.PITCREW_FILES_ROOT, engine: 'codex', permission_mode: 'default' };
+  const started = [];
+  try {
+    for (let i = 0; i < 2; i++) started.push(await api('/v1/sessions', 202, schemas.session, { method: 'POST', body }));
+    assert.notEqual(started[0].id, started[1].id);
+    assert.notEqual(started[0].terminal, started[1].terminal);
+  } finally {
+    for (const session of started) await api(`/v1/sessions/${session.id}/end`, 204, undefined, { method: 'POST', body: { mode: 'kill' } });
+  }
+});
+
+check('a workstream start is linked before transcript discovery on both hubs', async () => {
+  const machine = (await api('/v1/machines')).find((m) => m.kind === 'local').id;
+  const workstream = await api('/v1/workstreams', 201, schemas.workstream, { method: 'POST', body: {
+    project: context.project.id, name: 'Synthetic start link', locations: [],
+  } });
+  const session = await api('/v1/sessions', 202, schemas.session, { method: 'POST', body: {
+    machine, engine: 'claude', cwd: process.env.PITCREW_FILES_ROOT, workstream: workstream.id, permission_mode: 'default',
+  } });
+  try {
+    assert.equal(session.workstream, workstream.id);
+    assert.equal(session.link_basis, 'manual');
+    const found = await api(`/v1/sessions/${session.id}`, 200, schemas.session);
+    assert.equal(found.workstream, workstream.id);
+    assert.equal(found.link_basis, 'manual');
+  } finally {
+    await api(`/v1/sessions/${session.id}/end`, 204, undefined, { method: 'POST', body: { mode: 'kill' } });
+  }
+});
+
+check('directory creation and editing are device-only, validated, event-backed and atomic', async () => {
+  const recipe = { name: '  Synthetic author  ', engine: 'claude', model: 'demo-model', instructions: 'Synthetic\nexamples.', permission_mode: 'plan' };
+  for (const [path, body] of [['/v1/personas', recipe], ['/v1/teams', { name: 'Synthetic crew', lead: missing, members: [] }]]) {
+    await api(path, 401, undefined, { method: 'POST', token: '', body });
+    await api(path, 403, undefined, { method: 'POST', token: agent, body });
+  }
+  const rev = (await api('/v1/workspace')).rev;
+  await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, name: ' ' } });
+  await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, engine: 'invalid' } });
+  await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, model: 'x'.repeat(201) } });
+  await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, instructions: 'x'.repeat(32001) } });
+  assert.equal((await api('/v1/workspace')).rev, rev);
+  const persona = await api('/v1/personas', 201, undefined, { method: 'POST', body: { ...recipe, id: missing, author: missing } });
+  assert.equal(persona.name, 'Synthetic author'); assert.notEqual(persona.id, missing);
+  schemas.personas([persona]);
+  let members = await api('/v1/members');
+  const member = members.find((m) => m.persona === persona.id);
+  const me = await api('/v1/me');
+  assert.equal(member.kind, 'agent'); assert.equal(member.owner, me.id);
+  const second = process.env.PITCREW_CONFORMANCE_SECOND_PERSON;
+  assert.ok(second, 'second person fixture token');
+  const beforeEdit = (await api('/v1/workspace')).rev;
+  await api(`/v1/personas/${persona.id}`, 403, undefined, { method: 'PUT', token: second, body: { ...recipe, name: 'Stolen' } });
+  for (const change of [{ permission_mode: 'bypass_permissions' }, { model: '--dangerously-skip-permissions' }]) {
+    await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, ...change } });
+    await api(`/v1/personas/${persona.id}`, 400, undefined, { method: 'PUT', body: { ...recipe, ...change } });
+  }
+  assert.equal((await api('/v1/workspace')).rev, beforeEdit);
+  assert.equal((await api('/v1/personas')).find((p) => p.id === persona.id).name, 'Synthetic author');
+  assert.equal((await api('/v1/members')).find((m) => m.id === member.id).name, 'Synthetic author');
+
+  const renamed = await api(`/v1/personas/per_${persona.id.replace(/^per_/, '')}`, 200, undefined, { method: 'PUT', body: { ...recipe, name: 'Renamed author' } });
+  assert.equal(renamed.id, persona.id);
+  members = await api('/v1/members');
+  assert.equal(members.find((m) => m.id === member.id).name, 'Renamed author');
+  const dispatchTask = await api('/v1/tasks', 201, schemas.task, { method: 'POST', body: { project: context.project.id, title: 'Dispatch new agent' } });
+  const serviceActors = members.filter((m) => m.kind === 'agent' && m.owner === me.id && m.persona === undefined);
+  assert.ok(serviceActors.length > 0, 'owned service actor fixture');
+  const beforeServiceDispatch = (await api('/v1/workspace')).rev;
+  for (const actor of serviceActors) {
+    await api(`/v1/tasks/${dispatchTask.id}/dispatch`, 400, undefined, { method: 'POST', body: { agent: actor.id } });
+  }
+  assert.equal((await api('/v1/workspace')).rev, beforeServiceDispatch);
+  context.directoryDispatch = { task: dispatchTask.id, agent: member.id };
+  const teamBody = { name: 'Synthetic crew', lead: me.id, members: [member.id, member.id] };
+  const teamRev = (await api('/v1/workspace')).rev;
+  await api('/v1/teams', 400, undefined, { method: 'POST', body: { ...teamBody, members: [missing] } });
+  await api('/v1/teams', 400, undefined, { method: 'POST', body: { ...teamBody, lead: missing } });
+  await api('/v1/teams', 400, undefined, { method: 'POST', body: { ...teamBody, members: Array(257).fill(member.id) } });
+  assert.equal((await api('/v1/workspace')).rev, teamRev);
+  const team = await api('/v1/teams', 201, undefined, { method: 'POST', body: teamBody });
+  schemas.teams([team]); assert.deepEqual(team.members, [me.id, member.id]);
+  const updated = await api(`/v1/teams/team_${team.id.replace(/^team_/, '')}`, 200, undefined, { method: 'PUT', body: { ...teamBody, name: 'Renamed crew', lead: member.id, members: [] } });
+  assert.deepEqual(updated.members, [member.id]); assert.equal(updated.id, team.id);
+  for (const path of [`/v1/personas/${persona.id}`, `/v1/teams/${team.id}`]) {
+    await api(path, 403, undefined, { method: 'PUT', token: agent, body: {} });
+  }
+  for (const path of [`/v1/personas/${missing}`, `/v1/teams/${missing}`, '/v1/personas/bad', '/v1/teams/bad']) {
+    await api(path, 404, undefined, { method: 'PUT', body: {} });
+  }
+  const events = (await api('/v1/events?limit=100')).events;
+  assert.ok(events.some((e) => e.body.type === 'persona_saved' && e.body.data.persona.id === persona.id && e.author === me.id));
+  assert.ok(events.some((e) => e.body.type === 'team_saved' && e.body.data.team.id === team.id && e.author === me.id));
+});
+
+check('project and optional first workstream are created together or neither is created', async () => {
+  const key = 'ATOMIC';
+  const body = { key, name: 'Atomic project', first_workstream: '  ' };
+  const rev = (await api('/v1/workspace')).rev;
+  await api('/v1/projects', 400, undefined, { method: 'POST', body });
+  assert.equal((await api('/v1/workspace')).rev, rev);
+  assert.ok(!(await api('/v1/projects')).some((p) => p.key === key));
+  const project = await api('/v1/projects', 201, schemas.project, { method: 'POST', body: { ...body, first_workstream: 'First stream' } });
+  const streams = await api(`/v1/workstreams?project=${project.id}`);
+  assert.equal(streams.length, 1); assert.equal(streams[0].name, 'First stream');
+  const after = (await api('/v1/workspace')).rev;
+  await api('/v1/projects', 409, undefined, { method: 'POST', body: { ...body, first_workstream: 'Second stream' } });
+  assert.equal((await api('/v1/workspace')).rev, after);
+  assert.equal((await api(`/v1/workstreams?project=${project.id}`)).length, 1);
+});
+
+// A successful dispatch emits runner events asynchronously. Keep it after exact-revision
+// refusal checks so unrelated launch events cannot look like mutations by refused writes.
+check('the newly created directory agent can dispatch a task', async () => {
+  const { task, agent: member } = context.directoryDispatch;
+  const reply = await raw(`/v1/tasks/${task}/dispatch`, { method: 'POST', body: { agent: member } });
+  assert.equal(reply.status, 202, reply.data?.message);
+  schemas.dispatch(reply.data);
+  assert.equal(reply.data.task, task);
 });

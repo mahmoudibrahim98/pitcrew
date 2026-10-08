@@ -29,11 +29,14 @@ import type {
   NewTask,
   NewWorkstream,
   Persona,
+  PersonaEdit,
   Project,
   RecapBlockFilters,
   RecapDayScope,
   Session,
   SessionFilters,
+  SessionOptions,
+  StartSession,
   Setup,
   SetupResult,
   Subtask,
@@ -42,6 +45,7 @@ import type {
   TaskPatch,
   TaskStatus,
   Team,
+  TeamEdit,
   TranscriptPage,
   TranscriptQuery,
   WorkspaceInfo,
@@ -183,6 +187,10 @@ export function createApi(options: ApiOptions) {
     setup: (setup: Setup) => request<SetupResult>('POST', '/v1/setup', { body: setup }),
     machines: (signal?: AbortSignal) => get<Machine[]>('/v1/machines', undefined, signal),
     members: (signal?: AbortSignal) => get<Member[]>('/v1/members', undefined, signal),
+    createPersona: (body: PersonaEdit) => request<Persona>('POST', '/v1/personas', { body }),
+    editPersona: (id: string, body: PersonaEdit) => request<Persona>('PUT', `/v1/personas/${encodeURIComponent(id)}`, { body }),
+    createTeam: (body: TeamEdit) => request<Team>('POST', '/v1/teams', { body }),
+    editTeam: (id: string, body: TeamEdit) => request<Team>('PUT', `/v1/teams/${encodeURIComponent(id)}`, { body }),
     personas: (signal?: AbortSignal) => get<Persona[]>('/v1/personas', undefined, signal),
     teams: (signal?: AbortSignal) => get<Team[]>('/v1/teams', undefined, signal),
     projects: (signal?: AbortSignal) => get<Project[]>('/v1/projects', undefined, signal),
@@ -201,6 +209,10 @@ export function createApi(options: ApiOptions) {
     /** A field left out is unchanged; `null` clears `workstream`, `start` or `due`. */
     patchTask: (task: string, patch: TaskPatch) =>
       request<Task>('PATCH', `/v1/tasks/${id(task)}`, { body: patch }),
+    safety: (signal?: AbortSignal) => get<{ permission_mode: import('./types.ts').PermissionMode }>('/v1/safety', undefined, signal),
+    sessionOptions: (machine: string, signal?: AbortSignal) =>
+      get<SessionOptions>(`/v1/machines/${id(machine)}/session-options`, undefined, signal),
+    startSession: (start: StartSession) => request<Session>('POST', '/v1/sessions', { body: start }),
     sessions: (filters: SessionFilters = {}, signal?: AbortSignal) =>
       get<Session[]>('/v1/sessions', { ...filters }, signal),
     session: (session: string, signal?: AbortSignal) =>

@@ -229,7 +229,15 @@ fn an_unknown_session_and_a_transcript_that_cannot_be_read_are_different_errors(
     let lines = fixture_lines();
     let path = claude_file(home.path(), FIXTURE_ID);
     std::fs::write(&path, lines[..5].concat()).unwrap();
-    let (runner, s) = watch(home.path(), state.path());
+    let first_sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![Arc::new(ClaudeAdapter::new())],
+        first_sink.clone(),
+    )
+    .unwrap();
+    first_sink.wait_for(3, CEILING).expect("first transcript");
+    let s = discovered(&first_sink.events()).id;
     let stranger = SessionId::new();
     assert!(matches!(
         runner.transcript_page(stranger, None, None),
@@ -240,6 +248,10 @@ fn an_unknown_session_and_a_transcript_that_cannot_be_read_are_different_errors(
     std::fs::remove_file(&path).unwrap();
     let gone = runner.transcript_page(s, None, None);
     assert!(unavailable(&gone, s), "{gone:?}");
+    first_sink
+        .wait_for(4, CEILING)
+        .expect("deletion becomes idle before restart");
+    assert_eq!(common::label(&first_sink.events()[3]), "state:Idle");
     runner.stop();
 
     // After a restart the index still has the session, not its transcript.

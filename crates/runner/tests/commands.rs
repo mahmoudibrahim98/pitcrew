@@ -388,3 +388,61 @@ fn refusals_and_failures() {
     assert_eq!(run(RunnerCommand::Scan { roots: vec![] }), ok());
     r.runner.stop();
 }
+
+#[test]
+fn personal_folder_starts_coexist_but_a_named_start_still_conflicts() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let runtime = Arc::new(Recording::default());
+    let r = rig(
+        home.path(),
+        state.path(),
+        runtime.clone(),
+        CommandOptions::default(),
+    );
+    let start = |session| RunnerCommand::StartSession {
+        engine: Engine::Codex,
+        cwd: work.path().to_str().unwrap().into(),
+        name: "personal".into(),
+        brief: None,
+        persona: None,
+        model: None,
+        account: None,
+        permission_mode: PermissionMode::Default,
+        session: Some(session),
+    };
+    let (first, second) = (SessionId::new(), SessionId::new());
+    detail(&r.commands.run_unclaimed(CommandId::new(), &start(first)));
+    detail(&r.commands.run_unclaimed(CommandId::new(), &start(second)));
+    assert_eq!(runtime.list().unwrap().len(), 2);
+    assert_eq!(r.commands.started(first), pitcrew_runner::Started::Running);
+    assert_eq!(r.commands.started(second), pitcrew_runner::Started::Running);
+    assert_eq!(
+        r.commands.run(CommandId::new(), &start(SessionId::new())),
+        CommandOutcome::Rejected {
+            reason: pitcrew_runner::FOLDER_BUSY.into()
+        }
+    );
+    assert_eq!(runtime.list().unwrap().len(), 2);
+    r.runner.stop();
+    drop(r.commands);
+    drop(r.terminals);
+    let reopened = rig(
+        home.path(),
+        state.path(),
+        runtime.clone(),
+        CommandOptions::default(),
+    );
+    detail(
+        &reopened
+            .commands
+            .run_unclaimed(CommandId::new(), &start(SessionId::new())),
+    );
+    assert_eq!(
+        runtime.list().unwrap().len(),
+        3,
+        "the exemption survives a restart"
+    );
+    reopened.runner.stop();
+}

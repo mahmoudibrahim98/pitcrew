@@ -1,7 +1,8 @@
 // "+ New": a menu of the registered create items, each opening its dialog. The palette's "New …"
 // commands open the same dialogs.
 
-import { Suspense, useId } from 'react';
+import { useParams } from '@tanstack/react-router';
+import { Suspense, useId, useRef } from 'react';
 import {
   Button,
   Dialog,
@@ -52,6 +53,7 @@ function NewMenuItem({ entry, onOpen }: { entry: ResolvedCreate; onOpen(id: stri
 }
 
 export function NewMenu() {
+  const { project }: { project?: string } = useParams({ strict: false });
   const registry = useRegistry();
   const setCreating = useShell((s) => s.setCreating);
   return (
@@ -70,7 +72,7 @@ export function NewMenu() {
         }}
       >
         <MenuLabel>Create</MenuLabel>
-        {registry.create.map((entry) => (
+        {registry.create.filter((entry) => !entry.projectContext || project !== undefined).map((entry) => (
           <NewMenuItem
             key={entry.id}
             entry={entry}
@@ -90,6 +92,7 @@ function focusAfterCreate(from: Element | null): void {
 
 export function CreateDialog() {
   const registry = useRegistry();
+  const content = useRef<HTMLDivElement>(null);
   const creating = useShell((s) => s.creating);
   const from = useShell((s) => s.creatingFrom);
   const setCreating = useShell((s) => s.setCreating);
@@ -101,6 +104,11 @@ export function CreateDialog() {
   return (
     <Dialog open onOpenChange={(open) => !open && close()}>
       <DialogContent
+        ref={content}
+        onOpenAutoFocus={(event) => {
+          const field = content.current?.querySelector<HTMLInputElement>('[data-create-focus]');
+          if (field !== undefined && field !== null) { event.preventDefault(); field.focus(); }
+        }}
         title={entry.title ?? `New ${entry.label.toLowerCase()}`}
         // The dialog has no trigger element of its own, so it hands focus back itself.
         onCloseAutoFocus={(event) => {

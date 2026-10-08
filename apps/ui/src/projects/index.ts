@@ -99,7 +99,13 @@ export const feature = defineFeature({
       run: (c) => c.go('settings/integrations'),
     },
   ],
-  create: [{ id: 'task', label: 'Task', order: 10, dialog: lazy(() => import('./new-task.tsx').then((m) => ({ default: m.NewTaskDialog }))) }],
+  create: [
+    { id: 'task', label: 'Task', order: 10, dialog: lazy(() => import('./new-task.tsx').then((m) => ({ default: m.NewTaskDialog }))) },
+    { id: 'agent', label: 'Agent', order: 20, dialog: lazy(() => import('./new-entities.tsx').then((m) => ({ default: m.NewAgentDialog }))) },
+    { id: 'project', label: 'Project', order: 30, dialog: lazy(() => import('./new-entities.tsx').then((m) => ({ default: m.NewProjectDialog }))) },
+    { id: 'workstream', label: 'Workstream', order: 35, projectContext: true, dialog: lazy(() => import('./new-entities.tsx').then((m) => ({ default: m.NewWorkstreamDialog }))) },
+    { id: 'team', label: 'Team', order: 40, dialog: lazy(() => import('./new-entities.tsx').then((m) => ({ default: m.NewTeamDialog }))) },
+  ],
 });
 
 export const Home = lazy(() => import('./home.tsx').then((m) => ({ default: m.Home })));

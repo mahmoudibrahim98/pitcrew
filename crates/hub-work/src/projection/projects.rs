@@ -20,8 +20,8 @@ pub struct Projects;
 impl Projects {
     /// The projection's name.
     pub const NAME: &'static str = "work.projects";
-    /// 2: project keys are unique; a `project_created` whose key is taken is not applied.
-    const VERSION: u32 = 2;
+    /// 3: workstreams whose project is missing are skipped, including a rejected key race.
+    const VERSION: u32 = 3;
 }
 
 impl Projection for Projects {
@@ -125,6 +125,14 @@ fn project_created(tx: &Transaction<'_>, rev: i64, p: &Project) -> Applied {
 }
 
 fn workstream_created(tx: &Transaction<'_>, rev: i64, w: &Workstream) -> Applied {
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM work_projects WHERE id = ?1)",
+        params![w.project.text()],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(());
+    }
     let id = w.id.text();
     exec(
         tx,

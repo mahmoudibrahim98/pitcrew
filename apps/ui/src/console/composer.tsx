@@ -30,7 +30,7 @@ export function Composer({ sessionId, className }: ComposerProps) {
 
   const snapshot = `${session.data?.state}:${session.data?.last_activity}:${machine?.liveness}`;
   const blocked =
-    inputBlocked(session.data, machine) ?? (unreachable?.at === snapshot ? unreachable.message : undefined);
+    inputBlocked(session.data, machine) ?? (session.data !== undefined && session.data.terminal == null ? 'PitCrew did not start this session, so it cannot send input. Start a new session in PitCrew to use its terminal.' : undefined) ?? (unreachable?.at === snapshot ? unreachable.message : undefined);
 
   const error = [send.error, keys.error, interrupt.error].find(
     (e): e is Error => e !== null && !(e instanceof ApiError && e.code === 'unavailable'),

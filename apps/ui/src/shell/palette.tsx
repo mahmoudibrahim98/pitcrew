@@ -61,6 +61,7 @@ function useItems(opener: Element | null): Item[] {
   const layout = useLayout();
   const params: { task?: string; session?: string } = useParams({ strict: false });
   const registry = useRegistry();
+  const { project }: { project?: string } = useParams({ strict: false });
   const setCreating = useShell((s) => s.setCreating);
   const projects = useProjects().data ?? [];
   const workstreams = useWorkstreams().data ?? [];
@@ -103,7 +104,7 @@ function useItems(opener: Element | null): Item[] {
         run: () => c.run(context),
       })),
     ...registry.create
-      .filter((e) => e.disabled === undefined)
+      .filter((e) => e.disabled === undefined && (!e.projectContext || project !== undefined))
       .map<Item>((e) => ({
         id: `create:${e.id}`,
         kind: 'create',

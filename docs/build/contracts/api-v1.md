@@ -143,7 +143,11 @@ the task key (`PAP-4`).
 | `DELETE /v1/machines/{id}/agents/{engine}/sign-in` | → 204 | Stops that sign-in and removes its terminal. The hub's owner only. |
 | `GET /v1/members` | → `Member[]` | **agent** |
 | `GET /v1/personas` | → `Persona[]` | |
+| `POST /v1/personas` | `PersonaEdit` → `Persona` (201) | Device only; emits `persona_saved` and an owned agent `member_added` in one append. |
+| `PUT /v1/personas/{id}` | `PersonaEdit` → `Persona` | Device only; unknown id 404; emits `persona_saved`. |
 | `GET /v1/teams` | → `Team[]` | |
+| `POST /v1/teams` | `TeamEdit` → `Team` (201) | Device only; emits `team_saved`. |
+| `PUT /v1/teams/{id}` | `TeamEdit` → `Team` | Device only; unknown id 404; emits `team_saved`. |
 
 #### The first run: `POST /v1/setup`
 
@@ -181,6 +185,21 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
   `409`. Start it with `PITCREW_MOCK_FRESH=1` for an empty workspace (no members, machines or
   work) whose setup succeeds once.
 
+`PersonaEdit`: `{ "name": String, "engine": Engine, "model"?: String,
+"instructions"?: String, "permission_mode"?: PermissionMode }` (default `default`). Names are
+trimmed, 1–80 code points, with no control characters; model is nonblank, control-free and at
+most 200 code points when supplied; instructions are at most 32,000 code points (multiline).
+Invalid fields answer 400 and append nothing. Ids and event authors are assigned by the hub.
+Creating an agent recipe also creates an agent member owned by the caller, with that persona,
+name and a friendly engine handle (`@claude`, `@codex`, `@opencode`, with a numeric suffix only on collision). This makes it selectable in teams without
+changing `Persona` or `Team` fields. Editing a recipe updates its linked members' names in the
+same append, only when every linked member is owned by the caller (otherwise 403; unlinked recipes are editable). Bypass permissions and models beginning with `-` are refused (400); saving a recipe launches nothing.
+
+`TeamEdit`: `{ "name": String, "lead": MemberId, "members": MemberId[] }`. Name follows the
+same rule. Members are existing people or agent members (including those linked to personas),
+never persona ids. Unknown ids answer 400; duplicate ids are dropped and the lead is included.
+At most 256 members; validation completes before any event is appended.
+
 ### Projects and workstreams
 
 | Method and path | Body → response | Notes |
@@ -196,7 +215,7 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 `NewProject`, `NewWorkstream` and `NewTask` are Rust types in `crates/protocol/src/api.rs`.
 
 `NewProject`: `{ "key": ProjectKey, "name": String, "lead"?: MemberId, "members"?: MemberId[],
-"status"?: ProjectStatus, "start"?: Date, "due"?: Date, "root"?: Location }`. The hub assigns `id`;
+"status"?: ProjectStatus, "start"?: Date, "due"?: Date, "root"?: Location, "first_workstream"?: String }`. The hub assigns `id`;
 `external` starts empty.
 - `key` is a `ProjectKey`: 2 to 10 characters, an uppercase ASCII letter, then uppercase letters or
   digits (`PAP`, `TL2`). Any other key is `400 invalid`; a key another project has is
@@ -206,7 +225,14 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
   (put first when the list leaves it out), and duplicates are dropped. An unknown member is `400`.
 - `status` defaults to `in_progress`.
 - Dates are `YYYY-MM-DD`, and `start` ≤ `due` when both are set (`400`).
-- `root` names a known machine and a non-empty path (`400`).
+- `root` names a known machine and a non-empty path (`400`). The creation dialog requires an
+  absolute path for the selected platform (drive/UNC on Windows, `/` on Unix). The hub also
+  rejects relative or incompatible paths for its local machine. Setup records its OS and
+  architecture from the hub platform.
+- `first_workstream`, when supplied, is a nonblank workstream name. Both objects are validated
+  before one atomic append of `project_created` and `workstream_created`; its location is the
+  project's root. This optional extension avoids a half-created project if a second HTTP request
+  fails. Standalone workstreams use `POST /v1/workstreams` as before.
 
 `NewWorkstream`: `{ "project": ProjectId, "name": String, "status"?: WorkstreamStatus,
 "locations"?: Location[] }`. The hub assigns `id`; `health` starts `on_track` and `external` empty.
@@ -351,7 +377,9 @@ New workstreams trigger another pass over existing runner sessions.
 
 `StartSession`: `{ "machine": MachineId, "engine": Engine, "cwd": String, "agent"?: MemberId,
 "task"?: TaskId, "brief"?: String, "persona"?: PersonaId, "model"?: String,
-"permission_mode"?: PermissionMode }`. `persona`, `model` and `permission_mode` are launch options
+"permission_mode"?: PermissionMode, "title"?: String, "workstream"?: WorkstreamId }`. A title is trimmed, 1–200 Unicode
+characters, with no control characters. It overrides the transcript's title without changing it.
+`persona`, `model` and `permission_mode` are launch options
 and are not echoed on `Session`. With a `task`, the session is linked with `link_basis: "manual"`.
 - With an `agent` or a `task`, the hub stores the session before its CLI starts
   (`session_discovered`, state `starting`, the agent named, linked to the task) and answers it
@@ -362,7 +390,42 @@ and are not echoed on `Session`. With a `task`, the session is linked with `link
   the start, the session ends (`session_ended`) and the start answers why. If the runner does not
   answer in time, the start answers `503` and the session stays `starting`: the hub ends it later
   only if its CLI did not start, as for a dispatch. It moves no task: only a dispatch does.
-- Without them, the start answers once the runner has found the CLI's transcript.
+- Without them, the hub also records a `starting` session before launching. Every successful
+  start answers `202` with its terminal, even without a prompt or transcript yet. The transcript
+  adopts that id later. This makes the terminal available for the first prompt. Person starts without an agent or task
+  are not subject to the 15-minute named-start deadline; a running terminal keeps them alive,
+  and multiple such starts in one folder retain the existing best-effort folder matching.
+- CLI availability, permission modes, bypass policy and argument constraints are checked before
+  recording a start (400 with a plain reason). An ambiguous named start in the same folder is
+  409 `conflict`. A runtime failure after validation can still end a recorded start.
+- An explicit `workstream` links the session by hand before launching. Without one, a workstream
+  whose location contains the resolved folder is inferred at start. Firm links survive adoption.
+
+`GET /v1/machines/{id}/session-options` (person-only) returns
+`SessionOptions`: `{ "platform": "windows" | "unix", "engines":
+[{ "engine": Engine, "permission_modes": PermissionMode[], "first_prompt_forbidden": String[] }] }`. Only executable CLIs
+on that runner's PATH are listed; none are run to detect availability. Modes reflect launch
+support and the runner's bypass policy (Codex has no plan mode; OpenCode uses its settings).
+Unknown machines are `404`; no runner, no terminal runtime or an unreachable machine is `503`.
+Availability is advisory: a CLI removed after the check can still fail at launch.
+`first_prompt_forbidden` lists characters that cannot be passed through an installed Windows
+batch wrapper (control characters and `" % ! ^ & | < > ( )`); it is empty for native programs and
+Unix CLIs. Such a prompt is refused before recording, with 400 and advice to enter it in the
+terminal after starting. The dialog checks these limits and selects the saved safety default
+only when supported by the chosen engine.
+
+Working and Starting from transcripts become Idle after **five minutes** without
+transcript writes, accepted hooks or a known live terminal. **Waiting or an open tool call gets
+60 minutes**: a quiet permission decision or a long tool run should not look abandoned after
+five minutes, while abandoned waits still expire within an hour. An unavailable terminal list
+is unknown evidence: expiry is skipped and that failure is not cached. A deleted transcript
+emits Idle (unless terminal evidence is alive or unknown), including after restart.
+The runner checks this during its
+existing safety sweeps (normally 30 seconds; 120 seconds on polled network homes). Old transcripts
+are normalized before discovery, including after restart. Expiry clears the status line, emits
+`session_state_changed` and never edits a transcript. A later write/hook can resume activity;
+ended and unreachable states are preserved. Terminal/process evidence is obtained from the
+runner's bounded runtime calls, never by guessing a process from its name.
 
 **Transcript paging.** Tail-first: without `before`, the newest page; pass a page's `from` as
 `before` to get the previous one. `limit` counts items (default 200, max 1000). Pages hold
@@ -602,8 +665,14 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   `~/.codex`, OpenCode's data folder, or where `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and
   `XDG_DATA_HOME` point). On the daemon these are the runner's homes: `--homes` when given, none
   with `--demo` alone. It reads a prefix of each transcript (one indexed row of an OpenCode
-  store), never a whole transcript, and never prompt text. It is not an import: it appends no
-  event and creates nothing.
+  store), never a whole transcript, and never prompt text. It does not import sessions. During
+  setup, every successful scan also ensures one dispatchable, caller-owned agent per detected engine
+  (`counts.by_engine` with a positive count), before the `done` frame. Missing recipes and members
+  are appended together as `persona_saved`/`member_added`, using default permissions. A person who
+  already owns an agent with that engine's persona gets no duplicate; repeat/concurrent scans are
+  idempotent. `@office` (no persona) never satisfies this requirement. Empty, failed or canceled
+  scans create no agents; partial scans provision only engines actually detected. A provisioning
+  failure returns an `error` frame and appends none of the new agents.
 - **Which machine.** Only the hub's own (its first `local` machine). An unknown or malformed id
   is `404`. Another machine of the workspace is `409 conflict`: scanning it is not supported yet.
   A hub that reads no agent homes (the daemon with `--no-runner`) is `409` too. The body is
@@ -1165,3 +1234,15 @@ has no changes. Conflicting engines are excluded from preview files and skipped,
 with their status shown to the person. CLI homes also establish engine presence
 when a GUI process lacks CLI binaries on PATH. The desktop ships `pitcrew` beside
 `pitcrewd`, and the Hooks step disables Install when there are no file changes.
+
+### Directory write safeguards
+
+`PUT /v1/personas/{id}` answers `403` unless every member linked to the persona is owned by
+the caller; an unlinked persona is editable by any person. Refusals append no events and rename
+no members. Both persona write routes reject `bypass_permissions` with the same message as
+saving safety settings, and reject a trimmed model beginning with `-` (`400 invalid`).
+New agents use `@claude`, `@codex`, or `@opencode`, adding `-2`, `-3`, … only when a handle is
+already taken. Handles remain stable on edits. Dispatch requires an agent linked to an existing
+persona; service actors such as `@office` and `@sync` cannot be dispatched (`400 invalid`).
+Every successful machine scan provisions missing owned agents for the engines it detected;
+repeated scans reuse existing owned, persona-linked agents.
