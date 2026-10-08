@@ -252,6 +252,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         let _ = main_window(app);
         return Err(crate::portable::WEBVIEW2_MISSING.into());
     }
+    crate::portable::log_detected();
     let handle = app.handle().clone();
     let paths = app.path();
     let config_dir = paths.app_config_dir()?;
