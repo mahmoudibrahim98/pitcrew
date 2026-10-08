@@ -348,7 +348,8 @@ notesUrl?: string, downloadUrl?: string }`.
 `gateway_update_check()` checks now and returns the same status.
 `gateway_update_channel({ prereleases: boolean })` saves the choice (default false), discards
 the pending update, and checks again. `gateway://update` carries the status after each check.
-Checks also run at startup and every 24 hours. An empty compiled public key disables checks.
+Checks also run at startup and every 24 hours. An empty compiled public key disables checks
+(except in a portable copy, below).
 `gateway_update_install({ version: string })` installs only the pending version shown to the
 person, after explicit consent; the updater verifies its minisign signature before installation.
 Signatures must bind the artifact to the offered version in their authenticated trusted comment.
@@ -361,14 +362,21 @@ eligible semantic version with a feed from GitHub's latest 100 published release
 pre-releases. Downgrades and equal versions are never offered. Linux self-update is for
 AppImage installs; deb/rpm users update through their package manager.
 
-**A portable copy** (`portable.txt` next to the app's executable: the portable Windows zip) has
-`portable: true`. It checks whether or not a public key is compiled in (`enabled` is always true),
-but never downloads or installs: `gateway_update_install` for the pending version opens the fixed
-page of the portable workflow's successful runs for pushes to `main` (`event:push`, never a
-pull request's run, whose head branch may also be named `main`; where the newest
-`pitcrew-windows-x64-portable.zip` is) in the system browser, and fails with a sentence saying
-so, for the UI to show. While an update is pending, `downloadUrl` is that page (portable copies
-only). An installed copy has `portable: false` and no `downloadUrl`.
+**A portable copy** (the portable Windows zip: `portable.txt` next to the app's executable, on
+Windows, and no `uninstall.exe` there) has `portable: true` and never downloads or installs.
+- **A release's zip** (`channel=release` in `portable.txt`) checks whether or not a public key is
+  compiled in (`enabled: true`). It reads GitHub's latest 100 published releases and offers the
+  greatest version newer than its own among those that carry `pitcrew-windows-x64-portable.zip`
+  (pre-releases only with the opt-in); no release, or none newer, is no update. While one is
+  pending, `downloadUrl` is that release's fixed page (the same as `notesUrl`), where the zip is.
+- **A development build** (any other channel: built from `main` or a pull request) never checks
+  (`enabled: false`) and has no `version`.
+- `gateway_update_notes` opens the pending release's page, as for an installed copy.
+  `gateway_update_install` for the pending version opens the same page in the system browser and
+  fails with a sentence saying so, for the UI to show; the UI offers **Download** (the notes
+  command) instead of an install.
+
+An installed copy has `portable: false` and no `downloadUrl`.
 
 ## Security notes
 
