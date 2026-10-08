@@ -7,10 +7,12 @@ import {
   useApi,
   useMachines,
   useMe,
+  useOrchestrator,
   useProjects,
   useSessions,
   useTasks,
   useWorkstreams,
+  type Engine,
   type Health,
   type SessionState,
   type TaskStatus,
@@ -237,10 +239,14 @@ export function SetupPage() {
   );
 }
 
-/** The agent CLIs the Orchestrator answers with, and how each signs in, in its own terminal. */
-const SIGN_IN: { engine: string; install: string; signIn: string }[] = [
-  { engine: 'Claude Code', install: 'claude', signIn: 'claude, then /login' },
-  { engine: 'OpenCode', install: 'opencode', signIn: 'opencode auth login' },
+/**
+ * The agent CLIs the Orchestrator may answer with, and how each signs in, in its own terminal. The
+ * page lists those the hub offers (`GET /v1/orchestrator`'s `engines`: on Windows, Claude Code
+ * only); Claude Code alone until it has said.
+ */
+const SIGN_IN: { id: Engine; engine: string; install: string; signIn: string }[] = [
+  { id: 'claude', engine: 'Claude Code', install: 'claude', signIn: 'claude, then /login' },
+  { id: 'opencode', engine: 'OpenCode', install: 'opencode', signIn: 'opencode auth login' },
 ];
 
 /**
@@ -254,6 +260,8 @@ export function SignInPage() {
   const own = useMachines()
     .data?.find((m) => m.kind === 'local')
     ?.name.trim();
+  const offered = useOrchestrator().data?.engines.map((e) => e.engine);
+  const rows = SIGN_IN.filter((row) => (offered === undefined ? row.id === 'claude' : offered.includes(row.id)));
   return (
     <Page title="Sign in to your agents">
       <p className="text-sm text-ink-2">
@@ -263,7 +271,7 @@ export function SignInPage() {
       <SignInPanel api={api} target={{ kind: 'local' }} machineLabel={own === '' ? undefined : own} />
       <p className="text-sm text-ink-2">Or install one there and sign in once, in a terminal:</p>
       <List label="Agent CLIs" empty="">
-        {SIGN_IN.map((row) => (
+        {rows.map((row) => (
           <Row key={row.engine}>
             <span className="w-28 font-medium">{row.engine}</span>
             <span className="text-ink-2">

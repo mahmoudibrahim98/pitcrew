@@ -1,8 +1,9 @@
 // An Orchestrator answer, shown as text. The answer comes from an agent CLI that read what other
 // people and agents wrote, so it is untrusted: nothing in it is ever markup. This renders a small,
 // safe subset of Markdown as React elements (paragraphs, lists, code blocks, `code` and **strong**)
-// and turns the references the hub checked into links to app routes. Every other link stays text:
-// no URL from an answer is ever opened.
+// and turns the references the hub checked into links to app routes, each labelled in the hub's
+// words (a Markdown link's own label stays text before it). Every other link stays text: no URL
+// from an answer is ever opened.
 
 import type { MouseEvent, ReactNode } from 'react';
 import type { AnswerReference, ReferenceTarget } from '../data/index.ts';
@@ -36,7 +37,7 @@ export type Inline =
   | { t: 'text'; v: string }
   | { t: 'code'; v: string }
   | { t: 'strong'; c: Inline[] }
-  | { t: 'ref'; ref: AnswerReference; label?: string };
+  | { t: 'ref'; ref: AnswerReference };
 
 export type Block =
   | { t: 'p'; lines: Inline[][] }
@@ -111,7 +112,14 @@ export function inlines(text: string, refs: readonly AnswerReference[], depth = 
         const [whole, label = '', target = ''] = link;
         const ref = refs.find((r) => r.text === target);
         flush();
-        if (ref !== undefined) out.push({ t: 'ref', ref, label });
+        if (ref !== undefined) {
+          // A link says what it opens in the hub's words, never the answer's: the answer's own
+          // label stays text before it (`[PAP-7 (the blocked one)](PAP-9)` reads as that text,
+          // then a link labelled PAP-9).
+          const own = label.trim();
+          if (own === '' || own === ref.text || own === referenceText(ref)) out.push({ t: 'ref', ref });
+          else out.push(...withRefs(`${own} (`, refs), { t: 'ref', ref }, { t: 'text', v: ')' });
+        }
         // Any other link stays text: its label, then where it pointed.
         else out.push(...withRefs(`${label} (${target})`, refs));
         i += whole.length;
@@ -231,7 +239,7 @@ function renderInlines(nodes: readonly Inline[], ws: string, open: (path: string
               open(path);
             }}
           >
-            {node.label ?? referenceText(node.ref)}
+            {referenceText(node.ref)}
           </a>
         );
       }

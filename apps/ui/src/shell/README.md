@@ -43,8 +43,9 @@ person already uses, on the hub's machine, with a token that may only read.
   headings, code, `code` and **strong**) built as React elements, never HTML. Only the references
   the hub checked become links, matched as whole words as the hub finds them, labelled with the
   hub's name for them, to app routes (`referencePath`: sessions to the console, tasks, workstreams,
-  projects; a recap to its workstream or project); `[label](reference)` links one too. Every
-  other link stays text, its URL beside it.
+  projects; a recap to its workstream or project); `[label](reference)` links one too, still in
+  the hub's words, with the answer's own label as text before it (so `[PAP-7](PAP-9)` cannot read
+  as PAP-7 and open PAP-9). Every other link stays text, its URL beside it.
 - **Suggestions are buttons**, and nothing happens until the person clicks one: "Open …" goes to
   its route; "Move …" asks first, then moves the task as the person (`useMoveTask`). While an
   answer streams its suggestions may change, so each is followed by what it is (`suggestionKey`:
@@ -56,8 +57,9 @@ person already uses, on the hub's machine, with a token that may only read.
 - **No agent CLI installed** on the hub's machine: the panel says so, and links to
   `paths.signIn(ws)` (`/w/$ws/sign-in`). That page shows onboarding's sign-in panel for the hub's
   own machine (each CLI, whether it is signed in, and its own login in a terminal; the hub's owner
-  only, so anyone else is told why), then how to install and sign in by hand. The engines are the
-  ones the hub offers (Claude Code and OpenCode; Codex cannot answer the Orchestrator).
+  only, so anyone else is told why), then how to install and sign in by hand. That list holds the
+  engines the hub offers (`GET /v1/orchestrator`: Claude Code and OpenCode, Claude Code only on
+  Windows; Codex cannot answer the Orchestrator).
 
 ## Workspaces in the desktop app
 

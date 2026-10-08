@@ -51,9 +51,23 @@ describe('an answer', () => {
   it('keeps every other link as text, and never opens a URL from an answer', () => {
     show('[the method](PAP-1) and [a page](https://example.invalid/x) and [run](javascript:alert(1))');
     const links = screen.getAllByRole('link');
-    expect(links.map((a) => a.textContent)).toEqual(['the method']);
+    expect(links.map((a) => a.textContent)).toEqual(['PAP-1']);
+    expect(document.body.textContent).toContain('the method (PAP-1)');
     expect(document.body.textContent).toContain('a page (https://example.invalid/x)');
     expect(document.body.textContent).toContain('run (javascript:alert(1)');
+  });
+
+  it("labels a link in the hub's words, never the answer's", () => {
+    // The answer says PAP-7, but the link opens PAP-1: the link reads PAP-1.
+    show(`[PAP-7 (the blocked one)](PAP-1), [ses_${SES}](ses_${SES}) and [PAP-1](PAP-1).`);
+    const links = screen.getAllByRole('link');
+    expect(links.map((a) => [a.textContent, a.getAttribute('href')])).toEqual([
+      ['PAP-1', `/w/${WS}/tasks/PAP-1`],
+      ['Draft method section', `/w/${WS}/console/${SES}`],
+      ['PAP-1', `/w/${WS}/tasks/PAP-1`],
+    ]);
+    expect(links.some((a) => a.textContent?.includes('PAP-7'))).toBe(false);
+    expect(document.body.textContent).toContain('PAP-7 (the blocked one) (PAP-1)');
   });
 
   it('renders a small, safe subset: lists, code, headings', () => {

@@ -208,6 +208,20 @@ describe('the Orchestrator panel', () => {
     // And how to do it by hand.
     expect(screen.getByText('opencode auth login')).toBeTruthy();
   });
+
+  it('lists by hand only the agent CLIs the hub offers (Claude Code only on Windows)', async () => {
+    useShell.setState({ ...initialShellState, orchestratorOpen: false });
+    const windows: Orchestrator = {
+      engines: [{ engine: 'claude', installed: true }],
+      limits: { question_chars: 4000, answer_bytes: 16384, answer_seconds: 300, turns: 20, conversations: 20 },
+      conversations: [],
+    };
+    const silent: SocketFactory = () => ({ onmessage: null, onclose: null, onerror: null, close: () => undefined });
+    renderApp(`/w/${WORKSPACE}/sign-in`, silent, (client) => client.setQueryData(keys.orchestrator, windows));
+    await screen.findByRole('heading', { name: 'Sign in to your agents' }, { timeout: 8_000 });
+    expect(screen.getByText('claude, then /login')).toBeTruthy();
+    expect(screen.queryByText('opencode auth login')).toBeNull();
+  });
 });
 
 describe('suggestions', () => {
