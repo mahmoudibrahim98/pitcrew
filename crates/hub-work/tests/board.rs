@@ -1132,3 +1132,43 @@ async fn sessions_the_import_choice_hides_are_neither_sent_nor_evidence() {
     .await;
     expect(&res, 400);
 }
+
+/// A start refused before anything is stored (a person named as the agent, an unknown one) keeps
+/// the preview: the next start with its digest still sends exactly what the person saw, though
+/// the workstream moved on since. Only a start that stores its draft uses it.
+#[tokio::test]
+async fn a_refused_start_keeps_the_preview() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(None);
+    let now = Arc::new(AtomicI64::new(1_790_900_000_000));
+    let work = service_at(dir.path(), Arc::clone(&runner), Arc::clone(&now));
+    let shown = preview(&work, SUBMISSION).await;
+    let noisy = noisy_session(&work);
+    let rev = latest(&work);
+    for agent in [SAM, "01J00000000000000000000000"] {
+        expect(
+            &start(
+                &work,
+                SUBMISSION,
+                json!({ "agent": agent, "digest": shown["digest"] }),
+            )
+            .await,
+            400,
+        );
+    }
+    assert_eq!(latest(&work), rev, "a refused start stores nothing");
+    let res = start(
+        &work,
+        SUBMISSION,
+        json!({ "agent": WRITER, "digest": shown["digest"] }),
+    )
+    .await;
+    expect(&res, 202);
+    let request = &runner.starts()[0];
+    assert!(
+        request
+            .brief
+            .contains(shown["summary"].as_str().expect("summary"))
+    );
+    assert!(!request.brief.contains(&noisy.0.to_string()));
+}

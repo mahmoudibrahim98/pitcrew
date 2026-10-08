@@ -111,14 +111,21 @@ impl Previews {
         }
     }
 
-    fn take(&mut self, workstream: WorkstreamId, digest: &str, now: TimestampMs) -> Option<Made> {
+    /// `workstream`'s kept preview with `digest`, if it is still kept. It stays kept until
+    /// [`Previews::used`]: a start refused before it stored anything leaves it for the next.
+    fn find(&mut self, workstream: WorkstreamId, digest: &str, now: TimestampMs) -> Option<Made> {
         self.0
             .retain(|(_, at, _)| now.saturating_sub(*at) <= PREVIEW_KEPT_MS);
-        let i = self
-            .0
+        self.0
             .iter()
-            .position(|(w, _, made)| *w == workstream && made.digest == digest)?;
-        Some(self.0.remove(i).2)
+            .find(|(w, _, made)| *w == workstream && made.digest == digest)
+            .map(|(.., made)| made.clone())
+    }
+
+    /// `workstream`'s preview with `digest` was sent: a draft started with it.
+    fn used(&mut self, workstream: WorkstreamId, digest: &str) {
+        self.0
+            .retain(|(w, _, made)| !(*w == workstream && made.digest == digest));
     }
 }
 
@@ -314,7 +321,7 @@ impl WorkService {
             .previews
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take(workstream.id, &start.digest, self.now());
+            .find(workstream.id, &start.digest, self.now());
         let made = match previewed {
             Some(made) => made,
             None => self.make_prompt(&workstream)?,
@@ -431,6 +438,12 @@ impl WorkService {
                 self.by(caller, EventBody::SessionDiscovered { session }),
                 self.by(caller, started),
             ])?;
+            // Only now is the preview used: a start refused before this (`400`, `403`, `409`,
+            // `503`) keeps it for the next.
+            self.previews
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .used(workstream.id, &start.digest);
             (id, request, dispatcher)
         };
 

@@ -24,9 +24,11 @@
 //! - e-mail addresses, as `[email]`;
 //! - a home folder: `/home/<name>`, `/Users/<name>`, `C:\Users\<name>` (also as
 //!   `\\?\C:\Users\<name>` and WSL's `/mnt/c/Users/<name>`) become `~`, and `/root` too;
-//! - any other absolute path (`/scratch/<group>/<user>/…`, `D:\data\<user>\…`) keeps only its
-//!   end, `…/<file>` ([`path_tail`]), so a user name in it does not go; the end of a path is what
-//!   says which file it is.
+//! - any other absolute path of a file keeps only its file name, `…/<file>` ([`path_tail`]), so a
+//!   user name in a folder of it does not go (`/scratch/<group>/<user>/run.sh` is `…/run.sh`).
+//!   In a file's path ([`path`]) every absolute path is cut so (a folder's to `…`); in other text
+//!   (a title, a note) only a Windows path or a path ending in a file name is, so a URL's path
+//!   (`/api/users`) stays, and so does a folder's path there.
 //!
 //! Hidden characters (`pitcrew_protocol::text::is_hidden`) and control characters other than
 //! whitespace are dropped, and whitespace runs become one space, before anything is matched, so a
@@ -135,12 +137,27 @@ pub struct Redacted {
 /// cut there starts past `max` or is still long enough to match.
 #[must_use]
 pub fn line(text: &str, max: usize) -> Redacted {
+    line_with(text, max, Tails::FilesOnly)
+}
+
+/// Which absolute paths [`tails`] cuts to their end.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tails {
+    /// Only those that are plainly a file's path: a Windows path, or a path ending in a file
+    /// name. Free text (a title, a note) keeps a URL's path (`/api/users`) whole.
+    FilesOnly,
+    /// Every one: the text is a file's path ([`path`]).
+    Every,
+}
+
+/// [`line`], cutting the absolute paths `tails` says.
+fn line_with(text: &str, max: usize, which: Tails) -> Redacted {
     if max == 0 {
         return Redacted::default();
     }
     let limit = max.saturating_mul(SCAN_FACTOR).saturating_add(64);
     let (tidy, cut) = tidy(text, limit);
-    let mut out = redact(&tidy);
+    let mut out = redact(&tidy, which);
     let chars = out.text.chars().count();
     if chars > max || (cut && chars == max) {
         let mut kept: String = out.text.chars().take(max.saturating_sub(1)).collect();
@@ -182,7 +199,7 @@ fn tidy(text: &str, limit: usize) -> (String, bool) {
 }
 
 /// Every rule over one tidy line.
-fn redact(text: &str) -> Redacted {
+fn redact(text: &str, cut: Tails) -> Redacted {
     if text.contains("PRIVATE KEY") && text.contains("-----BEGIN") {
         return Redacted {
             text: REDACTED.to_owned(),
@@ -223,7 +240,7 @@ fn redact(text: &str) -> Redacted {
     let (text, homes) = homes(&out);
     count += homes;
     Redacted {
-        text: tails(&text),
+        text: tails(&text, cut),
         count,
     }
 }
@@ -609,21 +626,25 @@ fn home_at(text: &str) -> Option<usize> {
     None
 }
 
-/// Each absolute path left in `text` (a home folder is `~` already), as a word or after `=`, cut
-/// to its end ([`path_tail`]).
-fn tails(text: &str) -> String {
+/// Each absolute path left in `text` (a home folder is `~` already) that `cut` names, as a word
+/// or after `=`, cut to its end ([`path_tail`]).
+fn tails(text: &str, cut: Tails) -> String {
+    let wanted = |path: &str| match cut {
+        Tails::Every => is_absolute(path),
+        Tails::FilesOnly => is_file_path(path),
+    };
     let mut out = String::with_capacity(text.len());
     for piece in pieces(text) {
         match piece {
             Piece::Gap(gap) => out.push_str(gap),
             Piece::Word(word) => {
                 let (core, tail) = split_tail(word);
-                let start = if is_absolute(core) {
+                let start = if wanted(core) {
                     Some(0)
                 } else {
                     core.find('=')
                         .map(|i| i + 1)
-                        .filter(|&i| is_absolute(&core[i..]))
+                        .filter(|&i| wanted(&core[i..]))
                 };
                 match start {
                     Some(at) => {
@@ -637,6 +658,21 @@ fn tails(text: &str) -> String {
         }
     }
     out
+}
+
+/// Whether `text` is plainly a file's absolute path, in free text: a Windows path (`C:\…`,
+/// `\\server\…`, `\…`), or a `/` path ending in a file name (a last part with an extension).
+/// A `/` path without one may be a URL's (`/api/users`), and is not.
+fn is_file_path(text: &str) -> bool {
+    if !is_absolute(text) {
+        return false;
+    }
+    if !text.starts_with('/') {
+        return true;
+    }
+    text.rsplit('/')
+        .next()
+        .is_some_and(|last| last.trim_start_matches('.').contains('.'))
 }
 
 /// Whether `text` is an absolute path: `/…` (not a URL's `//host`), `\\…`, or `C:\…`/`C:/…`.
@@ -653,9 +689,10 @@ fn is_absolute(text: &str) -> bool {
 }
 
 /// The end of an absolute path, enough to say which file it is but not whose folder it is in:
-/// its last two parts after `…/` when it has five or more, else its file name when it has one
-/// (a last part with an extension), else `…`; a path of one part is kept. Any other text is
-/// returned as it is.
+/// its file name after `…/` when it has one (a last part with an extension), else `…`; a path
+/// of one part is kept. No folder of it is kept, however deep: any of them may be a user's name
+/// (`/lustre/scratch/<group>/<user>/train.py` is `…/train.py`). Any other text is returned as it
+/// is.
 #[must_use]
 pub fn path_tail(path: &str) -> String {
     if !is_absolute(path) {
@@ -667,7 +704,6 @@ pub fn path_tail(path: &str) -> String {
         .collect();
     match parts.as_slice() {
         [] | [_] => path.to_owned(),
-        [.., parent, file] if parts.len() >= 5 => format!("…/{parent}/{file}"),
         [.., file] if file.trim_start_matches('.').contains('.') => format!("…/{file}"),
         _ => "…".to_owned(),
     }
@@ -682,7 +718,7 @@ pub fn path(text: &str, max: usize) -> Redacted {
     let limit = max.saturating_mul(SCAN_FACTOR).saturating_add(64);
     let all = text.chars().count();
     let end: String = text.chars().skip(all.saturating_sub(limit)).collect();
-    let mut out = line(&end, limit);
+    let mut out = line_with(&end, limit, Tails::Every);
     let chars = out.text.chars().count();
     if chars > max {
         let keep = max.saturating_sub(1);
@@ -921,7 +957,8 @@ mod tests {
             r"opened ~\work\notes.md"
         );
         assert_eq!(r("in /root/.config"), "in ~/.config");
-        assert_eq!(r("in /rooted/x and a/home/b"), "in … and a/home/b");
+        // `/rooted` is not `/root`; a folder's path in free text stays.
+        assert_eq!(r("in /rooted/x and a/home/b"), "in /rooted/x and a/home/b");
         // Windows' verbatim prefix and WSL's view of a Windows drive.
         assert_eq!(r(r"opened \\?\C:\Users\sam\notes.md"), r"opened ~\notes.md");
         assert_eq!(
@@ -996,16 +1033,19 @@ mod tests {
         assert_eq!(r("**bold** and #hashtag"), "**bold** and #hashtag");
     }
 
-    /// An absolute path outside a home keeps only its end: a user name in it does not go, the
-    /// file name does.
+    /// An absolute path outside a home keeps only its file name: a user name in any folder of it
+    /// does not go, the file name does.
     #[test]
-    fn other_absolute_paths_keep_only_their_end() {
+    fn other_absolute_paths_keep_only_their_file_name() {
         assert_eq!(r("ran /scratch/grp/sam/run.sh"), "ran …/run.sh");
-        assert_eq!(r("in /scratch/grp/sam"), "in …");
         assert_eq!(
             r("edited /scratch/grp/sam/paper/src/main.py."),
-            "edited …/src/main.py."
+            "edited …/main.py."
         );
+        // However deep: no folder of it is kept (it may be a user's name).
+        assert_eq!(r("ran /lustre/scratch/grp/sam/train.py"), "ran …/train.py");
+        assert_eq!(path_tail("/lustre/scratch/grp/sam/train.py"), "…/train.py");
+        assert_eq!(path_tail("/a/b/c/d/e/f/g.rs"), "…/g.rs");
         assert_eq!(r(r"edited D:\data\sam\notes.md"), "edited …/notes.md");
         assert_eq!(r("cwd=/scratch/grp/sam/x.py"), "cwd=…/x.py");
         assert_eq!(r("see /tmp"), "see /tmp");
@@ -1015,8 +1055,30 @@ mod tests {
             "see https://example.com/a/b/c and src/a/b/c.rs"
         );
         assert_eq!(path_tail("src/a.rs"), "src/a.rs");
-        assert_eq!(path_tail("/a/b/c/d/e.rs"), "…/d/e.rs");
+        assert_eq!(path_tail("/a/b/c/d/e.rs"), "…/e.rs");
         assert_eq!(path_tail(r"\\server\share\sam\x"), "…");
+        // A file's path: every absolute path in it keeps only its end, a folder's too.
+        assert_eq!(path("/scratch/grp/sam", 100).text, "…");
+        assert_eq!(path(r"D:\data\sam", 100).text, "…");
+        assert_eq!(path("/scratch/grp/sam/run.sh", 100).text, "…/run.sh");
+    }
+
+    /// In a title or a note, only a file's path is cut: a URL's path stays whole.
+    #[test]
+    fn free_text_keeps_a_urls_path() {
+        assert_eq!(r("Fix /api/users 500"), "Fix /api/users 500");
+        assert_eq!(
+            r("GET /v1/sessions/{id}/transcript is slow"),
+            "GET /v1/sessions/{id}/transcript is slow"
+        );
+        assert_eq!(
+            r("POST /api/v1/users/42 fails"),
+            "POST /api/v1/users/42 fails"
+        );
+        assert_eq!(r("in /scratch/grp/sam"), "in /scratch/grp/sam");
+        // A Windows path is a file's path wherever it is.
+        assert_eq!(r(r"in D:\data\sam"), "in …");
+        assert_eq!(r(r"see \\server\share\sam\x.txt"), "see …/x.txt");
     }
 
     /// A path too long for its bound keeps its end, so its file name stays.
