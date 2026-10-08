@@ -41,8 +41,9 @@
 //! ## Prompts and what they send
 //!
 //! [`prompts`] holds the versioned prompt templates (`prompts/<name>/v<n>.md`); [`board`] builds
-//! the bounded, redacted summary a board draft sends its agent, and its cost; [`redact`] is what
-//! never leaves in a prompt.
+//! the bounded, redacted summary a board draft sends its agent, and its cost; [`orchestrator`]
+//! builds the Orchestrator's prompt and finds what its answers cite and suggest; [`redact`] is
+//! what never leaves in a prompt.
 
 #![forbid(unsafe_code)]
 
@@ -52,6 +53,7 @@ mod caps;
 mod commands;
 mod guard;
 mod office;
+pub mod orchestrator;
 pub mod prompts;
 pub mod redact;
 mod rule;

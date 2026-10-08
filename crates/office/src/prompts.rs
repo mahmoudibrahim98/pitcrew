@@ -20,6 +20,14 @@ pub const DRAFT_BOARD: Prompt = Prompt {
     template: include_str!("../prompts/draft-board/v1.md"),
 };
 
+/// The Orchestrator answering a person's question about their work
+/// (`prompts/orchestrator/v1.md`).
+pub const ORCHESTRATOR: Prompt = Prompt {
+    name: "orchestrator",
+    version: 1,
+    template: include_str!("../prompts/orchestrator/v1.md"),
+};
+
 impl Prompt {
     /// `name/v<version>`, as a draft records it.
     #[must_use]
@@ -85,6 +93,26 @@ mod tests {
         assert!(template.contains("pitcrew board submit {{draft}} --file proposal.json"));
         assert!(!template.contains("<<"), "no heredoc");
         assert!(template.contains("read no other file"));
+    }
+
+    #[test]
+    fn the_orchestrator_prompt_names_its_version_and_placeholders() {
+        assert_eq!(ORCHESTRATOR.id(), "orchestrator/v1");
+        for name in [
+            "person",
+            "workspace",
+            "today",
+            "max_suggestions",
+            "context",
+            "question",
+        ] {
+            assert!(
+                ORCHESTRATOR.template.contains(&format!("{{{{{name}}}}}")),
+                "{name}"
+            );
+        }
+        // The question comes last, so nothing the template says follows what a person typed.
+        assert!(ORCHESTRATOR.template.trim_end().ends_with("{{question}}"));
     }
 
     #[test]

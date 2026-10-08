@@ -89,6 +89,8 @@ function placeholderRoutes(parent: WorkspaceRoute): AnyRoute[] {
     route('console/$session', 'SessionPage', { layout: 'console' }),
     // `paths.setup`: where a workspace with `setup_needed` is sent, so it exists in every build.
     route('onboarding', 'SetupPage', { layout: 'both', title: 'Set up', setup: true }),
+    // `paths.signIn`: signing in to the agent CLIs on the hub's machine (onboarding's panel).
+    route('sign-in', 'SignInPage', { layout: 'both', title: 'Sign in to your agents' }),
   ];
 }
 

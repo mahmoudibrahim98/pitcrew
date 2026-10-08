@@ -20,6 +20,10 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Read as _;
 
+mod reads;
+
+pub(crate) use reads::{Scope, SessionListArgs};
+
 /// Mentions and answers this recent are shown by `check`.
 const RECENT_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
@@ -690,7 +694,7 @@ fn task_path(reference: &str, rest: &str) -> Result<String> {
     Ok(format!("/tasks/{}{rest}", encode(&task_ref(reference)?)))
 }
 
-fn query_string(pairs: &[(&str, String)]) -> String {
+pub(crate) fn query_string(pairs: &[(&str, String)]) -> String {
     let mut out = String::new();
     for (i, (name, value)) in pairs.iter().enumerate() {
         out.push(if i == 0 { '?' } else { '&' });
@@ -700,7 +704,7 @@ fn query_string(pairs: &[(&str, String)]) -> String {
 }
 
 /// A value's wire name, e.g. `in_progress`.
-fn wire<T: Serialize>(value: &T) -> String {
+pub(crate) fn wire<T: Serialize>(value: &T) -> String {
     match serde_json::to_value(value) {
         Ok(Value::String(s)) => s,
         Ok(other) => other.to_string(),
@@ -709,7 +713,7 @@ fn wire<T: Serialize>(value: &T) -> String {
 }
 
 /// Parses an enum by its wire name; `In-Progress` and `in progress` work too.
-fn parse_enum<T: DeserializeOwned>(what: &str, raw: &str, choices: &str) -> Result<T> {
+pub(crate) fn parse_enum<T: DeserializeOwned>(what: &str, raw: &str, choices: &str) -> Result<T> {
     let name = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
     serde_json::from_value(Value::String(name))
         .map_err(|_| Error::invalid(format!("unknown {what} {raw:?}; use one of: {choices}")))
@@ -750,7 +754,7 @@ fn numbered(options: &[String]) -> String {
 }
 
 /// Rows as aligned columns; the last column is not padded.
-fn table<const N: usize>(rows: &[[String; N]]) -> String {
+pub(crate) fn table<const N: usize>(rows: &[[String; N]]) -> String {
     let mut widths = [0usize; N];
     for row in rows {
         for (w, cell) in widths.iter_mut().zip(row) {
@@ -773,7 +777,7 @@ fn table<const N: usize>(rows: &[[String; N]]) -> String {
     out
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))

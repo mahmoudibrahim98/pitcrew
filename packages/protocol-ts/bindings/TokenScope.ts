@@ -4,4 +4,4 @@ import type { SessionId } from "./SessionId.ts";
 /**
  * The kinds of token (ADR-0006).
  */
-export type TokenScope = "device" | "agent" | { "session": SessionId };
+export type TokenScope = "device" | "agent" | "reader" | { "session": SessionId };

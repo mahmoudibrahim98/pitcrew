@@ -155,6 +155,11 @@ describe('sign-in', () => {
       const started = await call<SignIn>(server, 'POST', signInPath('claude'), { token: DEVICE });
       assert.equal(started.status, 201);
       await assert.rejects(terminal(server, started.body.terminal, SECOND), /403/);
+      // However its id is written in the path: with its prefix, or percent-encoded.
+      const id = started.body.terminal;
+      for (const form of [`ses_${id}`, `ses%5F${id}`, `%${id.charCodeAt(0).toString(16)}${id.slice(1)}`]) {
+        await assert.rejects(terminal(server, form, SECOND), /403/, form);
+      }
       const socket = await terminal(server, started.body.terminal);
       assert.equal((await socket.next()).type, 'binary');
       socket.close();

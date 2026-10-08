@@ -5,8 +5,9 @@
 //!   step with the log. Pass them to `Store::open_with`;
 //! - [`WorkService`]: reads of those tables, and **commands** that validate a change against them
 //!   and append its events, stamped from the [`Caller`](pitcrew_protocol::api::Caller);
-//! - [`routes`]: the work routes of API v1, split into [`agent_routes`] and [`device_routes`] for
-//!   `RouterParts::agent` and `RouterParts::device`;
+//! - [`routes`]: the work routes of API v1, split into [`agent_routes`], [`read_routes`] (reads a
+//!   reader token may make too) and [`device_routes`] for `RouterParts::agent`,
+//!   `RouterParts::read` and `RouterParts::device`;
 //! - three seams for other streams: [`EventRefs`] (the activity reference index, for the API
 //!   layer's `GET /v1/events` filters), [`RecapIndex`] (blocks and day recaps, for the recap
 //!   routes; see [`recap`]) and [`Dispatcher`] (starting dispatched sessions, and board drafts'
@@ -14,6 +15,10 @@
 //! - board drafts: an agent drafts a workstream's board from its history, and nothing is created
 //!   until a person accepts it ([`WorkService::start_draft`]; the routes are
 //!   [`board_session_routes`] and [`board_device_routes`], mounted apart from the others);
+//! - the Orchestrator panel's conversations: a person's questions, answered by an agent CLI they
+//!   use with a token that may only read, followed from its transcript
+//!   ([`WorkService::ask_orchestrator`], [`WorkService::follow_orchestrator`]; the routes are
+//!   [`orchestrator_routes`]);
 //! - [`SyncCommands`]: what a tracker sync (GitHub, Jira) changes in the hub, as the sync's own
 //!   member with `Mover::Sync`, and [`links`], the workstream links a sync routes issues by;
 //! - [`writes`]: outward writes to GitHub and Jira, each proposed with an approval ask and started
@@ -50,6 +55,7 @@
 //! work.seed(&demo)?;
 //! // The API layer mounts the routes and adds the service as an extension:
 //! let agent = pitcrew_hub_work::agent_routes::<()>().layer(axum::Extension(Arc::clone(&work)));
+//! let read = pitcrew_hub_work::read_routes::<()>().layer(axum::Extension(Arc::clone(&work)));
 //! let device = pitcrew_hub_work::device_routes::<()>().layer(axum::Extension(Arc::clone(&work)));
 //! // ... filters activity through the reference index, and serves recaps from the recap index
 //! // (built from the log on first use; `sync_recaps` builds it now):
@@ -65,7 +71,7 @@
 //!         last = revs.to_rev;
 //!     }
 //! }
-//! # let _ = (agent, device, refs, recaps);
+//! # let _ = (agent, read, device, refs, recaps);
 //! # Ok(()) }
 //! ```
 //!
@@ -86,6 +92,8 @@ mod error;
 mod import;
 pub mod links;
 mod office;
+mod orchestrator;
+mod orchestrator_routes;
 pub mod projection;
 pub mod query;
 pub mod recap;
@@ -103,7 +111,7 @@ pub use board_routes::{board_device_routes, board_session_routes};
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, SessionLink, WorkstreamPatch};
 pub use dispatch::{
     CONFINED_BRIEF, Confinement, DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT,
-    MAX_BRIEF, NEVER_STARTED, NewDispatch, PROMPT_FILE, RecordedStart, SessionRequest,
+    MAX_BRIEF, NEVER_STARTED, NewDispatch, PROMPT_FILE, RecordedStart, RunToken, SessionRequest,
 };
 pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};
@@ -111,6 +119,12 @@ pub use office::{
     Applied, BackOffice, OFFICE_HANDLE, OFFICE_NAME, OfficeCommands, OfficeRun,
     projections_with_office,
 };
+pub use orchestrator::{
+    ENGINES as ORCHESTRATOR_ENGINES, READ_VERBS, SESSION_MAX_RUNTIME as ORCHESTRATOR_MAX_RUNTIME,
+    SESSION_TITLE as ORCHESTRATOR_SESSION_TITLE, confinement as orchestrator_confinement,
+    not_offered as orchestrator_not_offered,
+};
+pub use orchestrator_routes::orchestrator_routes;
 pub use pitcrew_protocol::api::{
     NewProject, NewTask, NewWorkstream, Setup, SetupDone, SetupPerson,
 };
@@ -118,7 +132,7 @@ pub use pitcrew_protocol::model::TaskPatch;
 pub use projection::projections;
 pub use query::{AskFilter, REF_SCAN_BUDGET, RefFilter, SessionFilter, TaskFilter, TaskRef};
 pub use recap::{BlockFilter, DAY_CACHE_ENTRIES, DaysScope, RecapIndex, Recaps};
-pub use routes::{agent_routes, device_routes, routes};
+pub use routes::{agent_routes, device_routes, read_routes, routes};
 pub use seed::demo_events;
 pub use service::{Clock, WorkService, WorkspaceAt};
 pub use setup::SetupListener;

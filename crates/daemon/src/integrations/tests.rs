@@ -51,9 +51,7 @@ fn stand_in_gh(dir: &Path, script: &str) -> GhCli {
     let bin = dir.join("bin");
     std::fs::create_dir(&bin).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let gh = bin.join("gh");
-    std::fs::write(&gh, script).unwrap();
-    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    crate::test_scripts::write_script(&bin.join("gh"), script, 0o700);
     GhCli::with_path(bin.into_os_string())
 }
 

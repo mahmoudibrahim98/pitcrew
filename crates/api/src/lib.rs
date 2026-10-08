@@ -65,19 +65,23 @@ pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
 
 /// The routes to serve behind authentication, split by who may call them.
 ///
-/// - `agent` routes accept device and agent tokens (the routes marked **agent** in `api-v1.md`);
+/// - `agent` routes accept device, agent and reader tokens (the routes marked **agent** in
+///   `api-v1.md`); session tokens get `403 forbidden`.
+/// - `read` routes accept device and reader tokens (the routes marked **read**); agents and
 ///   session tokens get `403 forbidden`.
 /// - `session` routes accept every scope, session tokens included (the routes marked **session**
 ///   in `api-v1.md`). Each must check itself that a session token answers only for its own
 ///   session's resource.
-/// - `device` routes accept only device tokens; agents and sessions get `403 forbidden`.
+/// - `device` routes accept only device tokens; agents, readers and sessions get `403 forbidden`.
 ///
-/// Routes are device-only unless added with [`RouterParts::agent`] or [`RouterParts::session`],
-/// so forgetting to mark a route fails closed; and a session token reaches only the routes added
-/// with [`RouterParts::session`].
+/// A reader token reaches any route only with a `GET` or `HEAD` (see `auth`), so only reads go in
+/// `read`. Routes are device-only unless added with [`RouterParts::agent`], [`RouterParts::read`]
+/// or [`RouterParts::session`], so forgetting to mark a route fails closed; and a session token
+/// reaches only the routes added with [`RouterParts::session`].
 #[derive(Debug, Default)]
 pub struct RouterParts {
     agent: Router,
+    read: Router,
     session: Router,
     device: Router,
 }
@@ -93,6 +97,13 @@ impl RouterParts {
     #[must_use]
     pub fn agent(mut self, routes: Router) -> Self {
         self.agent = self.agent.merge(routes);
+        self
+    }
+
+    /// Adds reads that a reader token may make too: `GET` routes only.
+    #[must_use]
+    pub fn read(mut self, routes: Router) -> Self {
+        self.read = self.read.merge(routes);
         self
     }
 
@@ -122,6 +133,7 @@ impl RouterParts {
 pub fn router(host_info: HostInfo, tokens: Arc<dyn TokenStore>, parts: RouterParts) -> Router {
     let host_info = Arc::new(host_info);
     let authenticated = pitcrew_auth::no_session(parts.agent)
+        .merge(pitcrew_auth::readable(parts.read))
         .merge(parts.session)
         .merge(pitcrew_auth::device_only(parts.device))
         .layer(middleware::from_fn_with_state(tokens, auth::authenticate));

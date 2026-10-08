@@ -2,18 +2,24 @@
 // features register their own. They show just enough to navigate by.
 
 import { Link, useParams } from '@tanstack/react-router';
-import type { ReactNode } from 'react';
+import { useMemo, type ReactNode } from 'react';
 import {
+  useApi,
+  useMachines,
   useMe,
+  useOrchestrator,
   useProjects,
   useSessions,
   useTasks,
   useWorkstreams,
+  type Engine,
   type Health,
   type SessionState,
   type TaskStatus,
 } from '../../data/index.ts';
 import { StatusPill, type Tone } from '../../design/index.ts';
+import { createHubOnboardingApi } from '../../onboarding/hub-api.ts';
+import { SignInPanel } from '../../onboarding/sign-in-panel.tsx';
 import { isOpenTask, useMyOpenAsks } from '../data.ts';
 import { useWorkspaceId } from '../layout.ts';
 import { paths } from '../paths.ts';
@@ -229,6 +235,52 @@ export function SetupPage() {
   return (
     <Page title="Set up">
       <p className="text-sm text-ink-2">This workspace needs setting up, and this build has no setup wizard.</p>
+    </Page>
+  );
+}
+
+/**
+ * The agent CLIs the Orchestrator may answer with, and how each signs in, in its own terminal. The
+ * page lists those the hub offers (`GET /v1/orchestrator`'s `engines`: on Windows, Claude Code
+ * only); Claude Code alone until it has said.
+ */
+const SIGN_IN: { id: Engine; engine: string; install: string; signIn: string }[] = [
+  { id: 'claude', engine: 'Claude Code', install: 'claude', signIn: 'claude, then /login' },
+  { id: 'opencode', engine: 'OpenCode', install: 'opencode', signIn: 'opencode auth login' },
+];
+
+/**
+ * `paths.signIn`: the agent CLIs on this hub's machine, whether each is signed in, and its own login
+ * in a terminal (onboarding's sign-in panel, over `GET /v1/machines/{id}/agents`; the hub's owner
+ * only, so anyone else sees why not). How to do it by hand follows.
+ */
+export function SignInPage() {
+  const data = useApi();
+  const api = useMemo(() => createHubOnboardingApi({ transport: data.transport }), [data.transport]);
+  const own = useMachines()
+    .data?.find((m) => m.kind === 'local')
+    ?.name.trim();
+  const offered = useOrchestrator().data?.engines.map((e) => e.engine);
+  const rows = SIGN_IN.filter((row) => (offered === undefined ? row.id === 'claude' : offered.includes(row.id)));
+  return (
+    <Page title="Sign in to your agents">
+      <p className="text-sm text-ink-2">
+        The Orchestrator answers with an agent CLI you already use, on this hub&apos;s machine, signed in as
+        you.
+      </p>
+      <SignInPanel api={api} target={{ kind: 'local' }} machineLabel={own === '' ? undefined : own} />
+      <p className="text-sm text-ink-2">Or install one there and sign in once, in a terminal:</p>
+      <List label="Agent CLIs" empty="">
+        {rows.map((row) => (
+          <Row key={row.engine}>
+            <span className="w-28 font-medium">{row.engine}</span>
+            <span className="text-ink-2">
+              On the PATH as <code className="font-mono text-xs">{row.install}</code>; sign in with{' '}
+              <code className="font-mono text-xs">{row.signIn}</code>
+            </span>
+          </Row>
+        ))}
+      </List>
     </Page>
   );
 }

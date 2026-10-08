@@ -212,6 +212,13 @@ test('sign-in terminal', { timeout: 60000 }, async () => {
   const terminal = `/v1/sessions/${started.body.terminal}/terminal?cols=80&rows=24`;
   assert.equal((await upgrade(terminal, agent)).status, 403);
   assert.equal((await upgrade(terminal, second)).status, 403, 'only for the person who started it');
+  // However its id is written in the path (`ses%5F…`, an encoded character of its ULID).
+  const id = started.body.terminal.startsWith('ses_') ? started.body.terminal.slice(4) : started.body.terminal;
+  const hex = (c) => c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0');
+  for (const form of [`ses%5F${id}`, `ses%5f${id}`, `ses_%${hex(id[0])}${id.slice(1)}`, `%${hex(id[0])}${id.slice(1)}`]) {
+    const status = (await upgrade(`/v1/sessions/${form}/terminal?cols=80&rows=24`, second)).status;
+    assert.equal(status, 403, `only for the person who started it, as ${form}`);
+  }
   const opened = await upgrade(terminal, person);
   assert.equal(opened.status, 101);
   assert.equal(opened.protocol, 'pitcrew.v1');

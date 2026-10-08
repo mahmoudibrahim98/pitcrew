@@ -1,14 +1,16 @@
 //! # pitcrew-auth
 //!
-//! Device, agent and session tokens, scopes, and author stamping (ADR-0006).
+//! Device, agent, reader and session tokens, scopes, and author stamping (ADR-0006).
 //!
-//! - [`token`]: raw tokens (`pcd_…` for devices, `pca_…` for agents, `pcs_…` for sessions PitCrew
-//!   starts on its own behalf), their ids and hashes.
+//! - [`token`]: raw tokens (`pcd_…` for devices, `pca_…` for agents, `pcr_…` for readers: agents
+//!   that may only read, `pcs_…` for sessions PitCrew starts on its own behalf), their ids and
+//!   hashes.
 //! - [`store`]: the [`TokenStore`] trait and [`FileTokenStore`], a registry that keeps only
 //!   SHA-256 hashes.
 //! - [`private`]: private directories and files (owner and mode checks on Unix).
-//! - [`http`]: what domain crates use in `routes()`: the [`Authenticated`] and [`Person`]
-//!   extractors, the [`device_only`] and [`no_session`] guards, and [`ErrorResponse`].
+//! - [`http`]: what domain crates use in `routes()`: the [`Authenticated`], [`Person`] and
+//!   [`Reading`] extractors, the [`device_only`], [`readable`] and [`no_session`] guards, and
+//!   [`ErrorResponse`].
 //!
 //! **Owned by stream H.** The work packages are in `docs/build/streams/H.md`. Build against
 //! `pitcrew-protocol` and `pitcrew-interfaces` only, never another stream's internals.
@@ -19,8 +21,8 @@ pub mod store;
 pub mod token;
 
 pub use http::{
-    Authenticated, ErrorResponse, Person, WS_BEARER_PREFIX, WS_PROTOCOL, device_only, no_session,
-    refuse_session, require_device,
+    Authenticated, ErrorResponse, Person, Reading, WS_BEARER_PREFIX, WS_PROTOCOL, device_only,
+    no_session, readable, refuse_session, require_device, require_device_or_reader,
 };
 #[cfg(unix)]
 pub use private::euid;

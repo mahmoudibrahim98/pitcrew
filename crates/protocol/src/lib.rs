@@ -15,7 +15,9 @@
 //! outward writes to them that a person approves first.
 //!
 //! Besides the six, [`text`] holds the one set of hidden characters every crate drops from
-//! untrusted text.
+//! untrusted text, and the features' own modules hold their wire types: [`board`] (board drafts),
+//! [`orchestrator`] (the Orchestrator panel's conversation), [`files`], [`import`], [`onboarding`]
+//! and [`scan`].
 //!
 //! **Change process.** This crate belongs to stream 0. Other streams propose changes in a
 //! `s/0/contract-…` pull request. Breaking changes bump [`version::PROTOCOL_VERSION`].
@@ -33,6 +35,7 @@ pub mod integrations;
 pub mod machine_setup;
 pub mod model;
 pub mod onboarding;
+pub mod orchestrator;
 pub mod recap;
 pub mod runner;
 pub mod scan;

@@ -31,6 +31,12 @@ composed (the generated `BoardDraft` and the UI's `Task`). `TokenScope` gained
 `{ "session": SessionId }`, and `RunnerCommand`'s `start_session` an optional `confined`; neither
 is a UI type.
 
+**The Orchestrator** (2026-10, brief 0-orchestrator-chat): `Orchestrator`, `Conversation`,
+`OrchestratorTurn`, `TurnState`, `AnswerReference`, `ReferenceTarget`, `AnswerSuggestion`,
+`AnswerUsage`, `EngineStatus`, `OrchestratorLimits` and `Question` are new, and `TokenScope` gained
+`reader`. The UI declares the shapes it uses in `apps/ui/src/data/orchestrator.ts`, the same as the
+generated ones; they are not events, so nothing in the stream or `data/types.ts` changed.
+
 ## Different names and missing declarations
 
 | Rust type | UI counterpart | Contract position |

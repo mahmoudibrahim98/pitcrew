@@ -21,6 +21,7 @@ pub mod hook;
 pub mod http;
 pub mod install;
 pub mod plan;
+mod time;
 pub mod transport;
 mod verbs;
 
@@ -182,6 +183,26 @@ enum Command {
     /// Board drafts: answer the one you were started for.
     #[command(subcommand)]
     Board(BoardCommand),
+    /// Sessions: list them, or show one and its recent work.
+    #[command(subcommand)]
+    Session(SessionCommand),
+    /// Recaps: blocks of work, and day paragraphs of a workstream or project.
+    #[command(subcommand)]
+    Recap(RecapCommand),
+    /// The activity log (its newest page).
+    Activity {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// The most events (default 50, at most 200).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Find projects, workstreams, tasks, sessions and recent work holding every word.
+    Search {
+        /// The words (any case).
+        #[arg(required = true)]
+        words: Vec<String>,
+    },
     /// Send an agent CLI's hook event to the daemon. Always silent; always exits 0.
     Hook {
         /// claude, codex or opencode.
@@ -251,6 +272,78 @@ enum HooksAction {
         /// Don't ask for confirmation.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// What a read is narrowed to. Ids take their prefixed (`ses_…`) or bare form; a task, its key.
+#[derive(Debug, Args)]
+struct ScopeArgs {
+    /// Only this session's (ses_…).
+    #[arg(long)]
+    session: Option<String>,
+    /// Only this task's (PAP-4 or tsk_…).
+    #[arg(long, value_parser = task_arg)]
+    task: Option<String>,
+    /// Only this workstream's (wst_…).
+    #[arg(long)]
+    workstream: Option<String>,
+    /// Only this project's (prj_…).
+    #[arg(long)]
+    project: Option<String>,
+}
+
+impl From<ScopeArgs> for verbs::Scope {
+    fn from(args: ScopeArgs) -> Self {
+        Self {
+            session: args.session,
+            task: args.task,
+            workstream: args.workstream,
+            project: args.project,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// List sessions, most recently active first.
+    List {
+        /// Only those active since this day (UTC): today, or YYYY-MM-DD.
+        #[arg(long)]
+        since: Option<String>,
+        /// Only these states (repeatable or comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        state: Vec<String>,
+        /// Only this workstream's (wst_…).
+        #[arg(long)]
+        workstream: Option<String>,
+        /// Only this task's (PAP-4 or tsk_…).
+        #[arg(long, value_parser = task_arg)]
+        task: Option<String>,
+    },
+    /// Show a session and its recent blocks of work.
+    Show {
+        /// The session (ses_…).
+        session: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RecapCommand {
+    /// Blocks of work, newest first, each with its one-line summary.
+    Blocks {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// The most blocks (default 50, at most 200).
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Day paragraphs of a workstream or a project, newest day first.
+    Days {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// The most days (default 7, at most 30).
+        #[arg(long)]
+        limit: Option<u32>,
     },
 }
 
@@ -433,6 +526,26 @@ fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Resul
         }),
         Command::Reply { ask, text, option } => verb.reply(&ask, &text, option),
         Command::Check => verb.check(),
+        Command::Session(SessionCommand::List {
+            since,
+            state,
+            workstream,
+            task,
+        }) => verb.session_list(&verbs::SessionListArgs {
+            since,
+            states: state,
+            workstream,
+            task,
+        }),
+        Command::Session(SessionCommand::Show { session }) => verb.session_show(&session),
+        Command::Recap(RecapCommand::Blocks { scope, limit }) => {
+            verb.recap_blocks(&scope.into(), limit)
+        }
+        Command::Recap(RecapCommand::Days { scope, limit }) => {
+            verb.recap_days(&scope.into(), limit)
+        }
+        Command::Activity { scope, limit } => verb.activity(&scope.into(), limit),
+        Command::Search { words } => verb.search(&words),
         // Handled above, and in `run`, before the client ever connects.
         Command::Board(_) | Command::Hook { .. } | Command::Hooks(_) => Ok(()),
     }

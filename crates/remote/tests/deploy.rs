@@ -311,16 +311,16 @@ mod unix {
                 break;
             }
         }
+        if cut && remote.kill {
+            // Killed while it still reads. Closing its input first lets it see end of file, and
+            // clean up, before the signal lands: macOS's runners were quick enough to.
+            let group = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap());
+            let _ =
+                rustix::process::kill_process_group(group.unwrap(), rustix::process::Signal::KILL);
+        }
         drop(to_remote);
         log_call(dir, &line, count);
         if cut {
-            if remote.kill {
-                let group = rustix::process::Pid::from_raw(i32::try_from(child.id()).unwrap());
-                let _ = rustix::process::kill_process_group(
-                    group.unwrap(),
-                    rustix::process::Signal::KILL,
-                );
-            }
             if let Some(path) = ssh_log {
                 let mut file = std::fs::OpenOptions::new()
                     .create(true)

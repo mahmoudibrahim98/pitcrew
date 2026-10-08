@@ -266,6 +266,40 @@ const boardDraft = object({
   accepted: list(draftedTask),
   rejected: list(integer),
 });
+// The Orchestrator (orchestrator.rs).
+const engine = enumeration('claude', 'codex', 'opencode');
+const referenceTarget = tagged('kind', {
+  session: object({ id }),
+  task: object({ id, key: text }),
+  workstream: object({ id, project: id }),
+  project: object({ id }),
+  recap: object({ project: id, 'workstream?': id, 'date?': date }),
+});
+const orchestratorTurn = object({
+  question: text,
+  asked: integer,
+  session: id,
+  state: enumeration('answering', 'answered', 'canceled', 'timed_out', 'too_long', 'failed'),
+  answer: text,
+  references: list(object({ text, target: referenceTarget, label: text })),
+  suggestions: list(
+    tagged('kind', {
+      move_task: object({ task: id, key: text, to: status, label: text }),
+      open: object({ target: referenceTarget, label: text }),
+    }),
+  ),
+  'usage?': object({ duration_ms: integer, tool_runs: integer, answer_bytes: integer }),
+  'ended?': integer,
+  'note?': text,
+});
+const conversation = object({
+  id,
+  engine,
+  agent: id,
+  started: integer,
+  'session?': id,
+  turns: list(orchestratorTurn),
+});
 const eventData = {
   safety_changed: object({ settings: object({ permission_mode: enumeration("default", "plan", "accept_edits", "bypass_permissions"), back_office_enabled: bool, back_office_caps: object({ max_auto_accept_per_hour: integer }) }) }),
   cursor_moved: object({ scope: text, rev: integer }),
@@ -576,6 +610,19 @@ export const schemas = {
   boardDraft,
   draftPreview: object({ workstream: id, prompt: text, cost: draftCost, summary: text, digest: text }),
   draftReviewed: object({ draft: boardDraft, tasks: list(task) }),
+  conversation,
+  orchestrator: object({
+    engines: list(object({ engine, installed: bool })),
+    'engine?': engine,
+    limits: object({
+      question_chars: integer,
+      answer_bytes: integer,
+      answer_seconds: integer,
+      turns: integer,
+      conversations: integer,
+    }),
+    conversations: list(conversation),
+  }),
   error: object({
     code: enumeration(
       'unauthorized',

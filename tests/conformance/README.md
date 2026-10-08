@@ -11,7 +11,8 @@ Both commands run `onboarding.test.mjs` on its own, then the same `api.test.mjs`
 `files.test.mjs` and `machine-setup.test.mjs`, then `import.test.mjs` on its own, then `integrations.test.mjs` on its own
 (its syncs append events, which the main suite's exact-revision checks must not see), then
 `writes.test.mjs` on its own (it connects the same repository), then `board.test.mjs` on its own
-(board drafts start an agent's CLI and create tasks). Every phase runs, and the first failure
+(board drafts start an agent's CLI and create tasks), and `orchestrator.test.mjs` on its own, last
+(a question starts an agent's CLI too). Every phase runs, and the first failure
 decides the exit code. No npm dependency is needed. The
 daemon runner builds `pitcrewd` and `pitcrew-ptyd` with the locked workspace dependencies, starts a
 seeded demo on an OS-assigned free loopback port, and reads its two private token files without
@@ -63,7 +64,8 @@ synthetic, and the demo daemon watches none.
 and fixes (an `ok` row has none; a missing tool offers its install page; no helper row on the hub's
 own machine), one row with `?row=`, the accounts' shape and rules, a sign-in's answer, the same one
 while it runs, its terminal served (`101`) to a person and refused to an agent and to another
-person, and not a session, `DELETE` stopping it (`204`, then `404` and its terminal gone), and the
+person (however the path writes its id: `ses%5F…`, an encoded character of its ULID), and not a
+session, `DELETE` stopping it (`204`, then `404` and its terminal gone), and the
 refusals (no or unknown token, agent, another person's device token on every route, unknown and
 other machines, unknown CLI, a method the CLI lacks, unknown body fields). On the daemon target the stand-in CLIs answer `--version` and
 their status commands at once (not signed in), and a sign-in runs the stand-in's "login", which
@@ -89,7 +91,7 @@ Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
 
-`board.test.mjs` runs on both targets, alone, last ("Board drafts"): the
+`board.test.mjs` runs on both targets, alone, just before the Orchestrator ("Board drafts"): the
 preview's shape, sizes and estimate, and that it stores nothing; a start refused for a stale
 digest, a person or an unknown member as the agent, and while another draft runs; device-only
 routes; only the draft's session token proposes (its agent's token is refused, and the session
@@ -115,6 +117,22 @@ request creates both. Both targets run these cases.
 
 Directory conformance also dispatches a task through the member created by New agent, exercising
 the recipe/member ownership link against both servers.
+
+`orchestrator.test.mjs` runs on both targets, alone and last ("Orchestrator", and the reader
+scope in "Transport and auth"). With `PITCREW_CONFORMANCE_READER`, a reader token (the mock's
+`dev-reader-token`; on the daemon, a random one `run.mjs` provisions in the temporary registry
+before startup, for `@office` on behalf of the person): it is `403` on **every write route the
+contract names** (read from `api-v1.md` itself), on the device-only reads and on a WebSocket
+upgrade, and reads the routes marked **read** or **agent**. Then the Orchestrator: people only;
+the engines (Codex not offered) and limits; what a question must be (`codex` is `400`); a
+question starts a session titled `Orchestrator` as the person's agent, in a folder of its own
+(`…/scratch/<state key>/<session>`); its CLI's token, handed to the suite through
+`PITCREW_CONFORMANCE_SESSION_TOKENS` as a draft's is, is a reader token of its own that reads and
+writes nothing; its transcript is `403` to another person, however the path writes its id
+(`ses%5F…`, an encoded character of its ULID); one answer at a time; another person
+sees none of it; cancel; clear forgets and ends the session, revokes its token at once (`401`),
+and leaves the transcript its asker's alone. On the daemon the CLI is the stand-in `claude`,
+which never answers, so the suite cancels; the mock answers after its reply delay.
 
 Hook-install conformance writes agent configurations. It is disabled unless
 `PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed

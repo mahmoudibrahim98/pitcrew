@@ -99,6 +99,10 @@ pub enum TokenScope {
     Device,
     /// An agent or hook. It is limited to agent verbs, for its owner's workspace.
     Agent,
+    /// An agent that may only read: the Orchestrator's CLI (api-v1.md, "Orchestrator"). `GET`s on
+    /// the routes marked **agent** or **read**, and nothing else: every other request is refused
+    /// before it reaches a route. Like an agent token, it names an agent and its owner.
+    Reader,
     /// A session token: minted for one session PitCrew starts on its own behalf (a board
     /// draft's), bound to that session, and given to its CLI instead of its agent's token. It
     /// acts as the session's agent, for its owner, but may call only the routes mounted for
@@ -114,7 +118,7 @@ impl TokenScope {
     pub fn session(self) -> Option<SessionId> {
         match self {
             Self::Session(session) => Some(session),
-            Self::Device | Self::Agent => None,
+            Self::Device | Self::Agent | Self::Reader => None,
         }
     }
 }
@@ -185,6 +189,12 @@ impl Caller {
     #[must_use]
     pub fn is_person(&self) -> bool {
         self.scope == TokenScope::Device
+    }
+
+    /// Whether this caller may only read (a [`TokenScope::Reader`] token).
+    #[must_use]
+    pub fn reads_only(&self) -> bool {
+        self.scope == TokenScope::Reader
     }
 }
 

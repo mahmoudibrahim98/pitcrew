@@ -2,10 +2,16 @@
 //!
 //! - [`agent_routes`] are the routes marked **agent** in the contract: both token scopes may call
 //!   them. Reads see the whole workspace; writes are limited to the agent's own tasks.
+//! - [`read_routes`] are the reads marked **read** in the contract: a person's device token or a
+//!   reader token (the Orchestrator's CLI, which may only read). Mount them with
+//!   `RouterParts::read`; each handler refuses agents itself too.
 //! - [`device_routes`] need a person's device token. Mount them with `RouterParts::device`, which
 //!   refuses agents before they get here; each handler also refuses agents itself, so mounting
 //!   them in the wrong place still fails closed.
-//! - [`routes`] is both.
+//! - [`routes`] is all three.
+//!
+//! A reader token never writes: the API refuses its writes first, and [`Who`] (every agent
+//! write's extractor) refuses them again.
 //!
 //! Handlers read the caller from `Extension<Caller>` (inserted by the API layer after
 //! authentication) and the service from `Extension<Arc<WorkService>>` (added by the daemon). Every
@@ -68,31 +74,41 @@ where
         .route("/v1/asks/{id}/answer", post(answer_ask))
 }
 
+/// The reads a reader token may make too. See the [module docs](self).
+pub fn read_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    Router::new()
+        .route("/v1/workspace", get(get_workspace))
+        .route("/v1/machines", get(list_machines))
+        .route("/v1/personas", get(list_personas))
+        .route("/v1/teams", get(list_teams))
+        .route("/v1/projects", get(list_projects))
+        .route("/v1/projects/{id}", get(get_project))
+        .route("/v1/workstreams", get(list_workstreams))
+        .route("/v1/workstreams/{id}", get(get_workstream))
+        .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions/{id}", get(get_session))
+        .route("/v1/briefs", get(list_briefs))
+}
+
 /// Routes that only a person's device may call. See the [module docs](self).
 pub fn device_routes<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
-        .route("/v1/workspace", get(get_workspace))
         .route("/v1/me/cursors", get(get_cursors))
         .route("/v1/me/cursors/{scope}", put(put_cursor))
         .route("/v1/setup", post(post_setup))
-        .route("/v1/machines", get(list_machines))
-        .route("/v1/personas", get(list_personas).post(create_persona))
+        .route("/v1/personas", post(create_persona))
         .route("/v1/personas/{id}", put(edit_persona))
-        .route("/v1/teams", get(list_teams).post(create_team))
+        .route("/v1/teams", post(create_team))
         .route("/v1/teams/{id}", put(edit_team))
-        .route("/v1/projects", get(list_projects).post(create_project))
-        .route("/v1/projects/{id}", get(get_project))
-        .route(
-            "/v1/workstreams",
-            get(list_workstreams).post(create_workstream),
-        )
-        .route(
-            "/v1/workstreams/{id}",
-            get(get_workstream).patch(patch_workstream),
-        )
+        .route("/v1/projects", post(create_project))
+        .route("/v1/workstreams", post(create_workstream))
+        .route("/v1/workstreams/{id}", patch(patch_workstream))
         .route("/v1/tasks", post(create_task))
         .route("/v1/tasks/{id}", patch(patch_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
@@ -100,19 +116,16 @@ where
         .route("/v1/safety", get(get_safety).put(put_safety))
         .route("/v1/import", get(get_import).put(put_import))
         .route("/v1/import/dry-run", post(dry_run_import))
-        .route("/v1/sessions", get(list_sessions))
-        .route("/v1/sessions/{id}", get(get_session))
         .route("/v1/sessions/{id}/link", post(link_session))
-        .route("/v1/briefs", get(list_briefs))
         .route("/v1/briefs/{kind}/{id}", put(put_brief))
 }
 
-/// Every work route: [`agent_routes`] and [`device_routes`].
+/// Every work route: [`agent_routes`], [`read_routes`] and [`device_routes`].
 pub fn routes<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    agent_routes().merge(device_routes())
+    agent_routes().merge(read_routes()).merge(device_routes())
 }
 
 // ─── Extractors ──────────────────────────────────────────────────────────────────────────────────
@@ -143,14 +156,43 @@ fn caller(parts: &Parts) -> Result<Caller, WorkError> {
     })
 }
 
-/// The caller, of either scope.
+/// The caller, of any scope; a reader only for a `GET` (it changes nothing).
 pub(crate) struct Who(pub(crate) Caller);
 
 impl<S: Send + Sync> FromRequestParts<S> for Who {
     type Rejection = WorkError;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, WorkError> {
-        caller(parts).map(Self)
+        let caller = caller(parts)?;
+        if caller.reads_only() && parts.method != axum::http::Method::GET {
+            return Err(WorkError::forbidden(format!(
+                "{} {} is refused: this token may only read.",
+                parts.method,
+                parts.uri.path()
+            )));
+        }
+        Ok(Self(caller))
+    }
+}
+
+/// Requires the caller to be a person or a reader (an agent that may only read): the reads marked
+/// **read**, which do not depend on who reads.
+pub(crate) struct Reading;
+
+impl<S: Send + Sync> FromRequestParts<S> for Reading {
+    type Rejection = WorkError;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, WorkError> {
+        let caller = caller(parts)?;
+        if caller.is_person() || caller.reads_only() {
+            Ok(Self)
+        } else {
+            Err(WorkError::forbidden(format!(
+                "{} {} needs a device token or a reader token.",
+                parts.method,
+                parts.uri.path()
+            )))
+        }
     }
 }
 
@@ -312,7 +354,7 @@ where
 
 // ─── Workspace, members, machines, personas, teams ───────────────────────────────────────────────
 
-async fn get_workspace(Work(w): Work, Person(_): Person) -> Reply<WorkspaceAt> {
+async fn get_workspace(Work(w): Work, _: Reading) -> Reply<WorkspaceAt> {
     Ok(Json(blocking(w, WorkService::workspace_at).await?))
 }
 
@@ -334,29 +376,25 @@ async fn list_members(Work(w): Work, Who(_): Who) -> Reply<Vec<Member>> {
     Ok(Json(blocking(w, WorkService::members).await?))
 }
 
-async fn list_machines(Work(w): Work, Person(_): Person) -> Reply<Vec<Machine>> {
+async fn list_machines(Work(w): Work, _: Reading) -> Reply<Vec<Machine>> {
     Ok(Json(blocking(w, WorkService::machines).await?))
 }
 
-async fn list_personas(Work(w): Work, Person(_): Person) -> Reply<Vec<Persona>> {
+async fn list_personas(Work(w): Work, _: Reading) -> Reply<Vec<Persona>> {
     Ok(Json(blocking(w, WorkService::personas).await?))
 }
 
-async fn list_teams(Work(w): Work, Person(_): Person) -> Reply<Vec<Team>> {
+async fn list_teams(Work(w): Work, _: Reading) -> Reply<Vec<Team>> {
     Ok(Json(blocking(w, WorkService::teams).await?))
 }
 
 // ─── Projects and workstreams ────────────────────────────────────────────────────────────────────
 
-async fn list_projects(Work(w): Work, Person(_): Person) -> Reply<Vec<Project>> {
+async fn list_projects(Work(w): Work, _: Reading) -> Reply<Vec<Project>> {
     Ok(Json(blocking(w, WorkService::projects).await?))
 }
 
-async fn get_project(
-    Work(w): Work,
-    Person(_): Person,
-    Segments(id): Segments<String>,
-) -> Reply<Project> {
+async fn get_project(Work(w): Work, _: Reading, Segments(id): Segments<String>) -> Reply<Project> {
     let id: ProjectId = path_id(&id, "project")?;
     Ok(Json(blocking(w, move |w| w.project(&id)).await?))
 }
@@ -379,11 +417,7 @@ async fn create_workstream(
     Ok((StatusCode::CREATED, Json(workstream)))
 }
 
-async fn list_workstreams(
-    Work(w): Work,
-    Person(_): Person,
-    params: Params,
-) -> Reply<Vec<Workstream>> {
+async fn list_workstreams(Work(w): Work, _: Reading, params: Params) -> Reply<Vec<Workstream>> {
     let project: Option<ProjectId> = params.one("project")?;
     Ok(Json(
         blocking(w, move |w| w.workstreams(project.as_ref())).await?,
@@ -392,7 +426,7 @@ async fn list_workstreams(
 
 async fn get_workstream(
     Work(w): Work,
-    Person(_): Person,
+    _: Reading,
     Segments(id): Segments<String>,
 ) -> Reply<Workstream> {
     let id: WorkstreamId = path_id(&id, "workstream")?;
@@ -545,7 +579,7 @@ async fn dispatch_task(
 
 // ─── Sessions ────────────────────────────────────────────────────────────────────────────────────
 
-async fn list_sessions(Work(w): Work, Person(_): Person, params: Params) -> Reply<Vec<Session>> {
+async fn list_sessions(Work(w): Work, _: Reading, params: Params) -> Reply<Vec<Session>> {
     let filter = SessionFilter {
         machine: params.one("machine")?,
         workstream: params.one("workstream")?,
@@ -564,11 +598,7 @@ async fn list_sessions(Work(w): Work, Person(_): Person, params: Params) -> Repl
     ))
 }
 
-async fn get_session(
-    Work(w): Work,
-    Person(_): Person,
-    Segments(id): Segments<String>,
-) -> Reply<Session> {
+async fn get_session(Work(w): Work, _: Reading, Segments(id): Segments<String>) -> Reply<Session> {
     let id: SessionId = path_id(&id, "session")?;
     Ok(Json(
         blocking(w, move |w| {
@@ -624,7 +654,7 @@ async fn answer_ask(
     ))
 }
 
-async fn list_briefs(Work(w): Work, Person(_): Person) -> Reply<Vec<Brief>> {
+async fn list_briefs(Work(w): Work, _: Reading) -> Reply<Vec<Brief>> {
     Ok(Json(blocking(w, WorkService::briefs).await?))
 }
 

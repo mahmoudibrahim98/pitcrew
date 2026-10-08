@@ -61,7 +61,7 @@ pub async fn cors(request: Request, next: Next) -> Response {
         headers.insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         headers.insert(
             ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static("GET, POST, PUT, PATCH, OPTIONS"),
+            HeaderValue::from_static("GET, POST, PUT, PATCH, DELETE, OPTIONS"),
         );
         headers.insert(
             ACCESS_CONTROL_ALLOW_HEADERS,

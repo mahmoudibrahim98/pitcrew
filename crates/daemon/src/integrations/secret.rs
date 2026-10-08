@@ -347,11 +347,8 @@ mod tests {
     /// A stand-in `gh` in a private temporary folder: never the machine's own.
     #[cfg(unix)]
     fn stand_in(script: &str) -> (tempfile::TempDir, GhCli) {
-        use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let gh = dir.path().join("gh");
-        fs::write(&gh, script).unwrap();
-        fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_scripts::write_script(&dir.path().join("gh"), script, 0o700);
         let cli = GhCli::with_path(dir.path().as_os_str().to_owned());
         (dir, cli)
     }

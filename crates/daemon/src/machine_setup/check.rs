@@ -301,12 +301,9 @@ async fn slurm(env: &CheckEnv) -> Option<MachineCheckRow> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::os::unix::fs::PermissionsExt as _;
 
     fn script(dir: &Path, name: &str, body: &str) {
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scripts::write_script(&dir.join(name), &format!("#!/bin/sh\n{body}\n"), 0o755);
     }
 
     fn env(bin: &Path, state: &Path, runtime: Option<Capability>) -> CheckEnv {

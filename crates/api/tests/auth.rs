@@ -84,6 +84,67 @@ async fn an_agent_token_on_an_agent_route_sees_the_agent_and_its_owner() {
     assert_eq!(body["on_behalf_of"], f.person.member.0.to_string());
 }
 
+/// A reader reads the agent and read routes, never a device one; any other request of its to a
+/// route is `403`: a write on an agent route or a device route, a WebSocket upgrade. A method a
+/// route does not have is `404`, as for anyone. Agents may not use the read routes.
+#[tokio::test]
+async fn a_reader_token_only_reads() {
+    let f = Fixture::new();
+    let reader = Some(f.reader_token.as_str());
+    for path in ["/v1/me", "/v1/read"] {
+        let (status, body) = call(f.app(), get_request(path, reader)).await;
+        assert_eq!(status, 200, "{path}");
+        assert_eq!(body, serde_json::to_value(f.reader).unwrap());
+    }
+    let (status, body) = call(f.app(), get_request("/v1/device-only", reader)).await;
+    assert_eq!(status, 403);
+    assert_eq!(body["code"], "forbidden");
+    let send = |method: &str, path: &str| {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {}", f.reader_token))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{}"))
+            .unwrap()
+    };
+    for path in ["/v1/agent-write", "/v1/device-write"] {
+        let (status, body) = call(f.app(), send("POST", path)).await;
+        assert_eq!(status, 403, "POST {path}");
+        assert_eq!(body["code"], "forbidden", "POST {path}");
+    }
+    for (method, path) in [
+        ("POST", "/v1/me"),
+        ("PUT", "/v1/read"),
+        ("DELETE", "/v1/read"),
+    ] {
+        let (status, body) = call(f.app(), send(method, path)).await;
+        assert_eq!(status, 404, "{method} {path}");
+        assert_eq!(body["code"], "not_found", "{method} {path}");
+    }
+    let upgrade = axum::http::Request::builder()
+        .uri("/v1/me")
+        .header("authorization", format!("Bearer {}", f.reader_token))
+        .header("upgrade", "websocket")
+        .header("connection", "upgrade")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (status, _) = call(f.app(), upgrade).await;
+    assert_eq!(status, 403, "a socket carries input");
+    // The agent writes where it may, and cannot use the read routes.
+    let write = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/agent-write")
+        .header("authorization", format!("Bearer {}", f.agent_token))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(call(f.app(), write).await.0, 200);
+    let (status, _) = call(f.app(), get_request("/v1/read", Some(&f.agent_token))).await;
+    assert_eq!(status, 403);
+    let (status, _) = call(f.app(), get_request("/v1/read", Some(&f.device_token))).await;
+    assert_eq!(status, 200);
+}
+
 #[tokio::test]
 async fn a_session_token_reaches_only_the_session_routes() {
     let f = Fixture::new();

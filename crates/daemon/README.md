@@ -68,6 +68,7 @@ in the log when used (see "Terminals"):
 | `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `agents/<agent id>.token` | An agent token for each agent whose CLI the runner started (a dispatch's, or `POST /v1/sessions` with `agent`), bound to that agent and its owner, `pca_…`. The CLI is given its path (`PITCREW_TOKEN_FILE`), never the token. Minted once, reused while it verifies as exactly that. The folder is 0700, each file 0600. |
+| `orchestrator.json` | The Orchestrator's conversations, per person, and the ids of every Orchestrator session started for them, kept when they clear (hub-work's `with_orchestrator_file`): not in the event log, so a person can clear their conversations. Written atomically. Private. One this hub cannot read is moved aside (`orchestrator.json.unreadable-<ms>`), logged, and the hub starts with none. |
 | `integrations.json` | The GitHub and Jira connections (never a secret), each connection's sync member (`@sync` or `@tracker-sync`, an agent of the person who added it) and last sync status, the upstream titles of linked milestones and epics, and how far the outward-write planner has read the log (`writes_rev`). Private. |
 | `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream; never in the event log) and its stored secret, when it has one. The folder is 0700 (an owner-only DACL on Windows), each file 0600. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
@@ -663,43 +664,88 @@ review).
 
 ### Confined runs and session tokens (shared plumbing)
 
-A run PitCrew starts **on its own behalf** (a board draft's now; the Orchestrator's later) is a
+A run PitCrew starts **on its own behalf** (a board draft's, the Orchestrator's) is a
 `SessionRequest` with a `Confinement` (hub-work: the `pitcrew` commands it may run, the files in
-its folder it may write, its longest running time). `crate::confined` carries it out, the same
+its folder it may write, its longest running time, and its token: `RunToken`). `crate::confined` carries it out, the same
 for every such run and every CLI, whatever the agent's persona or the person's own settings for
 that CLI say; a later confined run only names its own `Confinement`:
 
-- **A fresh private folder** (`ConfinedRuns`): `scratch/<session>` in PitCrew's cache folder
-  (`~/.cache/pitcrew` on Linux, `~/Library/Caches/PitCrew` on macOS, `%LOCALAPPDATA%\PitCrew\cache`
-  on Windows; `XDG_CACHE_HOME` is honoured), never the state directory (refused if the two would
-  nest) nor the person's repository. The scratch folder is 0700 (repaired if it is open; an
+- **A fresh private folder** (`ConfinedRuns`): `scratch/<state key>/<session>` in PitCrew's
+  cache folder (`~/.cache/pitcrew` on Linux, `~/Library/Caches/PitCrew` on macOS,
+  `%LOCALAPPDATA%\PitCrew\cache` on Windows; `XDG_CACHE_HOME` is honoured), never the state
+  directory (refused if the two would nest) nor the person's repository. The state key
+  (`confined::state_key`: 16 hexadecimal digits of the SHA-256 of the state directory's canonical
+  path) gives each daemon its own folder there, so a second daemon of the same user never removes
+  the first's runs. The scratch folder and the daemon's folder are 0700 (repaired if open; an
   owner-only ACL on Windows); each run's folder is made new for its start (an old one of that name
   is removed), owner-only, holding only `prompt.md` (the prompt, 0600) and the CLI's settings
-  (Claude Code's `.claude/settings.json` from `claude_settings`, OpenCode's `opencode.json` from
+  (Claude Code's `.claude/settings.json` from `claude_settings`, which also denies reading the
+  agent CLIs' folders and common credential stores, `SECRET_READS`, sub-agents, `SUB_AGENT_TOOLS`,
+  and every file edit for a run that writes none; OpenCode's `opencode.json` from
   `opencode_settings`; Codex reads none from an untrusted folder). At each start, whatever in the
-  scratch folder is not a running run's folder is removed (the CLIs read their folders' parents,
-  so an injected `CLAUDE.md` there would reach later runs); when the daemon starts, all of it is.
+  daemon's folder is not a running run's folder is removed, and so is whatever in the scratch
+  folder is not a daemon's folder (the CLIs read their folders' parents, so an injected
+  `CLAUDE.md` there would reach later runs); when the daemon starts, all of its folder is, with
+  the token files a crashed daemon left in `sessions/`. One run per session: a second start of a
+  running one is refused.
   `Dispatcher::confined_folder` names the folder before the session is stored, so its `cwd` is
   right from the start.
 - **Its launch**: the runner's `StartSession` with `confined` and `CONFINED_BRIEF`, one plain line
   telling the CLI to read `prompt.md` (cmd-safe, so Windows `.cmd` shims pass, and nothing of the
   prompt on `/proc/<pid>/cmdline`); the runner's `start_spec` gives each CLI its confined shape
   (see the runner's README).
-- **A session token** (`TokenScope::Session`, `pcs_…`): bound to the session, acting as its agent
-  for the agent's owner, minted into an in-memory registry (`HubTokens` layers it over the token
-  registry for the API, so none outlives the daemon or reaches `tokens.json`), and written to
-  `sessions/<session>.token` in the state directory (0600). `AgentEnv` gives a confined run's CLI
-  that file in place of its agent's, and refuses any token to a board draft's session whose run is
-  gone (fail closed). The API reaches a session token only to routes mounted with
-  `RouterParts::session`; each checks the token is for its own session's resource.
+- **Its own token**, as the confinement says: a **session token** (`RunToken::Session`,
+  `TokenScope::Session`, `pcs_…`, a board draft's) bound to the session, or a **reader token**
+  (`RunToken::Reader`, `TokenScope::Reader`, `pcr_…`, the Orchestrator's) minted for the session
+  alone; either acts as its agent for the agent's owner, is minted into an in-memory registry
+  (`HubTokens` layers it over the token registry for the API, so none outlives the daemon or
+  reaches `tokens.json`; a reader token is looked for there first, then in the registry), and is
+  written to `sessions/<session>.token` in the state directory (0600). `AgentEnv` gives a
+  confined run's CLI that file in place of its agent's, and refuses any token to a board draft's
+  session or an Orchestrator session whose run is gone (fail closed). The API reaches a session
+  token only to routes mounted with `RouterParts::session`, each of which checks the token is for
+  its own session's resource; a reader token only `GET`s the **agent** and **read** routes.
 - **Its end** (`Ender`): `Dispatcher::finish_session` (a draft's proposal is in) revokes the token
-  at once and ends the CLI after `GRACE` (3 s; gracefully, else killed); a watch per run removes
-  its folder and token once its session has ended (looked at every 5 s), and ends it after its
-  `max_runtime` (30 minutes for a draft). At the daemon's start, drafts left running are ended
-  (`WorkService::end_running_drafts`), and their CLIs too once the runner is attached.
+  at once and ends the CLI after `GRACE` (3 s; gracefully, else killed); a watch per run ends it
+  (its CLI too, then its folder and token) once its session has ended (looked at every 5 s: the
+  hub may give up on a CLI that never reported, whose terminal would otherwise stay; a failed
+  look is not an end), and after its `max_runtime` (30 minutes for a draft, 60 for an
+  Orchestrator session). At the daemon's start,
+  drafts and Orchestrator sessions left running are ended (`WorkService::end_running_drafts`,
+  `end_orchestrator_sessions`), and their CLIs too once the runner is attached.
 
-The Orchestrator reuses all of it: its own `Confinement` (its read verbs as `commands`, no
-`writes`) and its own session routes.
+The Orchestrator reuses all of it with its own `Confinement` (`orchestrator_confinement`: the read
+verbs as `commands`, no `writes`, 60 minutes, a reader token).
+
+## The Orchestrator
+
+The Orchestrator panel's questions (api-v1.md, "Orchestrator"; hub-work's README, "The
+Orchestrator") run as sessions of an agent CLI on this machine, through the same `RunnerLink`
+(`src/orchestrator.rs`, `src/dispatch.rs`):
+
+- **Where and as whom:** each question that starts a session is a **confined run** (see "Confined
+  runs and session tokens"): a fresh private folder under the cache folder, its prompt in
+  `prompt.md`, its CLI's confined shape (Claude Code's settings allow only `pitcrew`'s read verbs
+  and deny every edit; OpenCode's allow reading its folder and the read verbs; Codex is not
+  offered, as its read-only sandbox keeps `pitcrew` from this daemon), and a **reader token**
+  minted for the session alone, never its agent's: `AgentEnv` refuses an Orchestrator session any
+  token once its run is gone. A reader may only `GET` (`pitcrew-api` refuses anything else, and
+  every WebSocket, with `403`), so the CLI's write verbs fail and its read verbs work. A new
+  conversation, a clear and the session's end finish the run (token, CLI, folder).
+- **Asker only:** `orchestrator::asker_only`, a route layer on `GET /v1/sessions/{id}/transcript`
+  and `GET /v1/sessions/{id}/terminal`, answers `403` to anyone but the person who asked an
+  Orchestrator session, or a sub-agent's session under one (`WorkService::orchestrator_asker`,
+  cleared or not). It reads the session id as the route does (`Path<String>`, percent-decoded:
+  `route_session`), never from the raw path, as the sign-in terminals' `only_its_starter` does.
+- **Installed:** `Dispatcher::installed` says whether the CLI is on this daemon's `PATH`
+  (`PATHEXT` on Windows), which `GET /v1/orchestrator` shows per engine.
+- **Following answers:** a loop (`orchestrator::follow`, every second, on the blocking pool)
+  calls `WorkService::follow_orchestrator`, which reads each answering session's transcript
+  through `Dispatcher::transcript` (the runner's) and sends Esc through `Dispatcher::command` when
+  an answer is cut, times out or is canceled.
+
+`serve` mounts hub-work's `read_routes`, `pitcrew-api`'s `Activity` and `Recaps` as **read**
+routes (device and reader tokens), and `orchestrator_routes` as device routes.
 
 ## Routes
 
@@ -714,9 +760,10 @@ The Orchestrator reuses all of it: its own `Confinement` (its read verbs as `com
 | `POST /v1/machines/{id}/scan` | `src/scan.rs`, a device route, over the runner's homes with `pitcrew_ingest::scan` (see "The machine scan") |
 | `GET /v1/machines/{id}/check`, `GET /v1/machines/{id}/agents`, `GET`/`POST`/`DELETE /v1/machines/{id}/agents/{engine}/sign-in` | `src/machine_setup/`, device routes for the hub's owner only (see "Machine setup") |
 | `POST /v1/hooks/{engine}/{event}` | `pitcrew-api` into the runner's `RunnerHooks` (see "The runner"); with `--no-runner`, logged at debug (engine, event, member; never the body) |
-| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SignInTerminals` (machine setup's sign-in terminals by their id, for the member who started each only) and then `SessionTerminals` (see "Terminals") |
+| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SignInTerminals` (machine setup's sign-in terminals by their id, for the member who started each only) and then `SessionTerminals` (see "Terminals"); an Orchestrator session's for its asker only (`orchestrator::asker_only`) |
 | `POST /v1/sessions`, `POST /v1/sessions/{id}/send`, `/keys`, `/interrupt`, `/end` | `src/sessions.rs`, device routes, through the runner's `RunnerCommands` (see "Terminals") |
-| `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route, from the runner's `RunnerTranscripts` (see "The runner") |
+| `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route, from the runner's `RunnerTranscripts` (see "The runner"); an Orchestrator session's for its asker only (`orchestrator::asker_only`) |
+| `GET /v1/orchestrator`, `POST /v1/orchestrator/questions`, `POST /v1/orchestrator/conversations/{id}/cancel`, `DELETE /v1/orchestrator/conversations` | `pitcrew-hub-work` (`orchestrator_routes`), device routes, with `RunnerLink` as its dispatcher (see "The Orchestrator") |
 | `/v1/integrations…`, `/v1/writes…` | `src/integrations/`, device routes (see "Integrations") |
 
 On development TCP only, the daemon answers CORS as the mock hub does: preflights from
@@ -725,7 +772,8 @@ On development TCP only, the daemon answers CORS as the mock hub does: preflight
 
 ## Recaps
 
-`GET /v1/recaps/blocks` and `GET /v1/recaps/days` (api-v1, "Recaps"; device tokens only) are
+`GET /v1/recaps/blocks` and `GET /v1/recaps/days` (api-v1, "Recaps"; device and reader tokens,
+**read** routes) are
 answered by the hub's recap index: hub-work's `RecapIndex`, which its one `WorkService`
 implements (hub-work's README, "Recaps"). Blocks and day paragraphs are derived from the log, so
 a restart builds them again. The blocks are kept on disk, not in memory, in `recaps.sqlite3` in the
@@ -1086,6 +1134,20 @@ process the daemon starts carries the test's mark, and none is left at the end.
   appended as if the hub stopped before starting it: at the next start the second fails ("did not
   start") and its session ends, while the first is kept and reported under its id once its
   transcript appears; ended without a report, its dispatch is `canceled`.
+
+`tests/orchestrator.rs` (Unix), the Orchestrator end to end, with the same rig: a stand-in
+`claude` starts confined (Claude Code's confined flags, `CONFINED_BRIEF` as its only prompt
+argument, a fresh private folder outside the state directory holding `prompt.md` and settings that
+allow only the read verbs and deny every edit), reads the work through the real `pitcrew` read
+verbs with the token file the daemon gave it (`sessions/<session>.token`, a reader token minted
+for that session alone, none in its environment, no agent token minted), tries two writes (both
+refused, exit 3), and answers "What did my agents do today?" in a transcript as Claude Code writes
+one. The answer arrives with working links (each reference names a session and a task the hub
+serves) and a suggestion that moved nothing; the reader token is `403` on every write route of the
+contract, every WebSocket and the device-only reads, and `200` on the reads marked **read**;
+another person gets `403` on the session's transcript and terminal, before and after clearing; a
+follow-up is typed into the live session and answered there; clearing forgets the conversation,
+revokes the reader token at once, ends its session, and removes its folder and token file.
 
 `tests/board.rs` (Unix), a board draft end to end, with the same rig as `tests/dispatch.rs` and
 the `pitcrew` CLI built next to `pitcrewd` (skipped with a message when it or pitcrew-ptyd is not

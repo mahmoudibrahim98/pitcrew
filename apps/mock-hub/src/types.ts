@@ -102,7 +102,7 @@ export const CAPABILITIES = ['tmux', 'pty', 'slurm', 'watch', 'scan'] as const;
 export type Capability = (typeof CAPABILITIES)[number];
 
 /** The mock's token kinds: a session token (`pcs_…`) also names its session (`Caller.session`). */
-export const TOKEN_SCOPES = ['device', 'agent', 'session'] as const;
+export const TOKEN_SCOPES = ['device', 'agent', 'reader', 'session'] as const;
 export type TokenScope = (typeof TOKEN_SCOPES)[number];
 
 export const ERROR_CODES = [
@@ -519,6 +519,76 @@ export interface BoardDraft {
   reviewed?: TimestampMs;
   accepted: DraftedTask[];
   rejected: number[];
+}
+
+// ─── The Orchestrator (orchestrator.rs) ──────────────────────────────────────────────────────────
+
+export interface EngineStatus {
+  engine: Engine;
+  installed: boolean;
+}
+
+export interface OrchestratorLimits {
+  question_chars: number;
+  answer_bytes: number;
+  answer_seconds: number;
+  turns: number;
+  conversations: number;
+}
+
+export const TURN_STATES = ['answering', 'answered', 'canceled', 'timed_out', 'too_long', 'failed'] as const;
+export type TurnState = (typeof TURN_STATES)[number];
+
+export type ReferenceTarget =
+  | { kind: 'session'; id: SessionId }
+  | { kind: 'task'; id: TaskId; key: string }
+  | { kind: 'workstream'; id: WorkstreamId; project: ProjectId }
+  | { kind: 'project'; id: ProjectId }
+  | { kind: 'recap'; project: ProjectId; workstream?: WorkstreamId; date?: string };
+
+export interface AnswerReference {
+  text: string;
+  target: ReferenceTarget;
+  label: string;
+}
+
+export type AnswerSuggestion =
+  | { kind: 'move_task'; task: TaskId; key: string; to: TaskStatus; label: string }
+  | { kind: 'open'; target: ReferenceTarget; label: string };
+
+export interface AnswerUsage {
+  duration_ms: number;
+  tool_runs: number;
+  answer_bytes: number;
+}
+
+export interface OrchestratorTurn {
+  question: string;
+  asked: TimestampMs;
+  session: SessionId;
+  state: TurnState;
+  answer: string;
+  references: AnswerReference[];
+  suggestions: AnswerSuggestion[];
+  usage?: AnswerUsage;
+  ended?: TimestampMs;
+  note?: string;
+}
+
+export interface Conversation {
+  id: string;
+  engine: Engine;
+  agent: MemberId;
+  started: TimestampMs;
+  session?: SessionId;
+  turns: OrchestratorTurn[];
+}
+
+export interface Orchestrator {
+  engines: EngineStatus[];
+  engine?: Engine;
+  limits: OrchestratorLimits;
+  conversations: Conversation[];
 }
 
 // ─── API (api.rs) ───────────────────────────────────────────────────────────────────────────────

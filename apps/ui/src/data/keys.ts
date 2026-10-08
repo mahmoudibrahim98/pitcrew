@@ -13,6 +13,8 @@ export const keys = {
   events: ['events'] as const,
   briefs: ['briefs'] as const,
   dispatches: ['dispatches'] as const,
+  /** The person's own Orchestrator conversations; not events, so polled while one answers. */
+  orchestrator: ['orchestrator'] as const,
 
   projects: {
     lists: ['projects', 'list'] as const,

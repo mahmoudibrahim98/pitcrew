@@ -22,12 +22,21 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
 - A WebSocket cannot set headers from a browser, so WebSocket routes take the token as a
   subprotocol: `Sec-WebSocket-Protocol: pitcrew.v1, pitcrew.bearer.<token>`. The server answers
   with `pitcrew.v1`.
-- Three scopes (`TokenScope`):
+- Four scopes (`TokenScope`):
   - `device` (`pcd_…`), a person's desktop: every route.
   - `agent` (`pca_…`), an agent or hook: only routes marked **agent** below.
     - **Reads** on those routes see the whole workspace, so agents can coordinate.
     - **Writes** are limited to the agent's **own** tasks (it is the assignee, or holds the task's
       active dispatch) and its own sessions. A write on anything else is `403 forbidden`.
+  - `reader` (`pcr_…`), an agent that may only read: the Orchestrator's CLI (see "Orchestrator").
+    Only `GET` and `HEAD` requests, on the routes marked **agent** or **read** below (`403` on the
+    others). **Every other request of a reader to a route is `403 forbidden`** before its body is
+    read: any `POST`, `PUT`, `PATCH` or `DELETE`, and any WebSocket upgrade (the stream,
+    terminals); as for anyone, a route or method that does not exist is `404`. Its reads see what
+    those routes show anyone. Reader tokens name an agent and its owner, as agent tokens do. The
+    hub mints one for each Orchestrator session alone (its confined run, see "Orchestrator"), in
+    the daemon's memory only, and revokes it when the session ends, when its person clears their
+    conversations, and with the daemon.
   - `{ "session": SessionId }` (`pcs_…`), a **session token**: minted by the hub for one session
     it starts on its own behalf (a confined run: a board draft's, see "Board drafts"), bound to
     that session, and given to its CLI (`PITCREW_TOKEN_FILE`) in place of its agent's token. It
@@ -35,12 +44,13 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
     session** below, and each of those only for its own session's resource; every other route
     is `403 forbidden` (an agent route too). It lives in the daemon's memory only (never in the
     token registry), and is revoked when its run has done its one thing, when its session ends,
-    when the run passes its time, and with the daemon. This is shared plumbing: a later confined
-    run (the Orchestrator's) gets its own session token the same way.
+    when the run passes its time, and with the daemon. This is shared plumbing: the Orchestrator's
+    confined runs get a **reader** token minted the same way instead (they only read).
   - The hub stamps `author` (the caller) and, for agents and session tokens, `on_behalf_of` (the
-    owner) from the token, never from the body.
-- Mock tokens: `dev-device-token` (acts as `@sam`) and `dev-agent-token` (acts as `@writer`). The
-  mock mints a session token per board draft, as the hub does, kept in memory (and written to
+    owner) from the token, never from the body. A reader never authors an event.
+- Mock tokens: `dev-device-token` (acts as `@sam`), `dev-agent-token` (acts as `@writer`) and
+  `dev-reader-token` (a reader acting as `@office`, for `@sam`). The mock mints a session token
+  per board draft, as the hub does, kept in memory (and written to
   `<sessionTokenDir>/<session>.token` when started with that option, for the conformance suite).
 
 ## Errors
@@ -143,9 +153,9 @@ the task key (`PAP-4`).
 |---|---|---|
 | `GET /v1/host/info` | → `HostInfo` | No auth. Check `protocol_min ≤ yours ≤ protocol` before anything else. |
 | `GET /v1/me` | → `Member` | The token's member. **agent** `404` before setup (see below). |
-| `GET /v1/workspace` | → `{ "workspace": Workspace, "rev": u64, "setup_needed": bool }` | `rev` is the current event revision. `setup_needed` is `true` while the workspace has no person (a fresh hub); omitted means `false`. |
+| `GET /v1/workspace` | → `{ "workspace": Workspace, "rev": u64, "setup_needed": bool }` | `rev` is the current event revision. `setup_needed` is `true` while the workspace has no person (a fresh hub); omitted means `false`. **read** |
 | `POST /v1/setup` | `Setup` → `{ "workspace": Workspace, "me": Member, "machine": Machine }` | The first run (see below). Device tokens only. |
-| `GET /v1/machines` | → `Machine[]` | |
+| `GET /v1/machines` | → `Machine[]` | **read** |
 | `POST /v1/machines/{id}/scan` | → lines of `ScanFrame` (200) | Scans the machine's agent homes for onboarding. Device tokens only. See "Machine scan". |
 | `GET /v1/machines/{id}/check` | → `MachineCheck` | What the machine has for running agents. The hub's owner only. See "Machine setup". |
 | `GET /v1/machines/{id}/agents` | → `AgentAccount[]` | Each agent CLI's account, as its own status command reports it. The hub's owner only. |
@@ -153,10 +163,10 @@ the task key (`PAP-4`).
 | `GET /v1/machines/{id}/agents/{engine}/sign-in` | → `SignIn` | That sign-in, and whether it still runs. The hub's owner only. |
 | `DELETE /v1/machines/{id}/agents/{engine}/sign-in` | → 204 | Stops that sign-in and removes its terminal. The hub's owner only. |
 | `GET /v1/members` | → `Member[]` | **agent** |
-| `GET /v1/personas` | → `Persona[]` | |
+| `GET /v1/personas` | → `Persona[]` | **read** |
 | `POST /v1/personas` | `PersonaEdit` → `Persona` (201) | Device only; emits `persona_saved` and an owned agent `member_added` in one append. |
 | `PUT /v1/personas/{id}` | `PersonaEdit` → `Persona` | Device only; unknown id 404; emits `persona_saved`. |
-| `GET /v1/teams` | → `Team[]` | |
+| `GET /v1/teams` | → `Team[]` | **read** |
 | `POST /v1/teams` | `TeamEdit` → `Team` (201) | Device only; emits `team_saved`. |
 | `PUT /v1/teams/{id}` | `TeamEdit` → `Team` | Device only; unknown id 404; emits `team_saved`. |
 
@@ -215,11 +225,11 @@ At most 256 members; validation completes before any event is appended.
 
 | Method and path | Body → response | Notes |
 |---|---|---|
-| `GET /v1/projects` | → `Project[]` | |
-| `GET /v1/projects/{id}` | → `Project` | |
+| `GET /v1/projects` | → `Project[]` | **read** |
+| `GET /v1/projects/{id}` | → `Project` | **read** |
 | `POST /v1/projects` | `NewProject` → `Project` (201) | See below. `409 conflict` if the key is in use. Emits `project_created`. |
-| `GET /v1/workstreams?project=` | → `Workstream[]` | |
-| `GET /v1/workstreams/{id}` | → `Workstream` | |
+| `GET /v1/workstreams?project=` | → `Workstream[]` | **read** |
+| `GET /v1/workstreams/{id}` | → `Workstream` | **read** |
 | `POST /v1/workstreams` | `NewWorkstream` → `Workstream` (201) | See below. `404 not_found` for an unknown project. Emits `workstream_created`. |
 | `PATCH /v1/workstreams/{id}` | `{ "status"?, "health"?, "external"? }` → `Workstream` | Emits `workstream_changed` for status and health, `workstream_linked` for `external`: see "Linking a workstream upstream". |
 
@@ -363,8 +373,8 @@ another person's agent or one with no owner (explicit sharing may come later).
 
 | Method and path | Body → response | Notes |
 |---|---|---|
-| `GET /v1/sessions?machine=&workstream=&task=&state=` | → `Session[]` | |
-| `GET /v1/sessions/{id}` | → `Session` | |
+| `GET /v1/sessions?machine=&workstream=&task=&state=` | → `Session[]` | **read** |
+| `GET /v1/sessions/{id}` | → `Session` | **read** |
 | `GET /v1/sessions/{id}/transcript?before=&limit=` | → `TranscriptPage` | See "Transcript paging". |
 | `POST /v1/sessions` | `StartSession` → `Session` (202) | Starts a new session. Emits `session_discovered`. See below. |
 | `POST /v1/sessions/{id}/send` | `{ "text": String }` → 204 | Types text and presses Enter. |
@@ -483,9 +493,9 @@ when that visit began; arriving live events remain new until another visit.
 | `GET /v1/asks?to=&state=` | → `Ask[]` | The Inbox is `?to=<me>&state=open`. **agent** |
 | `POST /v1/asks` | `{ "kind", "to", "title", "body"?, "options"?, "task"?, "session"?, "receipts"? }` → `Ask` (201) | Emits `ask_raised`. **agent** |
 | `POST /v1/asks/{id}/answer` | `{ "option"?: usize, "text"?: String }` → `Ask` | See below. Emits `ask_answered`. **agent** |
-| `GET /v1/briefs` | → `Brief[]` | The briefs in force, each with its pending proposal in `proposal` when it has one. See "Briefs". |
+| `GET /v1/briefs` | → `Brief[]` | The briefs in force, each with its pending proposal in `proposal` when it has one. See "Briefs". **read** |
 | `PUT /v1/briefs/{project\|workstream}/{id}` | `{ "text", "next"?, "pinned" }` → `Brief` | A person's brief, or a proposal they accept. See "Briefs". Emits `brief_accepted`. |
-| `GET /v1/events?before=&limit=&project=&workstream=&task=&session=` | → `{ "events": Event[], "from_rev": u64, "to_rev": u64, "at_start": bool }` | See below. |
+| `GET /v1/events?before=&limit=&project=&workstream=&task=&session=` | → `{ "events": Event[], "from_rev": u64, "to_rev": u64, "at_start": bool }` | See below. **read** |
 
 **Briefs.** The brief in force for a project or workstream is the one its newest `brief_accepted`
 put there. Its **pending proposal** is the newest `brief_proposed` for that target, if it is newer
@@ -539,10 +549,10 @@ the previous page. Default limit 100, max 500;
 
 | Method and path | Body → response | Notes |
 |---|---|---|
-| `GET /v1/recaps/blocks?session=&task=&workstream=&project=&before=&limit=` | → `BlocksPage` | Activity blocks, newest first, each with its line. See "Recap blocks". |
-| `GET /v1/recaps/days?workstream=\|project=&tz=&before=&limit=` | → `DaysPage` | Day paragraphs, newest day first. See "Recap days". |
+| `GET /v1/recaps/blocks?session=&task=&workstream=&project=&before=&limit=` | → `BlocksPage` | Activity blocks, newest first, each with its line. See "Recap blocks". **read** |
+| `GET /v1/recaps/days?workstream=\|project=&tz=&before=&limit=` | → `DaysPage` | Day paragraphs, newest day first. See "Recap days". **read** |
 
-Both need a device token, like the activity log they summarise. The types are in
+Both need a device token (or a reader token), like the activity log they summarise. The types are in
 `crates/protocol/src/recap.rs`; the recap engine (`crates/recap`, stream F) computes them.
 
 **Recap types.**
@@ -753,8 +763,8 @@ agents, and sign in to each agent CLI with the CLI's own login. The types are in
 `crates/protocol/src/machine_setup.rs`.
 
 - **Who.** All five are for **the hub's owner only**: the member who set the hub up (its first
-  person, `POST /v1/setup`'s). An agent token gets `403`, and so does any other member's device
-  token, on every route and before anything else is looked at (the machine, the engine, the
+  person, `POST /v1/setup`'s). An agent or reader token gets `403`, and so does any other member's
+  device token, on every route and before anything else is looked at (the machine, the engine, the
   body): on a shared hub, another person cannot sign the owner's machine in to their own account,
   open the owner's sign-in, or read the owner's accounts. Before setup (no person yet) they are
   `409`.
@@ -857,7 +867,7 @@ A person connects GitHub repositories or Jira projects to the workspace, links w
 upstream scopes ("Linking a workstream upstream"), and the hub keeps tasks in step with upstream.
 **A sync only reads upstream**: no route here writes to GitHub or Jira, and every write goes
 through a person's approval first ("Outward writes", below). Every route is **device
-tokens only** (an agent token gets `403`, before anything else is checked). Types are in
+tokens only** (an agent or reader token gets `403`, before anything else is checked). Types are in
 `crates/protocol/src/integrations.rs`.
 
 | Method and path | Body → response | Notes |
@@ -987,8 +997,8 @@ PitCrew can change GitHub and Jira (create an issue from a task, comment, close 
 the title, description or labels, set a milestone or epic), but **nothing is sent upstream until a
 person approves it**. A hub change that implies a write raises an ask of kind `approval` that shows
 exactly what will be sent; the hub sends it only after the person answers **Send**, and records
-the result as an event. Every route here is **device tokens only** (an agent token gets `403`
-before anything else is checked). Types are in `crates/protocol/src/writes.rs`.
+the result as an event. Every route here is **device tokens only** (an agent or reader token gets
+`403` before anything else is checked). Types are in `crates/protocol/src/writes.rs`.
 
 | Method and path | Body → response | Notes |
 |---|---|---|
@@ -1184,8 +1194,10 @@ preview's prompt in memory for 10 minutes, for its start.
   task, its title, its counts (turns, tool runs and failures, file edits), up to 5 files it edited
   and up to 3 recap lines (the one-line summaries of its newest blocks of work). Files are named
   relative to the session's folder, else to one of the workstream's folders or its project's
-  root; any other absolute path keeps only its end (`…/<file>`, or its last two parts when it has
-  five or more, or `…`), and a path too long is cut at its start. Only sessions the
+  root; any other absolute path keeps only its file name (`…/<file>`, or `…` without one: no
+  folder of it, which may be a user's name), and a path too long is cut at its start. In titles,
+  recap lines and the proposal's texts only a Windows path or a path ending in a file name is cut
+  so (a URL's path such as `/api/users` stays). Only sessions the
   session routes would list (the import choice applies), without sub-agents and without drafts'
   own sessions. **Never** a transcript, a prompt, a tool's output or a secret.
 - **Bounds**: 40 sessions, 60 tasks (at most 4 KiB of them), titles of 120 characters, recap lines
@@ -1215,24 +1227,28 @@ that is running or waiting for review (one at a time); `503` when no session can
 attached, the hub's own machine not live, or no scratch folder for confined runs). The engine
 defaults to the agent's persona's, else `claude`; the person's UI offers only the CLIs found on
 the hub's machine (`GET /v1/machines/{id}/session-options`). A start with the latest preview's
-digest sends exactly that preview's prompt.
+digest sends exactly that preview's prompt; a start refused before the draft is stored (`400`,
+`403`, `409`, `503`) leaves that preview kept for the next.
 - **The CLI runs confined** (a confined run; the daemon's `crates/daemon/src/confined.rs`), whatever
   the agent's persona's permission mode and the person's own settings for that CLI:
-  - on the hub's own machine, in a **fresh private folder** `scratch/<session>` in PitCrew's cache
-    folder (0700, an owner-only ACL on Windows), never the workstream's folder nor the state
-    directory, removed when its session ends;
+  - on the hub's own machine, in a **fresh private folder** `scratch/<state key>/<session>` in
+    PitCrew's cache folder (the state key: 16 hexadecimal digits of the SHA-256 of the hub's state
+    directory, so each hub's runs are its own; 0700, an owner-only ACL on Windows), never the
+    workstream's folder nor the state directory, removed when its session ends;
   - with its prompt in `prompt.md` there (0600) and one plain line on its command line
     (`Read the file prompt.md in this folder and follow its instructions.`);
   - in its CLI's confined shape: Claude Code `--permission-mode=default --setting-sources=project
     --strict-mcp-config` with a project `.claude/settings.json` that pre-approves only `pitcrew
-    board submit` and writing `proposal.json`, and denies web fetch and search and the state
-    directory; Codex `--sandbox=read-only --ask-for-approval=on-request
+    board submit` and writing `proposal.json`, and denies web fetch and search, the state
+    directory, and sub-agents (`Task`, `Agent`); Codex `--sandbox=read-only --ask-for-approval=on-request
     --config=web_search=disabled` (its sandbox blocks the network, so the person approves the
     submit in its terminal); OpenCode with a deny-all `opencode.json` but reading its folder and
     `pitcrew board submit …` (refused on Windows);
   - with a **session token** (see "Transport and auth") for the draft's session, never the
     agent's token;
-  - for at most **30 minutes**: then its CLI is ended, and the draft with it (`ended`).
+  - for at most **30 minutes**: then its CLI is ended, and the draft with it (`ended`); and its
+    CLI is ended too once its session has ended otherwise (the hub gave up on a CLI that never
+    reported, a person ended it).
 - The hub stores the session first (`session_discovered`: state `starting`, the agent named,
   linked to the workstream with `link_basis: manual`, its `cwd` the private folder), then
   `board_draft_started` (the draft, its workstream, agent, engine, session, the prompt's version
@@ -1279,6 +1295,182 @@ file (the prompt asks for `--file proposal.json`, which works in every shell), o
 `--file -` or no `--file`; refuses one over 32 KiB or that is not a JSON object, and a person's
 device token, before sending it; and posts it with the token it was given (the draft's session
 token), without asking whose it is (`GET /v1/me` is not a session route).
+
+### Orchestrator
+
+The Orchestrator panel answers a person's questions about their work across projects, sessions
+and machines (what each agent did today, what is blocked, where something was decided, which
+session touched a file), with links to what it used. **No API keys:** each question runs as a
+session of an agent CLI the person already uses (their choice of engine, remembered), started by
+the hub as a **confined run** (as a board draft's is) with a versioned prompt and a **reader**
+token minted for that session alone (see "Transport and auth"): it finds things with the
+`pitcrew` CLI's read verbs and cannot change anything in PitCrew. **Any action comes back as a
+suggestion the person clicks.** Types: `crates/protocol/src/orchestrator.rs`.
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/orchestrator` | → `Orchestrator` | The caller's own: the engines, the remembered one, the bounds, and their conversations, newest first. |
+| `POST /v1/orchestrator/questions` | `Question` → `Conversation` (202) | A new conversation, or a follow-up in `conversation`. Emits `session_discovered` when it starts a session. |
+| `POST /v1/orchestrator/conversations/{id}/cancel` | → `Conversation` | Stops the answer under way: its CLI gets Esc. |
+| `DELETE /v1/orchestrator/conversations` | → 204 | Clears the caller's history, and finishes their Orchestrator session. |
+
+All four are for device tokens only (`403` for agent and reader tokens), and see only the caller's
+own conversations: another person's are `404`. Ids in paths are bare ULIDs (`cnv_…` is accepted
+too). **The conversations are not events:** the hub keeps them per person in its state directory
+(`orchestrator.json`, private to its user), never on the stream or in the activity log, so a
+clear forgets them. Only the sessions that answer are in the log, as any session is. A file the
+hub cannot read (a newer version, a variant it does not know, or one that does not parse) never
+stops it: it is moved aside (`orchestrator.json.unreadable-<ms>`) and the hub starts with no
+conversations.
+
+**An Orchestrator session's transcript and terminal are its asker's alone**: `GET
+/v1/sessions/{id}/transcript` and `GET /v1/sessions/{id}/terminal` for one are `403` for anyone
+but the person who asked (another person's device token included; a reader's and an agent's are
+refused there already), before and after they clear, however the path writes its id (`ses_…`,
+the bare ULID, or percent-encoded: the check reads the id the route reads). So is a session
+whose parent is one (a sub-agent's, as the runner states it), up to 8 parents. The hub remembers
+every Orchestrator session it started for a person, cleared or not (the newest 2000 per person),
+for this; one it no longer remembers (past those, or in a file moved aside) is still known by
+its own facts: titled `Orchestrator` and run in the very folder the hub names for its confined
+run, it is its agent's owner's. The session itself (`GET /v1/sessions/{id}`, its state and its
+activity in `GET /v1/events`, the tools it ran included) is listed as any session is.
+
+**`Orchestrator`**: `{ "engines": EngineStatus[], "engine"?: Engine, "limits": OrchestratorLimits,
+"conversations": Conversation[] }`.
+- `EngineStatus` is `{ "engine", "installed": bool }` for each engine the Orchestrator offers:
+  `claude` and `opencode` (only `claude` on Windows), whether that CLI is on the hub machine's
+  `PATH`, where questions run. **Codex is not offered**: its read-only sandbox keeps `pitcrew` from
+  reaching the hub (a Unix socket or loopback TCP alike), so every read would wait for the person's
+  approval in its terminal, and widening its sandbox would give it the network and writes too.
+  OpenCode is not offered on Windows, where its commands run in `cmd.exe` and its confinement
+  cannot hold. No engine installed is the panel's "nothing to ask with" state, which points to
+  signing in to an agent CLI. Whether a CLI is signed in is not known here (onboarding's
+  `GET /v1/machines/{id}/agents` says, to the hub's owner): a CLI that waits for its login or for
+  its folder to be trusted shows it in its session's terminal.
+- `engine`: the engine the caller chose last for a new conversation, the next one's default
+  (absent before the first).
+- `OrchestratorLimits`: `{ "question_chars": 4000, "answer_bytes": 16384, "answer_seconds": 300,
+  "turns": 20, "conversations": 20 }`: the longest question, answer and wait, the most questions
+  in one conversation, and the most conversations kept (the oldest are forgotten first).
+
+**Asking** (`Question`: `{ "text", "engine"?: Engine, "conversation"?: ConversationId, "agent"?:
+MemberId }`), refusals first, with nothing changed:
+- `404` an unknown `conversation` (or another person's); `400` a malformed body, or a `text` that
+  is empty or over `question_chars` once control and hidden characters are dropped and it is
+  trimmed (a follow-up's line breaks become spaces: it is typed into the CLI);
+- `400` an unknown agent, a person as the agent, or none named when the caller has no back office
+  (`@office`, the default); `403` an agent the caller does not own;
+- `400` an `engine` the Orchestrator does not offer (`codex`, and `opencode` on Windows), for a
+  question that starts a session;
+- `409` while one of the caller's answers is under way (one at a time: cancel it first), a
+  conversation at its `turns`, or an engine whose CLI is not installed (`installed: false`);
+- `503` when no session can start: no runner attached, the hub has no machine of its own, it is
+  not live, or there is no scratch folder for confined runs.
+
+Without `conversation` it is a new conversation, in `engine` (else the remembered one while it is
+offered, else `claude`), which becomes the remembered one; the caller's other Orchestrator session
+is finished first (one at a time per person: its token stops at once, its CLI is ended). With `conversation` it is a follow-up in that conversation's engine
+(`engine` is ignored): if the conversation's session lives, the question is typed into it (the
+runner's `SendText`); if it has ended, a new session starts, whose prompt carries the
+conversation's last questions and answers (at most 6 KiB, cut and marked as data).
+
+The question is saved first (with a new session's id), so one the hub cannot keep changes
+nothing (`500`, no turn left answering). A new session is then stored (`session_discovered`:
+title `Orchestrator`, state `starting`, the agent named, linked to nothing, its `cwd` its private
+folder), then its CLI starts **confined**
+(the daemon's `crates/daemon/src/confined.rs`, as for a board draft), whatever the agent's
+persona's permission mode and the person's own settings for that CLI:
+- on the hub's own machine, in a **fresh private folder** `scratch/<state key>/<session>` in
+  PitCrew's cache folder (0700, an owner-only ACL on Windows), never the state directory, made new
+  for this
+  session (a follow-up typed into a live session stays in its folder; a new session gets a new
+  one) and removed when the session ends, so nothing an answer could write there (a
+  `CLAUDE.md`, an `AGENTS.md`, a settings file) reaches a later session;
+- with its prompt (`crates/office/prompts/orchestrator/v1.md`, `orchestrator/v1`: the workspace,
+  the person, today's date, the read verbs, how to cite and how to suggest, then the question) in
+  `prompt.md` there (0600), and one plain line on its command line (`Read the file prompt.md in
+  this folder and follow its instructions.`), which passes a Windows `.cmd` shim;
+- in its CLI's confined shape: Claude Code `--permission-mode=default --setting-sources=project
+  --strict-mcp-config` with a project `.claude/settings.json` that pre-approves only `pitcrew`'s
+  read verbs (never `board submit`), denies every file edit, web fetch and search, sub-agents
+  (`Task`, `Agent`), reading or changing the state directory, and reading the agent CLIs' own
+  folders and common credential stores (`~/.ssh`, `~/.claude`, `~/.codex`, …); a read elsewhere outside its folder asks the
+  person in its terminal (Claude Code's denials win over its allowances, so it cannot be told to
+  deny every read but its folder's). OpenCode with a deny-all `opencode.json` but reading its
+  folder (`external_directory` denied) and `pitcrew <read verb>`;
+- with a **reader token** minted for this session alone (`PITCREW_TOKEN_FILE`:
+  `sessions/<session>.token` in the state directory), never its agent's token, even once its run
+  is gone; revoked when the session ends, when the person clears, and with the daemon;
+- for at most **60 minutes**: then its CLI is ended (a follow-up after that starts a new
+  session). When the daemon starts, Orchestrator sessions left running are ended (their tokens
+  were in the last daemon's memory).
+
+A start the runner refuses or fails ends the session and answers as a dispatch does (`409`, `503`
+or `500`); the turn is then `failed`. The answer is `202` with the conversation, its new turn
+`answering`.
+
+**`Conversation`**: `{ "id", "engine", "agent", "started", "session"?: SessionId, "turns":
+OrchestratorTurn[] }`; `session` is the session that answers it while that lives (absent once it
+has ended). **`OrchestratorTurn`**: `{ "question", "asked", "session", "state": TurnState,
+"answer", "references": AnswerReference[], "suggestions": AnswerSuggestion[], "usage"?:
+AnswerUsage, "ended"?, "note"? }`.
+
+**The answer streams from the session's transcript.** The hub follows every answering turn about
+once a second: its `answer` is the assistant's text after the turn's prompt in the session's
+transcript (as `GET /v1/sessions/{id}/transcript` reads it), so far. `TurnState`:
+- `answering`, until one of:
+- `answered` at the transcript's turn end;
+- `too_long` once the answer passes `answer_bytes`: it is cut there, and the CLI gets Esc;
+- `timed_out` once `answer_seconds` have passed since it was asked: the CLI gets Esc;
+- `canceled` by a cancel;
+- `failed` when the session ends, or its start fails, first (`note` says why).
+
+`usage` (`AnswerUsage`, from the transcript, once the turn has ended): `{ "duration_ms",
+"tool_runs", "answer_bytes" }`: how long it took, the tools its CLI ran, and the answer's size.
+The panel shows it under each answer, and polls `GET /v1/orchestrator` about once a second while a
+turn answers.
+
+**References** are what an answer cites, found in its text and checked against the hub: a session
+as `ses_…`, a task as its key (`PAP-4`) or `tsk_…`, a workstream as `wst_…`, a project as
+`prj_…`, and a recap as `recap:wst_…` or `recap:prj_…`, with `@YYYY-MM-DD` for one day. Each
+known one, once (at most 50), is an `AnswerReference`: `{ "text", "target": ReferenceTarget,
+"label" }`, where `text` is the reference exactly as the answer has it, `label` a short name for
+it (a session's title, a task's key and title, a workstream's or project's name), and
+`ReferenceTarget` one of `{ "kind": "session", "id" }`, `{ "kind": "task", "id", "key" }`,
+`{ "kind": "workstream", "id", "project" }`, `{ "kind": "project", "id" }` and
+`{ "kind": "recap", "project", "workstream"?, "date"? }`. Unknown ones, sessions the import choice
+hides, and anything else stay text. The panel labels each link in the hub's words (a task by its
+key, anything else by its `label`), never the answer's: a Markdown link's own text stays text
+before it, so `[PAP-7](PAP-9)` cannot read as PAP-7 and open PAP-9.
+
+**Suggestions** are the answer's lines `Suggestion: move <task> to <status>` and
+`Suggestion: open <reference>` (a list item's `- ` allowed before them), checked as references
+are; each one that holds (at most 10, and each once: a move of the same task to the same status,
+or an open of the same target, is one) is taken out of `answer` and becomes an `AnswerSuggestion`:
+`{ "kind": "move_task", "task", "key", "to": TaskStatus, "label" }` or `{ "kind": "open",
+"target": ReferenceTarget, "label" }`. Other lines stay text. **A suggestion does nothing by
+itself**: the panel shows it, and only the person's click acts, as the person, through the usual
+route (`POST /v1/tasks/{id}/move`, after they confirm) or by opening the page.
+
+**Cancel**: `404` unknown; `409` when no turn of it is answering; `503` when its CLI cannot be
+reached (nothing changes). Otherwise its CLI gets Esc and the turn is `canceled`.
+
+**Clear**: under the command lock, the caller's conversations are forgotten and each live
+Orchestrator session of theirs is finished: its reader token stops at once, then its CLI is ended
+and its folder removed. The remembered engine stays. **The sessions stay in the log, and their
+transcripts stay in each CLI's own folder (`~/.claude/projects/…`, and so on), as any session's
+do:** the hub does not delete a CLI's files, and still serves those transcripts to their asker
+alone.
+
+**The CLI's read verbs** (all `GET`s; the reader token can do nothing else; the confinement's
+allowed commands are exactly these and `pitcrew whoami`), each with `--json`:
+`pitcrew search <words…>` (projects, workstreams, tasks, sessions and recent recap lines whose
+text has every word), `pitcrew session list [--since today|<YYYY-MM-DD>] [--state …]
+[--workstream <id>] [--task <task>]`, `pitcrew session show <id>`, `pitcrew recap blocks
+[--session|--task|--workstream|--project <id>] [--limit <n>]`, `pitcrew recap days --workstream
+<id>|--project <id> [--limit <n>]`, `pitcrew activity [--session|--task|--workstream|--project
+<id>] [--limit <n>]`, and the existing `pitcrew task list` and `pitcrew task show`. Text output
+names things by the ids an answer cites (`ses_…`, `wst_…`, `prj_…`, task keys, `recap:…`).
 
 ## Live updates: `GET /v1/stream?since=<rev>` (WebSocket, device tokens)
 

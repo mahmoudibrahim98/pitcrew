@@ -90,6 +90,8 @@ pub struct WorkService {
     /// [`WorkService::follow_sessions`]): their task moved then, and is not moved again.
     working: Mutex<HashSet<DispatchId>>,
     pub(crate) import: Mutex<crate::import::ImportState>,
+    /// The Orchestrator's conversations (see [`crate::orchestrator`]).
+    pub(crate) orchestrator: Mutex<crate::orchestrator::OrchestratorState>,
     /// Each workstream's latest board-draft preview, for its start (see `crate::board`).
     pub(crate) previews: Mutex<crate::board::Previews>,
 }
@@ -122,6 +124,7 @@ impl WorkService {
             setup_listener: None,
             working: Mutex::new(HashSet::new()),
             import: Mutex::default(),
+            orchestrator: Mutex::default(),
             previews: Mutex::default(),
         }
     }
@@ -287,8 +290,9 @@ impl WorkService {
     /// An event by `caller`: `author` is its member and, only for an agent, `on_behalf_of` its
     /// owner. A person acts for nobody, whatever the caller says.
     pub(crate) fn by(&self, caller: &Caller, body: EventBody) -> Event {
+        // A reader writes nothing (the API refuses it first); were it to, it acts for its owner.
         let on_behalf_of = match caller.scope {
-            TokenScope::Agent | TokenScope::Session(_) => caller.on_behalf_of,
+            TokenScope::Agent | TokenScope::Reader | TokenScope::Session(_) => caller.on_behalf_of,
             TokenScope::Device => None,
         };
         self.event(caller.member, on_behalf_of, body)

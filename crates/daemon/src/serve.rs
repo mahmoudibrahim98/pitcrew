@@ -23,11 +23,12 @@
 //! 8. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; for
 //!    a workspace not set up yet, the task that starts the office and the runner once it is
 //!    ([`crate::setup::after_setup`]); the routes (`RouterParts`, with the activity index, the
-//!    recaps, the runner's hooks, terminals, session commands and transcripts, and host info as
-//!    it is now, [`crate::host`]); the listener, which the agents' CLIs are told
-//!    (`PITCREW_SOCKET`, `PITCREW_PIPE` or `PITCREW_URL`); the reconciliation of sessions stored
-//!    ahead of the runner ([`crate::dispatch::reconcile`]); and one line on stdout:
-//!    `pitcrewd listening on <where>`.
+//!    recaps, the runner's hooks, terminals, session commands and transcripts, the Orchestrator's,
+//!    and host info as it is now, [`crate::host`]; the reads a reader token may make too are its
+//!    `read` part); the listener, which the agents' CLIs are told (`PITCREW_SOCKET`,
+//!    `PITCREW_PIPE` or `PITCREW_URL`); the reconciliation of sessions stored ahead of the runner
+//!    ([`crate::dispatch::reconcile`]); the loop that follows the Orchestrator's answers
+//!    ([`crate::orchestrator::follow`]); and one line on stdout: `pitcrewd listening on <where>`.
 //!
 //! Stop (Ctrl+C or Ctrl+Break, or SIGTERM or SIGHUP on Unix): the server stops accepting and
 //! finishes in-flight requests (`pitcrew-api` closes open WebSockets with 1001) while the back
@@ -294,7 +295,8 @@ fn open_with(
             .with_setup_listener(Arc::new(signal))
             .with_dispatcher(Arc::new(link))
             .with_recap_file(state.root().join(RECAP_FILE))
-            .with_import_file(state.root().join("import.json"))?,
+            .with_import_file(state.root().join("import.json"))?
+            .with_orchestrator_file(state.orchestrator())?,
     );
     let _ = work_cell.set(Arc::downgrade(&work));
     let session_env = Arc::new(
@@ -579,6 +581,16 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         Ok(ended) => tracing::info!(ended, "ended the board drafts the last daemon left running"),
         Err(e) => tracing::warn!(error = %e, "cannot end the board drafts left running"),
     }
+    match work.end_orchestrator_sessions("the hub restarted, which ended the session's token") {
+        Ok(0) => {}
+        Ok(ended) => {
+            tracing::info!(
+                ended,
+                "ended the Orchestrator sessions the last daemon left running"
+            );
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot end the Orchestrator sessions left running"),
+    }
     drop(confined);
 
     let _locations = crate::locations::watch(&work, &workers);
@@ -626,27 +638,44 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
             StreamConfig::default(),
             pitcrew_api::visibility::Visibility(Some(Arc::clone(&visibility))),
         ))
-        .device(
+        // The reads a reader token (the Orchestrator's CLI) may make too.
+        .read(
             Activity::new(events)
                 .with_refs(refs)
                 .with_visibility(visibility)
                 .routes(),
         )
-        .device(Recaps::new(recaps).routes())
+        .read(Recaps::new(recaps).routes())
+        .read(pitcrew_hub_work::read_routes().layer(Extension(Arc::clone(&work))))
         .device(crate::scan::routes(Arc::clone(&work), homes.as_deref()))
         .device(crate::machine_setup::routes(machine_setup))
         .device(crate::files::routes(Arc::clone(&work), state.root()))
         .device(crate::onboarding::routes(Arc::clone(&work)))
         // A sign-in's terminal opens only for the member who started it.
-        .device(terminals.routes(TerminalConfig::default()))
-        .device(transcripts.routes())
+        // An Orchestrator session's terminal and transcript are its asker's alone.
+        .device(terminals.routes(TerminalConfig::default()).route_layer(
+            axum::middleware::from_fn_with_state(
+                Arc::clone(&work),
+                crate::orchestrator::asker_only,
+            ),
+        ))
+        .device(
+            transcripts
+                .routes()
+                .route_layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&work),
+                    crate::orchestrator::asker_only,
+                )),
+        )
         .device(sessions.routes())
         .device(crate::integrations::routes(Arc::clone(&integrations)))
         .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))))
         // Board drafts (api-v1.md, "Board drafts"): the drafting session's proposal (its session
         // token only), and the rest.
         .session(pitcrew_hub_work::board_session_routes().layer(Extension(Arc::clone(&work))))
-        .device(pitcrew_hub_work::board_device_routes().layer(Extension(Arc::clone(&work))));
+        .device(pitcrew_hub_work::board_device_routes().layer(Extension(Arc::clone(&work))))
+        // The Orchestrator (api-v1.md, "Orchestrator"): each person's own conversations.
+        .device(pitcrew_hub_work::orchestrator_routes().layer(Extension(Arc::clone(&work))));
     // The roles and capabilities as they are at each request (the runner may start later).
     let info = Arc::new(HostInfoNow::new(Arc::clone(&attached)));
 
@@ -717,6 +746,10 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         Arc::downgrade(&work),
         Arc::clone(&attached),
     )));
+    // The Orchestrator's answers, from their sessions' transcripts.
+    drop(tokio::spawn(crate::orchestrator::follow(Arc::downgrade(
+        &work,
+    ))));
     drop(session_env);
     drop(work);
     let (draining, drain) = tokio::sync::oneshot::channel::<()>();

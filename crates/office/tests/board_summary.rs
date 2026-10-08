@@ -288,8 +288,8 @@ fn the_prompt_names_its_draft_and_the_estimate_follows_its_size() {
 }
 
 /// Files are made relative to the session's or the workstream's folder by the hub
-/// (`relative_to`); any other absolute path keeps only its end, so no user name goes, and a long
-/// one keeps its file name.
+/// (`relative_to`); any other absolute path keeps only its file name, so no user name goes, and
+/// a long one keeps its file name.
 #[test]
 fn file_paths_say_which_file_and_not_whose_folder() {
     use pitcrew_office::board::relative_to;
@@ -322,7 +322,9 @@ fn file_paths_say_which_file_and_not_whose_folder() {
     let summary = summarize(&facts(vec![s, long])).text;
     assert!(summary.contains("method/intro.tex"), "{summary}");
     assert!(summary.contains("…/run.sh"), "{summary}");
-    assert!(summary.contains("…/deep/build.sh"), "{summary}");
+    // No folder of it is kept, however deep: any may be a user's name.
+    assert!(summary.contains("…/build.sh"), "{summary}");
+    assert!(!summary.contains("deep/build.sh"), "{summary}");
     assert!(summary.contains("~/notes/todo.md"), "{summary}");
     assert!(summary.contains(r"~\plan.md"), "{summary}");
     assert!(

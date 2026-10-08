@@ -54,10 +54,12 @@ use pitcrew_hub_work::{DispatchError, DispatchRequest, Dispatcher, SessionReques
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::{CommandId, MachineId, MemberId, SessionId};
+use pitcrew_protocol::model::Engine;
 use pitcrew_protocol::runner::{CommandOutcome, RunnerCommand};
+use pitcrew_protocol::transcript::TranscriptPage;
 use pitcrew_runner::{
-    EventSink, RunnerCommands, SessionAgent, SessionAgents as _, SessionEnv, SinkError, Started,
-    StoreSink,
+    EventSink, PageError, RunnerCommands, SessionAgent, SessionAgents as _, SessionEnv, SinkError,
+    Started, StoreSink,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -81,7 +83,8 @@ const ENDPOINTS: [&str; 3] = ["PITCREW_SOCKET", "PITCREW_PIPE", "PITCREW_URL"];
 #[derive(Debug)]
 pub struct RunnerLink {
     attached: Arc<Attached>,
-    /// Confined runs (board drafts): their folders, files, tokens and ends.
+    /// Confined runs (board drafts, the Orchestrator's sessions): their folders, files, tokens and
+    /// ends.
     confined: Option<Ender>,
 }
 
@@ -218,6 +221,48 @@ impl Dispatcher for RunnerLink {
                 }
             }
         }
+    }
+
+    fn command(&self, machine: &MachineId, command: &RunnerCommand) -> Result<(), DispatchError> {
+        let runner = self.runner(machine)?;
+        match runner.commands.run(CommandId::new(), command) {
+            CommandOutcome::Ok { .. } => Ok(()),
+            CommandOutcome::Rejected { reason } => Err(DispatchError::Rejected(reason)),
+            CommandOutcome::Failed { error } => Err(DispatchError::Unavailable(error)),
+        }
+    }
+
+    /// As `GET /v1/sessions/{id}/transcript` reads it (`crate::transcripts`): a session the
+    /// runner has not indexed yet has an empty page.
+    fn transcript(
+        &self,
+        machine: &MachineId,
+        session: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<TranscriptPage, DispatchError> {
+        let runner = self.runner(machine)?;
+        match runner
+            .transcripts
+            .transcript_page(*session, before, Some(limit))
+        {
+            Ok(page) => Ok(page),
+            Err(PageError::UnknownSession(_)) => Ok(TranscriptPage {
+                items: Vec::new(),
+                from: 0,
+                to: 0,
+                at_start: true,
+            }),
+            Err(PageError::Unavailable { reason, .. }) => {
+                Err(DispatchError::Unavailable(reason.to_owned()))
+            }
+        }
+    }
+
+    fn installed(&self, machine: &MachineId, engine: Engine) -> Option<bool> {
+        self.runner(machine)
+            .ok()
+            .map(|_| crate::orchestrator::installed(engine))
     }
 
     fn confined_folder(&self, session: &SessionId) -> Option<String> {
@@ -371,8 +416,9 @@ impl SessionEnv for AgentEnv {
                 owner: Some(owner),
             } => (agent, owner),
         };
-        // A confined run's CLI gets its session token, which can do only its run's one thing;
-        // and a board draft's session never gets its agent's token, even once its run is gone.
+        // A confined run's CLI gets the token minted for its run alone (a board draft's session
+        // token, the Orchestrator's reader token); and neither a board draft's session nor an
+        // Orchestrator session ever gets its agent's token, even once its run is gone.
         let confined = self
             .confined
             .as_ref()
@@ -383,6 +429,12 @@ impl SessionEnv for AgentEnv {
                 return Err(format!(
                     "session {session} is a board draft's, and its run's token is gone, so its \
                      CLI cannot be given one"
+                ));
+            }
+            None if work.is_orchestrator_session(&session).unwrap_or(true) => {
+                return Err(format!(
+                    "session {session} is an Orchestrator session, and its run's token is gone, \
+                     so its CLI cannot be given one"
                 ));
             }
             None => self.token_file(agent, owner).map_err(|e| {
@@ -892,6 +944,44 @@ mod tests {
         assert!(env.env_for(orphaned.id).unwrap_err().contains("no owner"));
         // Not stored: no agent yet, so nothing.
         assert_eq!(env.env_for(SessionId::new()).unwrap(), Vec::new());
+    }
+
+    /// An Orchestrator session whose run is gone (its run's token revoked, or a start that never
+    /// prepared one) never falls back to its agent's token: the hub keeps every Orchestrator
+    /// session it started, cleared or not, and the CLI is refused one.
+    #[test]
+    fn an_orchestrator_session_never_gets_its_agents_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sam = member(MemberKind::Human, "@sam", None);
+        let office = member(MemberKind::Agent, "@office", Some(sam.id));
+        let asked = session(Some(office.id));
+        let other = session(Some(office.id));
+        let file = tmp.path().join("orchestrator.json");
+        std::fs::write(
+            &file,
+            serde_json::json!({
+                "version": 1,
+                "people": [{"member": sam.id, "sessions": [asked.id]}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let work = work(tmp.path(), &[&sam, &office], &[&asked, &other]);
+        let work = Arc::new(
+            Arc::into_inner(work)
+                .unwrap()
+                .with_orchestrator_file(file)
+                .unwrap(),
+        );
+        let tokens: Arc<dyn TokenStore> = Arc::new(FileTokenStore::in_memory());
+        let dir = tmp.path().join("agents");
+        let env = AgentEnv::new(&work, Arc::clone(&tokens), dir.clone());
+        let refused = env.env_for(asked.id).unwrap_err();
+        assert!(refused.contains("Orchestrator"), "{refused}");
+        assert!(tokens.list().is_empty(), "no token was minted");
+        assert!(!dir.join(format!("{}.token", office.id.0)).exists());
+        // Another session of the same agent gets its agent's token, as before.
+        assert!(env.env_for(other.id).is_ok());
     }
 
     fn request(machine: MachineId, cwd: &str) -> DispatchRequest {

@@ -126,6 +126,7 @@ try {
     env.PITCREW_CONFORMANCE_URL = mock.url;
     env.PITCREW_CONFORMANCE_PERSON = 'dev-device-token';
     env.PITCREW_CONFORMANCE_AGENT = 'dev-agent-token';
+    env.PITCREW_CONFORMANCE_READER = 'dev-reader-token';
     env.PITCREW_CONFORMANCE_SECOND_PERSON = 'dev-second-device-token';
   } else {
     build = spawn(
@@ -137,16 +138,25 @@ try {
     if (code !== 0) throw new Error('Daemon build failed');
     const state = join(temporary, 'state');
     await mkdir(state, { mode: 0o700 });
-    // Provision a second synthetic person's credential before the daemon owns the registry.
-    // The suite never prints either credential or opens a real user's registry.
+    // Provision a second synthetic person's credential, and a reader token (an agent that may
+    // only read: the demo's back office, for @sam), before the daemon owns the registry.
+    // The suite never prints a credential or opens a real user's registry.
     const second = `pcd_${randomBytes(32).toString('base64url')}`;
+    const reader = `pcr_${randomBytes(32).toString('base64url')}`;
+    const sha256 = (token) => createHash('sha256').update(token).digest('hex');
     await writeFile(join(state, 'tokens.json'), JSON.stringify({ version: 1, tokens: [{
       id: '01J00000000000000000000001',
-      sha256: createHash('sha256').update(second).digest('hex'),
+      sha256: sha256(second),
       caller: { member: '01JB000000000000000MEM0007', scope: 'device' },
+      created_at: 0,
+    }, {
+      id: '01J00000000000000000000002',
+      sha256: sha256(reader),
+      caller: { member: '01JB000000000000000MEM0006', scope: 'reader', on_behalf_of: '01JB000000000000000MEM0001' },
       created_at: 0,
     }] }), { mode: 0o600 });
     env.PITCREW_CONFORMANCE_SECOND_PERSON = second;
+    env.PITCREW_CONFORMANCE_READER = reader;
     const refused = join(temporary, 'not-a-socket');
     await writeFile(refused, 'Synthetic runtime refusal\n');
     // A dispatch starts its agent's CLI: stand-ins first on the daemon's PATH, never a real one.
@@ -154,8 +164,9 @@ try {
     // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle. They
     // answer `--version` at once (a Claude Code new enough for onboarding.test.mjs's hooks), and
     // for machine-setup.test.mjs their status commands too (not signed in); a sign-in's "login"
-    // waits like a session. Started for a board draft (in its private folder, `scratch/<session>`),
-    // a stand-in hands its session token to the suite, which proposes as the CLI would.
+    // waits like a session. Started for a board draft (in its private folder,
+    // `scratch/<key>/<session>`), a stand-in hands its session token to the suite, which proposes
+    // as the CLI would.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
     const standIn =
@@ -239,9 +250,10 @@ try {
   // onboarding.test.mjs first, then the main suite, then import.test.mjs, which commits session
   // inclusion (and restores it), then integrations.test.mjs, which syncs, appending events that
   // the main suite's exact-revision checks must not see, then writes.test.mjs on its own (it
-  // connects the same repository integrations.test.mjs does), and board.test.mjs last: board
-  // drafts start an agent's CLI (a stand-in on the daemon) and create tasks. Every phase runs; the
-  // first failure decides the exit code.
+  // connects the same repository integrations.test.mjs does), then board.test.mjs: board drafts
+  // start an agent's CLI (a stand-in on the daemon) and create tasks, and orchestrator.test.mjs
+  // last: the Orchestrator starts an agent's CLI too, and ends it. Every phase runs; the first
+  // failure decides the exit code.
   for (const files of [
     ['tests/conformance/onboarding.test.mjs'],
     [
@@ -254,6 +266,7 @@ try {
     ['tests/conformance/integrations.test.mjs'],
     ['tests/conformance/writes.test.mjs'],
     ['tests/conformance/board.test.mjs'],
+    ['tests/conformance/orchestrator.test.mjs'],
   ]) {
     suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,

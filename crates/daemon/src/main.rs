@@ -36,6 +36,7 @@ mod locations;
 mod machine_setup;
 mod office;
 mod onboarding;
+mod orchestrator;
 mod recaps;
 mod refs;
 mod runner;
@@ -46,6 +47,8 @@ mod sessions;
 mod setup;
 mod state;
 mod terminals;
+#[cfg(all(test, unix))]
+mod test_scripts;
 mod transcripts;
 mod visibility;
 

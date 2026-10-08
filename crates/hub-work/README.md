@@ -28,11 +28,16 @@ let work = Arc::new(
         .with_dispatcher(runner_link)                     // Arc<dyn Dispatcher>, stream D
         .with_hub_machine(this_machine)                   // where folderless dispatches run
         .with_setup_listener(setup_listener)               // starts the office and runner on setup
-        .with_recap_file(state_dir.join("recaps.sqlite3")), // the recap blocks on disk (see "Recaps")
+        .with_recap_file(state_dir.join("recaps.sqlite3")) // the recap blocks on disk (see "Recaps")
+        .with_orchestrator_file(state_dir.join("orchestrator.json"))?, // see "The Orchestrator"
 );
 let parts = RouterParts::new()
     .agent(pitcrew_hub_work::agent_routes().layer(Extension(Arc::clone(&work))))
-    .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))));
+    .read(pitcrew_hub_work::read_routes().layer(Extension(Arc::clone(&work))))
+    .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))))
+    .device(pitcrew_hub_work::orchestrator_routes().layer(Extension(Arc::clone(&work))));
+// The Orchestrator's answers: follow them about once a second (see "The Orchestrator").
+// tokio::spawn(… loop { spawn_blocking(move || work.follow_orchestrator()); sleep(1 s) } …);
 let refs: Arc<dyn pitcrew_hub_work::EventRefs> = work.clone(); // GET /v1/events filters (stream H)
 let recaps: Arc<dyn pitcrew_hub_work::RecapIndex> = work.clone(); // GET /v1/recaps/* (stream H)
 // Optional: build the recap index now, off the request path (it reads the whole log once).
@@ -431,12 +436,54 @@ accepts it** (`src/board.rs`, `src/board_routes.rs`; api-v1.md, "Board drafts"; 
 ### Confined runs (shared with the Orchestrator)
 
 `Confinement` on a `SessionRequest` marks a run PitCrew starts on its own behalf: the `pitcrew`
-commands its CLI may run without asking, the files in its folder it may write, and its longest
-running time. Hub-work only decides it; the runner link carries it out (the daemon's
+commands its CLI may run without asking, the files in its folder it may write, its longest
+running time, and the token its CLI gets (`RunToken`: a session token for a board draft, a reader
+token for the Orchestrator; never its agent's). Hub-work only decides it; the runner link carries it out (the daemon's
 `crate::confined`: a fresh private folder, `PROMPT_FILE`, `CONFINED_BRIEF` on the command line,
 the CLI's confined shape, a session token). `Dispatcher` has `confined_folder` (the folder, for the
-session's record) and `finish_session` (its one thing is done). A later confined run names its own
-`Confinement`.
+session's record) and `finish_session` (its one thing is done, or the hub ends it). The
+Orchestrator names its own `Confinement` (see "The Orchestrator").
+
+## The Orchestrator
+
+The Orchestrator panel's conversations (`src/orchestrator.rs`, `src/orchestrator_routes.rs`;
+api-v1.md, "Orchestrator"; brief `0-orchestrator-chat`); the module's comment has the details:
+
+- **A question runs as a session** of an agent CLI the person already uses (`ENGINES`: Claude Code
+  or OpenCode, only Claude Code on Windows, remembered per person; Codex is not offered, see
+  `not_offered`), as one of the person's own agents (`own_agent`, shared with board drafts: the
+  back office by default), on the hub's own machine, titled `Orchestrator` and linked to nothing.
+  It is a **confined run** (`orchestrator_confinement`: `READ_VERBS` as its commands, no
+  `writes`, `SESSION_MAX_RUNTIME` 60 minutes, `RunToken::Reader`): a fresh private folder the
+  `Dispatcher` names (`confined_folder`, its `cwd`), the prompt `orchestrator/v1`
+  (`pitcrew_office::orchestrator::prompt`) in its `prompt.md`, and a **reader token** minted for
+  that session alone. The question is saved first (a save that fails changes nothing), with the
+  new session's id kept for good in the person's `sessions` (`orchestrator_asker`,
+  `is_orchestrator_session`; the newest 2000 per person): its transcript and terminal are the
+  asker's alone, and the daemon never gives it its agent's token. A session whose id is no longer
+  kept is still known by its facts (titled `Orchestrator`, in the folder `confined_folder` names
+  for it: its agent's owner's), and a session whose parent is one (a sub-agent's) is its asker's
+  too.
+- **One answer at a time** per person, 20 questions a conversation, 20 conversations kept. A
+  follow-up types into the live session (one line, never a CLI command); one whose session ended
+  starts a new session with the conversation so far as data in its prompt. A new conversation
+  finishes the person's other Orchestrator session (`Dispatcher::finish_session`: its token
+  stops at once, its CLI is ended).
+- **Answers are followed from the transcript** (`follow_orchestrator`, which the daemon calls
+  about once a second, through `Dispatcher::transcript`): the text after the turn's prompt, until
+  its turn ends. Past 16 KiB it is cut, past 300 s it times out (both send the CLI Esc); a session
+  that ends first fails the turn. What it took (time, tool runs, size) comes from the transcript.
+- **References and suggestions** are found in the answer (`pitcrew_office::orchestrator::scan`)
+  and kept only when the hub knows what they name and the person may see it; suggestion lines
+  leave the text. **Nothing here acts on the work**: a suggestion is data the panel shows.
+- **Cancel** sends Esc and ends the turn `canceled`; **clear** (under the command lock) forgets
+  the person's conversations and finishes their live sessions. When the hub restarts,
+  `end_orchestrator_sessions` ends the sessions left running (their tokens were in memory).
+- **Where conversations live:** `orchestrator.json` in the state directory, written atomically
+  (0600), never the event log, so clearing forgets them for real. A file this hub cannot read (a
+  newer version, an unknown variant, or one that does not parse) is moved aside
+  (`orchestrator.json.unreadable-<ms>`) and the hub starts with none. Without the file (tests), in
+  memory.
 
 ## Commands
 
@@ -601,17 +648,26 @@ whose first event is already in the log is reported as `replayed` and appends no
 
 ## Routes
 
-Agent and device tokens (`agent_routes`): `GET /v1/me`, `GET /v1/members`,
+A reader token (an agent's that may only read, the Orchestrator's CLI's) is refused any request
+that is not a plain `GET` or `HEAD` by `pitcrew-api`; here, `Who` and `require_writer` refuse one
+again in every command.
+
+Agent, reader and device tokens (`agent_routes`; a reader only the `GET`s): `GET /v1/me`, `GET /v1/members`,
 `GET /v1/tasks?project=&workstream=&assignee=&status=`, `GET /v1/tasks/{id-or-key}`,
 `POST /v1/tasks/{id}/move`, `PUT /v1/tasks/{id}/subtasks`, `POST /v1/tasks/{id}/comments`,
 `GET /v1/asks?to=&state=`, `POST /v1/asks`, `POST /v1/asks/{id}/answer`.
 
-Device tokens only (`device_routes`): `GET /v1/workspace`, `POST /v1/setup`, `GET /v1/machines`,
-`GET /v1/personas`, `GET /v1/teams`, `GET|POST /v1/projects`, `GET /v1/projects/{id}`,
-`GET /v1/workstreams?project=`, `POST /v1/workstreams`, `GET|PATCH /v1/workstreams/{id}`,
-`POST /v1/tasks`, `PATCH /v1/tasks/{id-or-key}`, `POST /v1/tasks/{id}/assign`,
-`POST /v1/tasks/{id}/dispatch`, `GET /v1/sessions?machine=&workstream=&task=&state=`,
-`GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/link`, `GET /v1/briefs`, `PUT /v1/briefs/{project|workstream}/{id}`.
+Device and reader tokens (`read_routes`, marked **read** in api-v1.md): `GET /v1/workspace`,
+`GET /v1/machines`, `GET /v1/personas`, `GET /v1/teams`, `GET /v1/projects`,
+`GET /v1/projects/{id}`, `GET /v1/workstreams?project=`, `GET /v1/workstreams/{id}`,
+`GET /v1/sessions?machine=&workstream=&task=&state=`, `GET /v1/sessions/{id}`, `GET /v1/briefs`.
+
+Device tokens only (`device_routes`): `POST /v1/setup`, `POST /v1/projects`,
+`POST /v1/workstreams`, `PATCH /v1/workstreams/{id}`, `POST /v1/tasks`,
+`PATCH /v1/tasks/{id-or-key}`, `POST /v1/tasks/{id}/assign`, `POST /v1/tasks/{id}/dispatch`,
+`POST /v1/sessions/{id}/link`, `PUT /v1/briefs/{project|workstream}/{id}`; and
+(`orchestrator_routes`) `GET /v1/orchestrator`, `POST /v1/orchestrator/questions`,
+`POST /v1/orchestrator/conversations/{id}/cancel`, `DELETE /v1/orchestrator/conversations`.
 
 `GET /v1/workspace` answers `{ workspace, rev, setup_needed }`; `rev` is the lowest checkpoint of
 the work projections (`projection_state.rev`), the revision every work table reflects, and
@@ -731,6 +787,17 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   sessions, and happens once; accepting none creates nothing; one draft at a time; an ended
   session ends its draft; a failed start ends it; drafts left running end when the hub restarts;
   an unreadable draft event is skipped; hidden sessions are neither sent nor evidence.
+- `tests/orchestrator.rs`: the Orchestrator through the routes, with a stand-in runner that keeps
+  transcripts in memory: a question starts a confined session with a reader token in the folder
+  the dispatcher names, with one plain line on its command line, and its answer
+  streams from the transcript, with references, suggestions (which move nothing) and usage;
+  follow-ups type into the live session, one ended starts another, and a new conversation ends the
+  old one; one answer at a time, cut at the size limit, timed out, failed when the session ends;
+  cancel, and clear, which finishes the session and keeps it its asker's; who may ask and what
+  refuses a question (Codex is not offered); conversations survive a restart in a private file,
+  and sessions left running end; an unreadable file is moved aside; a reader reads and changes
+  nothing; sub-agents and forgotten sessions stay their askers'; a suggestion made twice is one; a
+  question that cannot be saved changes nothing.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other
   routes and commands. `tests/task_shape.rs`: the `Task` shape pin.
 

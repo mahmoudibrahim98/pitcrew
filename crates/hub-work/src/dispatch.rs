@@ -60,6 +60,7 @@ use pitcrew_protocol::model::{
     PermissionMode, Session, SessionState, Task, TaskStatus,
 };
 use pitcrew_protocol::runner::RunnerCommand;
+use pitcrew_protocol::transcript::TranscriptPage;
 use pitcrew_store::sql::Connection;
 use serde::Deserialize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -187,10 +188,11 @@ pub trait Dispatcher: Send + Sync + std::fmt::Debug {
     fn start(&self, request: &DispatchRequest) -> std::result::Result<(), DispatchError>;
 
     /// Starts a session the hub stored for an agent outside a dispatch: a board draft's
-    /// (`crate::board`). Called as [`Dispatcher::start`] is, with the session already stored
-    /// (`starting`, the agent named); on an error the hub ends it. A request with a
-    /// [`Confinement`] is a run PitCrew starts on its own behalf: see [`Confinement`] for what the
-    /// runner link must do. The default refuses, as [`DispatchError::Unavailable`].
+    /// (`crate::board`) or the Orchestrator's (`crate::orchestrator`). Called as
+    /// [`Dispatcher::start`] is, with the session already stored (`starting`, the agent named); on
+    /// an error the hub ends it. A request with a [`Confinement`] is a run PitCrew starts on its
+    /// own behalf: see [`Confinement`] for what the runner link must do. The default refuses, as
+    /// [`DispatchError::Unavailable`].
     ///
     /// # Errors
     ///
@@ -200,6 +202,51 @@ pub trait Dispatcher: Send + Sync + std::fmt::Debug {
         Err(DispatchError::Unavailable(
             "this hub's runner link starts only dispatched sessions".into(),
         ))
+    }
+
+    /// Runs `command` on `machine`'s runner for a session the hub started: typing a follow-up
+    /// (`SendText`), Esc (`Interrupt`), or ending it (`EndSession`). Called without the lock;
+    /// blocking. The default refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError`]: the machine is unreachable, the runner refused, or the command failed.
+    fn command(
+        &self,
+        machine: &MachineId,
+        command: &RunnerCommand,
+    ) -> std::result::Result<(), DispatchError> {
+        let _ = (machine, command);
+        Err(DispatchError::Unavailable(
+            "this hub's runner link runs no session commands".into(),
+        ))
+    }
+
+    /// A page of `session`'s transcript on `machine`, as `GET /v1/sessions/{id}/transcript` reads
+    /// it (`before`, `limit`): an empty page at its start while the runner has not found the
+    /// transcript. Called without the lock; blocking, bounded by the runner. The default refuses.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError`]: the machine is unreachable, or the transcript cannot be read now.
+    fn transcript(
+        &self,
+        machine: &MachineId,
+        session: &SessionId,
+        before: Option<u64>,
+        limit: usize,
+    ) -> std::result::Result<TranscriptPage, DispatchError> {
+        let _ = (machine, session, before, limit);
+        Err(DispatchError::Unavailable(
+            "this hub's runner link reads no transcripts".into(),
+        ))
+    }
+
+    /// Whether `engine`'s CLI is installed on `machine` (on its runner's `PATH`); `None` when the
+    /// link cannot tell. Called under the command lock: answer at once. The default cannot tell.
+    fn installed(&self, machine: &MachineId, engine: Engine) -> Option<bool> {
+        let _ = (machine, engine);
+        None
     }
 
     /// The private folder a confined session `session` will run in, for the hub's record of it
@@ -232,9 +279,10 @@ pub const CONFINED_BRIEF: &str =
 /// The file in a confined session's folder that holds its prompt.
 pub const PROMPT_FILE: &str = "prompt.md";
 
-/// How a run PitCrew starts on its own behalf is confined: a board draft's now (`crate::board`),
-/// and every such run after it. The hub decides it; the runner link carries it out, for every CLI
-/// alike, whatever the person's own settings for that CLI say:
+/// How a run PitCrew starts on its own behalf is confined: a board draft's (`crate::board`), the
+/// Orchestrator's (`crate::orchestrator`), and every such run after them. The hub decides it; the
+/// runner link carries it out, for every CLI alike, whatever the person's own settings for that
+/// CLI say:
 ///
 /// - **A fresh private folder**: made new for the session (never reused), owner-only, outside the
 ///   PitCrew state directory, holding only [`PROMPT_FILE`] (the request's `brief`) and the CLI's
@@ -243,11 +291,11 @@ pub const PROMPT_FILE: &str = "prompt.md";
 ///   with [`CONFINED_BRIEF`], in the default permission mode (the request's is ignored).
 /// - **Its settings files** pre-approve only `pitcrew <command> …` for each of [`Self::commands`]
 ///   and writing each of [`Self::writes`] in the folder, and deny what the CLI's settings can deny
-///   (web fetch and search; the state directory).
-/// - **A session token** (`TokenScope::Session`) bound to the session, in place of its agent's
-///   token: it reaches only the routes mounted for session tokens, for this session's own
-///   resource. Kept in memory only; revoked at [`Dispatcher::finish_session`], when the session
-///   ends, and with the daemon.
+///   (web fetch and search; the state directory; every file edit when it writes none).
+/// - **Its own token**, minted for this session alone, in place of its agent's token
+///   ([`Self::token`]): a session token for a run that answers through one route, a reader token
+///   for a run that only reads. Kept in memory only; revoked at [`Dispatcher::finish_session`],
+///   when the session ends, and with the daemon. Its CLI never gets its agent's token.
 /// - **At most [`Self::max_runtime`]**: then its CLI is ended, and its session with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Confinement {
@@ -258,6 +306,19 @@ pub struct Confinement {
     pub writes: Vec<String>,
     /// The longest it runs.
     pub max_runtime: std::time::Duration,
+    /// The token its CLI gets.
+    pub token: RunToken,
+}
+
+/// The token a confined run's CLI gets, minted for its session alone: never its agent's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunToken {
+    /// A session token (`TokenScope::Session`) bound to the session: it reaches only the routes
+    /// mounted for session tokens, for this session's own resource (a board draft's proposal).
+    Session,
+    /// A reader token (`TokenScope::Reader`): `GET`s on the routes marked **agent** or **read**,
+    /// and nothing else (the Orchestrator's).
+    Reader,
 }
 
 /// A session the hub stored for an agent outside a dispatch (a board draft's), for
@@ -941,6 +1002,36 @@ impl WorkService {
 
 /// A person runs only their own agents: `forbidden` unless `caller` owns `agent`. An agent with
 /// no owner is no one's to run.
+/// The agent a session the caller asks for runs as: `named`, a member that must be an agent
+/// (`invalid` for an unknown one or a person) of the caller's own (`forbidden` otherwise); else the
+/// caller's back office ([`crate::OFFICE_HANDLE`]), or `invalid`, saying to name one to `what`.
+pub(crate) fn own_agent(
+    conn: &Connection,
+    caller: &Caller,
+    named: Option<&MemberId>,
+    what: &str,
+) -> Result<Member> {
+    let agent = match named {
+        Some(id) => query::member(conn, id)?
+            .ok_or_else(|| WorkError::invalid(format!("agent: no member {id}.")))?,
+        None => query::member_with_handle(conn, crate::office::OFFICE_HANDLE)?
+            .filter(|m| m.owner == Some(caller.member))
+            .ok_or_else(|| {
+                WorkError::invalid(format!(
+                    "Name an agent to {what}: this hub has no back office of yours."
+                ))
+            })?,
+    };
+    if agent.kind != MemberKind::Agent {
+        return Err(WorkError::invalid(format!(
+            "agent must be an agent; {} is a person.",
+            agent.handle
+        )));
+    }
+    require_owner(caller, &agent)?;
+    Ok(agent)
+}
+
 pub(crate) fn require_owner(caller: &Caller, agent: &Member) -> Result<()> {
     if agent.owner == Some(caller.member) {
         return Ok(());

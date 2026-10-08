@@ -38,9 +38,8 @@
 //! when it runs past [`DRAFT_MAX_RUNTIME`], or when the hub restarts ([`WorkService::end_running_drafts`]:
 //! its session token is gone).
 
-use crate::dispatch::{Confinement, DispatchError, SessionRequest, refused, require_owner};
+use crate::dispatch::{Confinement, DispatchError, RunToken, SessionRequest, own_agent, refused};
 use crate::error::{Result, WorkError};
-use crate::office::OFFICE_HANDLE;
 use crate::query::{self, SessionFilter, TaskFilter};
 use crate::recap::{BlockFilter, RecapIndex};
 use crate::service::WorkService;
@@ -55,8 +54,8 @@ use pitcrew_protocol::board::{
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{DraftId, MemberId, SessionId, TaskId, WorkstreamId};
 use pitcrew_protocol::model::{
-    Engine, LinkBasis, Liveness, Machine, MemberKind, PermissionMode, Session, SessionState,
-    TaskStatus, TimestampMs, Workstream,
+    Engine, LinkBasis, Liveness, Machine, PermissionMode, Session, SessionState, TaskStatus,
+    TimestampMs, Workstream,
 };
 use pitcrew_store::sql::{Connection, params};
 use sha2::{Digest as _, Sha256};
@@ -112,14 +111,21 @@ impl Previews {
         }
     }
 
-    fn take(&mut self, workstream: WorkstreamId, digest: &str, now: TimestampMs) -> Option<Made> {
+    /// `workstream`'s kept preview with `digest`, if it is still kept. It stays kept until
+    /// [`Previews::used`]: a start refused before it stored anything leaves it for the next.
+    fn find(&mut self, workstream: WorkstreamId, digest: &str, now: TimestampMs) -> Option<Made> {
         self.0
             .retain(|(_, at, _)| now.saturating_sub(*at) <= PREVIEW_KEPT_MS);
-        let i = self
-            .0
+        self.0
             .iter()
-            .position(|(w, _, made)| *w == workstream && made.digest == digest)?;
-        Some(self.0.remove(i).2)
+            .find(|(w, _, made)| *w == workstream && made.digest == digest)
+            .map(|(.., made)| made.clone())
+    }
+
+    /// `workstream`'s preview with `digest` was sent: a draft started with it.
+    fn used(&mut self, workstream: WorkstreamId, digest: &str) {
+        self.0
+            .retain(|(w, _, made)| !(*w == workstream && made.digest == digest));
     }
 }
 
@@ -130,6 +136,7 @@ fn draft_confinement() -> Confinement {
         commands: vec!["board submit".to_owned()],
         writes: vec![PROPOSAL_FILE.to_owned()],
         max_runtime: DRAFT_MAX_RUNTIME,
+        token: RunToken::Session,
     }
 }
 
@@ -314,7 +321,7 @@ impl WorkService {
             .previews
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take(workstream.id, &start.digest, self.now());
+            .find(workstream.id, &start.digest, self.now());
         let made = match previewed {
             Some(made) => made,
             None => self.make_prompt(&workstream)?,
@@ -322,25 +329,7 @@ impl WorkService {
         let (draft, request, dispatcher) = {
             let _guard = self.lock();
             let (agent, machine, persona) = self.read(|c| {
-                let agent = match &start.agent {
-                    Some(id) => query::member(c, id)?
-                        .ok_or_else(|| WorkError::invalid(format!("agent: no member {id}.")))?,
-                    None => query::member_with_handle(c, OFFICE_HANDLE)?
-                        .filter(|m| m.owner == Some(caller.member))
-                        .ok_or_else(|| {
-                            WorkError::invalid(
-                                "Name an agent to draft the board: this hub has no back office \
-                                 of yours.",
-                            )
-                        })?,
-                };
-                if agent.kind != MemberKind::Agent {
-                    return Err(WorkError::invalid(format!(
-                        "agent must be an agent; {} is a person.",
-                        agent.handle
-                    )));
-                }
-                require_owner(caller, &agent)?;
+                let agent = own_agent(c, caller, start.agent.as_ref(), "draft the board")?;
                 if made.digest != start.digest {
                     return Err(WorkError::conflict(
                         "The workstream has changed since its preview: preview it again, and \
@@ -449,6 +438,12 @@ impl WorkService {
                 self.by(caller, EventBody::SessionDiscovered { session }),
                 self.by(caller, started),
             ])?;
+            // Only now is the preview used: a start refused before this (`400`, `403`, `409`,
+            // `503`) keeps it for the next.
+            self.previews
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .used(workstream.id, &start.digest);
             (id, request, dispatcher)
         };
 

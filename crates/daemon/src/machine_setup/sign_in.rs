@@ -552,19 +552,16 @@ impl<T: Terminals> Terminals for SignInTerminals<T> {
     }
 }
 
-/// `GET /v1/sessions/{id}/terminal` for a sign-in's id: only for the member who started it.
+/// `GET /v1/sessions/{id}/terminal` for a sign-in's id: only for the member who started it. The
+/// id is the route's `{id}` as the terminals route extracts it (decoded, `ses%5F…` too), never
+/// parsed from the raw path.
 async fn only_its_starter(
     State(sign_ins): State<Arc<SignIns>>,
+    id: Result<axum::extract::Path<String>, axum::extract::rejection::PathRejection>,
     request: Request,
     next: Next,
 ) -> Response {
-    let starter = request
-        .uri()
-        .path()
-        .strip_prefix("/v1/sessions/")
-        .and_then(|rest| rest.strip_suffix("/terminal"))
-        .and_then(|id| id.parse::<SessionId>().ok())
-        .and_then(|id| sign_ins.starter(id));
+    let starter = crate::orchestrator::route_session(id).and_then(|id| sign_ins.starter(id));
     if let Some(starter) = starter {
         let caller = request.extensions().get::<Caller>().map(|c| c.member);
         if caller != Some(starter) {
@@ -686,10 +683,11 @@ mod tests {
     /// pause, as a Node CLI takes a moment to start, and its login is never run here.
     #[cfg(unix)]
     fn stand_in(bin: &Path, name: &str, status: &str) {
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = bin.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\nsleep 0.2\n{status}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scripts::write_script(
+            &bin.join(name),
+            &format!("#!/bin/sh\nsleep 0.2\n{status}\n"),
+            0o755,
+        );
     }
 
     /// `bin` with a stand-in for each CLI, each answering its own status command. The rest of
@@ -999,5 +997,34 @@ mod tests {
         });
         rig(Arc::clone(&fake), Tools::default(), None).remove_leftovers();
         assert!(fake.killed.lock().unwrap().is_empty());
+    }
+    /// A sign-in's terminal opens only for the member who started it, however its id is written
+    /// in the path: the layer reads the id the terminals route reads (`ses%5F…` and an encoded
+    /// character of its ULID too).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_its_starter_reads_the_id_the_route_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let sign_ins = Arc::new(rig(Arc::clone(&fake), tools(tmp.path()), None));
+        let (sam, ana) = (person(), person());
+        let (started, _) = SignIns::start(&sign_ins, Engine::Claude, SignInMethod::Browser, sam)
+            .await
+            .unwrap();
+        let app = SignInTerminals::new(Arc::clone(&sign_ins), NoSessions)
+            .routes(TerminalConfig::default());
+        for form in crate::orchestrator::tests::path_forms(started.terminal) {
+            let path = format!("/v1/sessions/{form}/terminal");
+            let status = crate::orchestrator::tests::status;
+            assert_eq!(status(&app, &path, ana).await, 403, "{path}");
+            // Its starter gets past the layer: the route then asks for a WebSocket upgrade.
+            assert_eq!(status(&app, &path, sam).await, 400, "{path}");
+        }
+        // Any other session's id is the route's to answer.
+        let path = format!("/v1/sessions/ses%5F{}/terminal", SessionId::new().0);
+        assert_eq!(
+            crate::orchestrator::tests::status(&app, &path, ana).await,
+            404
+        );
     }
 }

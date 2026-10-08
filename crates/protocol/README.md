@@ -22,7 +22,14 @@ review, and a draft as the hub keeps it, with `DraftId` (`drf_…`) in `ids`. Th
 them: `board_draft_started` (sizes and the prompt's version, never the summary), `board_proposed`
 and `board_draft_reviewed`. Tasks a person accepts carry the label `DRAFTED_LABEL` (`drafted`).
 
-`api::TokenScope` has a third scope, `Session(SessionId)` (`{ "session": "<id>" }` on the wire):
+The Orchestrator lives in `orchestrator` (api-v1.md, "Orchestrator"): a person's conversations
+(`Conversation`, `ConversationId` `cnv_…` in `ids`), each turn's state, answer, checked references
+(`ReferenceTarget` names an app route's object) and suggestions (`AnswerSuggestion`, data only),
+what it took (`AnswerUsage`), and the limits (`MAX_QUESTION_CHARS` and the rest, served as
+`OrchestratorLimits::CURRENT`). They are not events. `api::TokenScope::Reader` (`pcr_…` tokens) is
+the scope its CLI reads with: `Caller::reads_only` says whether a caller may only read.
+
+`api::TokenScope` has a fourth scope, `Session(SessionId)` (`{ "session": "<id>" }` on the wire):
 a token bound to one session the hub starts on its own behalf (a board draft's). The runner's
 `StartSession` has `confined` (omitted when false): such a run starts in its CLI's confined
 shape (the runner's README, "Confined runs").

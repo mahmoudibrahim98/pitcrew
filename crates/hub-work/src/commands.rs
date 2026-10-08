@@ -111,6 +111,18 @@ pub struct NewComment {
     pub mentions: Vec<MemberId>,
 }
 
+/// A reader token (the Orchestrator's CLI) changes nothing: the API refuses its writes before
+/// they get here, and every write command refuses them again.
+pub(crate) fn require_writer(caller: &Caller) -> Result<()> {
+    if caller.reads_only() {
+        Err(WorkError::forbidden(
+            "This token may only read: it changes nothing.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn require_person(caller: &Caller, what: &str) -> Result<()> {
     if caller.is_person() {
         Ok(())
@@ -336,6 +348,7 @@ impl WorkService {
     ///
     /// `not_found`, `forbidden`, or database errors.
     pub fn check_task_write(&self, caller: &Caller, task: &TaskRef) -> Result<()> {
+        require_writer(caller)?;
         self.read(|c| {
             let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
             require_own_task(c, caller, &task)
@@ -349,6 +362,7 @@ impl WorkService {
     ///
     /// `not_found`, `forbidden`, or database errors.
     pub fn check_answer(&self, caller: &Caller, id: &AskId) -> Result<()> {
+        require_writer(caller)?;
         self.read(|c| self.answerable(c, caller, id).map(|_| ()))
     }
 
@@ -409,6 +423,7 @@ impl WorkService {
     /// `conflict` when `TaskStatus::can_move` refuses the move, or when another writer moved the
     /// task first (see "One writer" on [`WorkService`]).
     pub fn move_task(&self, caller: &Caller, task: &TaskRef, to: TaskStatus) -> Result<Task> {
+        require_writer(caller)?;
         let _guard = self.lock();
         let (task, reported) = self.read(|c| {
             let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
@@ -524,6 +539,7 @@ impl WorkService {
         task: &TaskRef,
         incoming: Vec<Subtask>,
     ) -> Result<Task> {
+        require_writer(caller)?;
         let _guard = self.lock();
         let task = self.read(|c| {
             let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
@@ -583,6 +599,7 @@ impl WorkService {
         task: &TaskRef,
         comment: NewComment,
     ) -> Result<Event> {
+        require_writer(caller)?;
         let _guard = self.lock();
         let task = self.read(|c| {
             let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
@@ -613,6 +630,7 @@ impl WorkService {
     /// `invalid` for an empty title or an unknown addressee, task or session; `forbidden` for an
     /// agent naming a task or session that is not its own.
     pub fn raise_ask(&self, caller: &Caller, new: NewAsk) -> Result<Ask> {
+        require_writer(caller)?;
         let _guard = self.lock();
         self.read(|c| {
             // The task and session decide whether an agent may raise it at all, so they come
@@ -680,6 +698,7 @@ impl WorkService {
     /// without an option or a non-blank text, or with an option out of range; `conflict` when it
     /// is no longer open.
     pub fn answer_ask(&self, caller: &Caller, id: &AskId, answer: AnswerAsk) -> Result<Ask> {
+        require_writer(caller)?;
         let text = answer.text.filter(|t| !t.trim().is_empty());
         let _guard = self.lock();
         let ask = self.read(|c| {

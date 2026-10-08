@@ -77,6 +77,17 @@ export const DRAFTED_LABEL = 'drafted';
 export const CONFINED_BRIEF = 'Read the file prompt.md in this folder and follow its instructions.';
 /** `DRAFT_MAX_RUNTIME`: then a draft's session is ended. */
 export const DRAFT_MAX_RUNTIME_MS = 30 * 60 * 1000;
+/**
+ * The mock's own folder in the scratch folder: the hub names it by its state directory's
+ * hash (`confined::state_key`, 16 hexadecimal digits), so each daemon has its own.
+ */
+const SCRATCH_KEY = '5ca7c400d0c0ffee';
+
+/** A confined run's fresh folder (`scratch/<state key>/<session>`), as the hub names it. */
+export function confinedFolder(session: string): string {
+  return `~/.cache/pitcrew/scratch/${SCRATCH_KEY}/${session}`;
+}
+
 /** `PREVIEW_KEPT_MS`: how long a workstream's latest preview is kept for its start. */
 export const PREVIEW_KEPT_MS = 10 * 60 * 1000;
 
@@ -95,9 +106,16 @@ function draftsOf(hub: Hub): BoardDraft[] {
 // ─── Session tokens (api-v1.md, "Tokens") ──────────────────────────────────────────────────────
 
 /** Each hub's session tokens: the agent each acts as, and the session it is bound to. */
-const SESSION_TOKENS = new WeakMap<Hub, Map<string, { member: string; session: string }>>();
+/** A confined run's own token: a draft's session token, or an Orchestrator session's reader token. */
+export interface RunGrant {
+  member: string;
+  session: string;
+  scope: 'session' | 'reader';
+}
 
-function sessionTokensOf(hub: Hub): Map<string, { member: string; session: string }> {
+const SESSION_TOKENS = new WeakMap<Hub, Map<string, RunGrant>>();
+
+function sessionTokensOf(hub: Hub): Map<string, RunGrant> {
   let tokens = SESSION_TOKENS.get(hub);
   if (tokens === undefined) {
     tokens = new Map();
@@ -106,8 +124,8 @@ function sessionTokensOf(hub: Hub): Map<string, { member: string; session: strin
   return tokens;
 }
 
-/** What a session token may act as, while its session runs; `undefined` for any other text. */
-export function sessionTokenGrant(hub: Hub, token: string): { member: string; session: string } | undefined {
+/** What a run's token may act as, while its session runs; `undefined` for any other text. */
+export function sessionTokenGrant(hub: Hub, token: string): RunGrant | undefined {
   const grant = sessionTokensOf(hub).get(token);
   if (grant === undefined) return undefined;
   if (hub.findSession(grant.session)?.state !== 'ended') return grant;
@@ -115,15 +133,19 @@ export function sessionTokenGrant(hub: Hub, token: string): { member: string; se
   return undefined;
 }
 
-function mintSessionToken(hub: Hub, member: string, session: string): void {
-  const token = `pcs_${randomBytes(32).toString('base64url')}`;
-  sessionTokensOf(hub).set(token, { member, session });
+/**
+ * Mints a confined run's own token for `session`, as `member`: a session token (`pcs_…`), or a
+ * reader token (`pcr_…`, the Orchestrator's). Kept in memory, revoked when the session ends.
+ */
+export function mintSessionToken(hub: Hub, member: string, session: string, scope: RunGrant['scope'] = 'session'): void {
+  const token = `${scope === 'reader' ? 'pcr' : 'pcs'}_${randomBytes(32).toString('base64url')}`;
+  sessionTokensOf(hub).set(token, { member, session, scope });
   if (hub.sessionTokenDir !== undefined) {
     writeFileSync(join(hub.sessionTokenDir, `${session}.token`), token, { mode: 0o600 });
   }
 }
 
-function revokeSessionTokens(hub: Hub, session: string): void {
+export function revokeSessionTokens(hub: Hub, session: string): void {
   const tokens = sessionTokensOf(hub);
   for (const [token, grant] of tokens) if (grant.session === session) tokens.delete(token);
   if (hub.sessionTokenDir !== undefined) rmSync(join(hub.sessionTokenDir, `${session}.token`), { force: true });
@@ -165,7 +187,7 @@ const SECRET_NAMES = [
 const SECRET_EXACT = ['pwd', 'pw', 'pat', 'key', 'sig', 'signature'];
 const SCHEMES = ['bearer', 'basic', 'digest'];
 // `pitcrew_protocol::text::is_hidden`, but for the line separators (they become spaces).
-const HIDDEN =
+export const HIDDEN =
   /[\u00AD\u034F\u061C\u115F\u1160\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
 const GAP = /[\s"'`()[\]{}<>,;|]/u;
 
@@ -333,28 +355,41 @@ function isAbsolute(text: string): boolean {
   return text.length > 1 && (text.startsWith('/') || text.startsWith('\\')) && /[\p{L}\p{N}]/u.test(text.slice(1));
 }
 
-/** The end of an absolute path (crates/office/src/redact.rs, `path_tail`). */
+/**
+ * The end of an absolute path (crates/office/src/redact.rs, `path_tail`): its file name after `…/`
+ * when it has one, else `…`. No folder of it is kept: any may be a user's name.
+ */
 export function pathTail(path: string): string {
   if (!isAbsolute(path)) return path;
   const parts = path.split(/[/\\]/).filter((p) => p !== '' && p !== '?' && p !== '.' && !p.endsWith(':'));
   if (parts.length <= 1) return path;
   const file = parts[parts.length - 1] ?? '';
-  if (parts.length >= 5) return `…/${parts[parts.length - 2] ?? ''}/${file}`;
   if (file.replace(/^\.+/, '').includes('.')) return `…/${file}`;
   return '…';
 }
 
-/** Each absolute path left in `text`, as a word or after `=`, cut to its end. */
-function tails(text: string): string {
+/** Whether `text` is plainly a file's path in free text: a Windows path, or a `/` path ending in a file name. */
+function isFilePath(text: string): boolean {
+  if (!isAbsolute(text)) return false;
+  if (!text.startsWith('/')) return true;
+  return (text.split('/').at(-1) ?? '').replace(/^\.+/, '').includes('.');
+}
+
+/**
+ * Each absolute path left in `text` that `every` names (every one in a file's path; else only
+ * a file's, so a URL's path such as `/api/users` stays), as a word or after `=`, cut to its end.
+ */
+function tails(text: string, every: boolean): string {
+  const wanted = every ? isAbsolute : isFilePath;
   return text
     .split(/([\s"'`()[\]{}<>,;|]+)/u)
     .map((piece) => {
       if (piece === '' || GAP.test(piece[0] ?? '')) return piece;
       const core = trimEndOf(piece, '.:!?');
       const tail = piece.slice(core.length);
-      if (isAbsolute(core)) return `${pathTail(core)}${tail}`;
+      if (wanted(core)) return `${pathTail(core)}${tail}`;
       const eq = core.indexOf('=');
-      if (eq !== -1 && isAbsolute(core.slice(eq + 1))) return `${core.slice(0, eq + 1)}${pathTail(core.slice(eq + 1))}${tail}`;
+      if (eq !== -1 && wanted(core.slice(eq + 1))) return `${core.slice(0, eq + 1)}${pathTail(core.slice(eq + 1))}${tail}`;
       return piece;
     })
     .join('');
@@ -363,7 +398,7 @@ function tails(text: string): string {
 const SEPARATORS = new Set([':', '=', ':=', '=>']);
 
 /** One clean line of at most `max` characters, redacted as the hub redacts it. */
-export function redactLine(text: string, max: number): { text: string; count: number } {
+export function redactLine(text: string, max: number, everyPath = false): { text: string; count: number } {
   const limit = max * 4 + 64;
   // Control characters other than whitespace are dropped, not turned into spaces.
   let tidy = text
@@ -404,7 +439,7 @@ export function redactLine(text: string, max: number): { text: string; count: nu
     named = !valueNext && tail === '' && isSecretName(core);
     out += tail;
   }
-  out = tails(homes(out, count));
+  out = tails(homes(out, count), everyPath);
   const all = [...out];
   if (all.length > max || (cut && all.length === max)) {
     out = `${all.slice(0, max - 1).join('').trimEnd()}…`;
@@ -420,7 +455,7 @@ export function redactLine(text: string, max: number): { text: string; count: nu
 function redactPath(text: string, max: number): { text: string; count: number } {
   const limit = max * 4 + 64;
   const all = [...text];
-  const r = redactLine(all.slice(Math.max(0, all.length - limit)).join(''), limit);
+  const r = redactLine(all.slice(Math.max(0, all.length - limit)).join(''), limit, true);
   const chars = [...r.text];
   if (chars.length > max) r.text = `…${chars.slice(chars.length - (max - 1)).join('').trimStart()}`;
   return r;
@@ -696,7 +731,7 @@ export function startDraft(hub: Hub, me: string, workstreamId: string, body: unk
     link_basis: 'manual',
     brief: CONFINED_BRIEF,
   });
-  session.cwd = `~/.cache/pitcrew/scratch/${session.id}`;
+  session.cwd = confinedFolder(session.id);
   mintSessionToken(hub, chosen.id, session.id);
   hub.later(DRAFT_MAX_RUNTIME_MS, () => {
     if (stateOf(hub, draft).state === 'running') finishRun(hub, session.id, 'kill');

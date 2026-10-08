@@ -1,8 +1,9 @@
 //! Raw tokens, their ids and their hashes.
 //!
-//! A token is `pcd_` (device), `pca_` (agent) or `pcs_` (session: bound to one session PitCrew
-//! started on its own behalf) followed by 32 random bytes in unpadded base64url. The prefix makes
-//! a leaked token easy to spot and to grep for. Only the SHA-256 of a token is ever stored.
+//! A token is `pcd_` (device), `pca_` (agent), `pcr_` (reader: an agent that may only read) or
+//! `pcs_` (session: bound to one session PitCrew started on its own behalf) followed by 32 random
+//! bytes in unpadded base64url. The prefix makes a leaked token easy to spot and to grep for. Only
+//! the SHA-256 of a token is ever stored.
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -19,6 +20,8 @@ pub const TOKEN_BYTES: usize = 32;
 pub const DEVICE_PREFIX: &str = "pcd_";
 /// Prefix of agent tokens.
 pub const AGENT_PREFIX: &str = "pca_";
+/// Prefix of reader tokens.
+pub const READER_PREFIX: &str = "pcr_";
 /// Prefix of session tokens.
 pub const SESSION_PREFIX: &str = "pcs_";
 
@@ -28,6 +31,7 @@ pub const fn prefix(scope: TokenScope) -> &'static str {
     match scope {
         TokenScope::Device => DEVICE_PREFIX,
         TokenScope::Agent => AGENT_PREFIX,
+        TokenScope::Reader => READER_PREFIX,
         TokenScope::Session(_) => SESSION_PREFIX,
     }
 }
@@ -36,20 +40,21 @@ pub const fn prefix(scope: TokenScope) -> &'static str {
 /// nor, for a session token, about its session: only the registry knows that.
 #[must_use]
 pub fn claimed_prefix(token: &str) -> Option<&'static str> {
-    let (prefix, body) = [DEVICE_PREFIX, AGENT_PREFIX, SESSION_PREFIX]
+    let (prefix, body) = [DEVICE_PREFIX, AGENT_PREFIX, READER_PREFIX, SESSION_PREFIX]
         .into_iter()
         .find_map(|prefix| Some((prefix, token.strip_prefix(prefix)?)))?;
     let bytes = URL_SAFE_NO_PAD.decode(body).ok()?;
     (bytes.len() == TOKEN_BYTES).then_some(prefix)
 }
 
-/// The scope a device or agent token claims by its prefix, if it is well formed; `None` for a
-/// session token too, whose session only the registry knows. Says nothing about validity.
+/// The scope a device, agent or reader token claims by its prefix, if it is well formed; `None`
+/// for a session token too, whose session only the registry knows. Says nothing about validity.
 #[must_use]
 pub fn claimed_scope(token: &str) -> Option<TokenScope> {
     match claimed_prefix(token)? {
         DEVICE_PREFIX => Some(TokenScope::Device),
         AGENT_PREFIX => Some(TokenScope::Agent),
+        READER_PREFIX => Some(TokenScope::Reader),
         _ => None,
     }
 }
@@ -186,10 +191,13 @@ mod tests {
     fn generated_tokens_have_their_scope_prefix_and_256_bits() {
         let device = SecretToken::generate(TokenScope::Device).unwrap();
         let agent = SecretToken::generate(TokenScope::Agent).unwrap();
+        let reader = SecretToken::generate(TokenScope::Reader).unwrap();
         assert!(device.expose().starts_with("pcd_"));
         assert!(agent.expose().starts_with("pca_"));
+        assert!(reader.expose().starts_with("pcr_"));
         assert_eq!(claimed_scope(device.expose()), Some(TokenScope::Device));
         assert_eq!(claimed_scope(agent.expose()), Some(TokenScope::Agent));
+        assert_eq!(claimed_scope(reader.expose()), Some(TokenScope::Reader));
         let session =
             SecretToken::generate(TokenScope::Session(pitcrew_protocol::ids::SessionId::new()))
                 .unwrap();
@@ -208,6 +216,7 @@ mod tests {
         assert_eq!(claimed_scope("dev-device-token"), None);
         assert_eq!(claimed_scope("pcd_short"), None);
         assert_eq!(claimed_scope("pcd_!!!"), None);
+        assert_eq!(claimed_scope("pcr_short"), None);
         assert_eq!(claimed_prefix("pcs_short"), None);
         assert_eq!(claimed_prefix("pcx_AAAA"), None);
     }
