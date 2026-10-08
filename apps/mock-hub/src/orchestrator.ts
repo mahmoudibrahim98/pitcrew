@@ -19,7 +19,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { HIDDEN, mintSessionToken, redactLine, revokeSessionTokens } from './board.ts';
+import { HIDDEN, confinedFolder, mintSessionToken, redactLine, revokeSessionTokens } from './board.ts';
 import { includesSession } from './import.ts';
 import { announceSession, createSession, endSession, interrupt, setSessionState } from './simulate.ts';
 import type { Hub } from './state.ts';
@@ -135,10 +135,28 @@ export function orchestratorOf(hub: Hub, member: MemberId): Orchestrator {
   };
 }
 
-/** The person who asked Orchestrator session `session`, if it is one (cleared or not). */
+/** The most parents followed to find a sub-agent's Orchestrator session. */
+const MAX_PARENTS = 8;
+
+/**
+ * The person who asked Orchestrator session `session`, if it is one (cleared or not), as the hub
+ * knows it (`WorkService::orchestrator_asker`): by the ids it keeps; else by the session's own
+ * facts (titled Orchestrator, in its confined run's folder: its agent's owner); else by its
+ * parent's, so a sub-agent of one is its asker's too.
+ */
 export function askerOf(hub: Hub, session: string): MemberId | undefined {
-  for (const [member, person] of peopleOf(hub)) {
-    if (person.sessions.includes(session)) return member;
+  let at: string | undefined = session;
+  for (let up = 0; at !== undefined && up <= MAX_PARENTS; up += 1) {
+    for (const [member, person] of peopleOf(hub)) {
+      if (person.sessions.includes(at)) return member;
+    }
+    const found = hub.findSession(at);
+    if (found === undefined) return undefined;
+    if (found.title === TITLE && found.cwd === confinedFolder(found.id) && found.agent !== undefined) {
+      const owner = hub.findMember(found.agent)?.owner;
+      if (owner !== undefined) return owner;
+    }
+    at = found.parent === at ? undefined : found.parent;
   }
   return undefined;
 }
@@ -274,7 +292,7 @@ export function ask(hub: Hub, caller: MemberId, body: unknown): Conversation {
       engine,
       machine: machine.id,
       // Its own fresh folder in the cache folder, as the hub's confined runs have.
-      cwd: '/cache/pitcrew/scratch',
+      cwd: '',
       title: TITLE,
       agent: agent.id,
       brief: render({
@@ -286,7 +304,7 @@ export function ask(hub: Hub, caller: MemberId, body: unknown): Conversation {
         question: text,
       }),
     });
-    session.cwd = `/cache/pitcrew/scratch/${session.id}`;
+    session.cwd = confinedFolder(session.id);
     person.sessions.push(session.id);
     // Its CLI's token, as the hub mints it: a reader token for this session alone.
     mintSessionToken(hub, agent.id, session.id, 'reader');
@@ -555,7 +573,13 @@ function target(hub: Hub, c: Cited): { target: ReferenceTarget; label: string } 
   }
 }
 
-function resolve(
+/** What a suggestion does, whatever its label (the hub's `same_suggestion`, the panel's `suggestionKey`). */
+function suggestionKey(s: AnswerSuggestion): string {
+  return s.kind === 'move_task' ? `move_task:${s.task}:${s.to}` : `open:${JSON.stringify(s.target)}`;
+}
+
+/** The references and suggestions the hub knows of `found` (each suggestion once), and the text. */
+export function resolve(
   hub: Hub,
   found: ReturnType<typeof scan>,
 ): { references: AnswerReference[]; suggestions: AnswerSuggestion[]; rest: string } {
@@ -581,8 +605,11 @@ function resolve(
       const known = target(hub, s.cited);
       if (known !== undefined) made = { kind: 'open', target: known.target, label: `Open ${known.label}` };
     }
-    if (made !== undefined) suggestions.push(made);
-    else rest = `${rest === '' ? '' : `${rest}\n`}Suggestion: ${s.line}`;
+    // The same suggestion twice is one (the panel follows each by what it is).
+    if (made !== undefined) {
+      const key = suggestionKey(made);
+      if (!suggestions.some((other) => suggestionKey(other) === key)) suggestions.push(made);
+    } else rest = `${rest === '' ? '' : `${rest}\n`}Suggestion: ${s.line}`;
   }
   return { references, suggestions, rest };
 }

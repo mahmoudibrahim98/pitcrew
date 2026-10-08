@@ -105,10 +105,12 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   lines; references and suggestions are found and resolved as the hub does. Follow-ups type into
   the live session (one line, `Q: ` before what would be a CLI command); a new conversation ends
   the old session; one answer at a time; cancel and clear as the contract says. As the hub's, each
-  session has its own folder (`/cache/pitcrew/scratch/<session>`) and a reader token minted for it
-  alone (`pcr_…`, in memory, written to `<sessionTokenDir>/<session>.token` as a draft's is),
-  revoked when the session ends, at a new conversation and at a clear; its transcript and terminal
-  are its asker's alone (`askerOf`, cleared or not). Claude Code and OpenCode are offered (Claude
+  session has its own folder (`~/.cache/pitcrew/scratch/<key>/<session>`, `confinedFolder`) and a
+  reader token minted for it alone (`pcr_…`, in memory, written to
+  `<sessionTokenDir>/<session>.token` as a draft's is), revoked when the session ends, at a new
+  conversation and at a clear; its transcript and terminal are its asker's alone (`askerOf`,
+  cleared or not; by its facts too, and a sub-agent's session under it). Each suggestion is kept
+  once. Claude Code and OpenCode are offered (Claude
   Code reads as installed, OpenCode not); Codex is refused (`400`). It never times out or cuts an
   answer.
 - **Board drafts** (`src/board.ts`, api-v1.md "Board drafts"): the preview builds the summary as
@@ -116,8 +118,8 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   redaction and path rules ported), from the workstream's sessions and the recaps fixture, and
   keeps the workstream's latest preview 10 minutes; a start sends that preview (else needs the
   prompt's digest now) with one of the caller's own agents, and runs a simulated session on the
-  local machine in a private folder (`~/.cache/pitcrew/scratch/<session>`), with one line as its
-  first prompt; it mints the draft a **session token** (`pcs_…`, in memory; also written to
+  local machine in a private folder (`~/.cache/pitcrew/scratch/<key>/<session>`), with one line
+  as its first prompt; it mints the draft a **session token** (`pcs_…`, in memory; also written to
   `<sessionTokenDir>/<session>.token` when the server is started with `sessionTokenDir`, or
   `PITCREW_MOCK_SESSION_TOKENS` from the command line). Only that token proposes (`dev-agent-token`
   is refused), and it reaches no other route (`session` routes only); the proposal revokes it and

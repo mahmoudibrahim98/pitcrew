@@ -22,6 +22,25 @@ assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(new URL(base).hostname));
 const missing = '01J00000000000000000000000';
 const codes = { 400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict' };
 
+/**
+ * A session's id as a request's path may write it: as shown and bare, and percent-encoded (its
+ * `_`, a character of its ULID), which the routes decode. A check of who may read must read the
+ * same id the route does.
+ */
+function idForms(id) {
+  const ulid = id.startsWith('ses_') ? id.slice(4) : id;
+  const hex = (c) => c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0');
+  return [
+    `ses_${ulid}`,
+    ulid,
+    `ses%5F${ulid}`,
+    `ses%5f${ulid}`,
+    `ses_%${hex(ulid[0])}${ulid.slice(1)}`,
+    `%${hex(ulid[0])}${ulid.slice(1)}`,
+    `ses_${ulid.slice(0, -1)}%${hex(ulid.at(-1)).toLowerCase()}`,
+  ];
+}
+
 /** The token an Orchestrator session's CLI was given, as the target hands it to the suite. Never printed. */
 async function runToken(session) {
   for (let i = 0; i < 300; i += 1) {
@@ -182,7 +201,8 @@ test('the orchestrator: a person\'s own conversations, one answer at a time, can
   assert.equal(session.title, 'Orchestrator');
   assert.equal(session.agent, asked.agent);
   assert.equal(session.workstream, undefined);
-  assert.match(session.cwd, new RegExp(`[\\\\/]scratch[\\\\/]${session.id}$`), 'its own fresh folder');
+  // `scratch/<state key>/<session>`: its own fresh folder, in its hub's own part of the scratch folder.
+  assert.match(session.cwd, new RegExp(`[\\\\/]scratch[\\\\/][0-9a-f]{16}[\\\\/]${session.id}$`), 'its own fresh folder');
 
   // Its CLI's token: a reader token minted for this session alone, which only reads.
   const own = await runToken(turn.session);
@@ -192,10 +212,12 @@ test('the orchestrator: a person\'s own conversations, one answer at a time, can
   await expect(403, 'POST', '/v1/tasks', {}, own);
   await expect(403, 'GET', '/v1/orchestrator', undefined, own);
 
-  // Its transcript is its asker's alone.
+  // Its transcript is its asker's alone, however its id is written in the path.
   const transcript = `/v1/sessions/${turn.session}/transcript`;
-  await expect(200, 'GET', transcript, undefined, person);
-  await expect(403, 'GET', transcript, undefined, second);
+  for (const form of idForms(turn.session)) {
+    await expect(200, 'GET', `/v1/sessions/${form}/transcript`, undefined, person);
+    await expect(403, 'GET', `/v1/sessions/${form}/transcript`, undefined, second);
+  }
 
   const now = await expect(200, 'GET', '/v1/orchestrator', undefined, person, schemas.orchestrator);
   assert.equal(now.engine, 'claude');
@@ -233,7 +255,9 @@ test('the orchestrator: a person\'s own conversations, one answer at a time, can
   const revoked = await call('GET', '/v1/me', undefined, own);
   assert.equal(revoked.status, 401);
   await expect(200, 'GET', transcript, undefined, person);
-  await expect(403, 'GET', transcript, undefined, second);
+  for (const form of idForms(turn.session)) {
+    await expect(403, 'GET', `/v1/sessions/${form}/transcript`, undefined, second);
+  }
   const deadline = Date.now() + 15000;
   for (;;) {
     const state = (await expect(200, 'GET', `/v1/sessions/${turn.session}`, undefined, person)).state;

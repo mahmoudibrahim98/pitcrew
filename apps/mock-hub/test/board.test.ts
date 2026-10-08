@@ -8,7 +8,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
-import { CONFINED_BRIEF, pathTail, redactLine, relativeTo } from '../src/board.ts';
+import { CONFINED_BRIEF, confinedFolder, pathTail, redactLine, relativeTo } from '../src/board.ts';
 import type { RunningServer } from '../src/server.ts';
 import type { BoardDraft, DraftPreview, Event, Task } from '../src/types.ts';
 import { AGENT, DEVICE, ID, call, sleep, withServer } from './helpers.ts';
@@ -94,7 +94,8 @@ describe('board drafts', () => {
       assert.equal((await tasks(server)).length, count);
       // Confined: a private folder of its own, never the workstream's, and one short line.
       const session = (await call<{ cwd: string }>(server, 'GET', `/v1/sessions/${draft.session}`, { token: DEVICE })).body;
-      assert.equal(session.cwd, `~/.cache/pitcrew/scratch/${draft.session}`);
+      assert.equal(session.cwd, confinedFolder(draft.session));
+      assert.match(session.cwd, new RegExp(`/scratch/[0-9a-f]{16}/${draft.session}$`), 'keyed by the hub');
       assert.ok(CONFINED_BRIEF.length < 100);
 
       const path = `/v1/board-drafts/${draft.id}/proposal`;
@@ -200,12 +201,17 @@ describe('board drafts', () => {
       ['opened /mnt/c/Users/sam/work/notes.md', 'opened ~/work/notes.md'],
       ['opened \\\\?\\C:\\Users\\sam\\notes.md', 'opened ~\\notes.md'],
       ['ran /scratch/grp/sam/run.sh', 'ran …/run.sh'],
-      ['in /scratch/grp/sam', 'in …'],
+      ['ran /lustre/scratch/grp/sam/train.py', 'ran …/train.py'],
+      // In free text only a file's path is cut: a URL's path, or a folder's, stays.
+      ['Fix /api/users 500', 'Fix /api/users 500'],
+      ['in /scratch/grp/sam', 'in /scratch/grp/sam'],
+      ['in D:\\data\\sam', 'in …'],
       ['see https://example.com/a/b/c', 'see https://example.com/a/b/c'],
     ] as const) {
       assert.ok(redactLine(text, 500).text === want, `case ${want}: not redacted as expected`);
     }
-    assert.equal(pathTail('/a/b/c/d/e.rs'), '…/d/e.rs');
+    assert.equal(pathTail('/a/b/c/d/e.rs'), '…/e.rs');
+    assert.equal(pathTail('/lustre/scratch/grp/sam/train.py'), '…/train.py');
     assert.equal(relativeTo('/scratch/grp/sam/paper/src/a.rs', ['/scratch/grp/sam/paper']), 'src/a.rs');
     assert.equal(relativeTo('C:\\Users\\sam\\p\\a.rs', ['c:/Users/sam/p']), 'a.rs');
   });

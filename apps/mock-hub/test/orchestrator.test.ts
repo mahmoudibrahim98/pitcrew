@@ -4,9 +4,11 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { cleanQuestion, scan, typed } from '../src/orchestrator.ts';
+import { confinedFolder } from '../src/board.ts';
+import { askerOf, cleanQuestion, resolve, scan, typed } from '../src/orchestrator.ts';
 import type { RunningServer } from '../src/server.ts';
 import type { Conversation, Orchestrator, Session, Task, TranscriptPage } from '../src/types.ts';
+import { ulid } from '../src/ulid.ts';
 import { AGENT, DEVICE, ID, call, sleep, withServer } from './helpers.ts';
 
 const FAST = { delays: { start: 20, reply: 40 } };
@@ -62,7 +64,8 @@ describe('the orchestrator', () => {
       assert.equal(session.title, 'Orchestrator');
       assert.equal(session.agent, OFFICE);
       assert.equal(session.workstream, undefined);
-      assert.equal(session.cwd, `/cache/pitcrew/scratch/${session.id}`, 'its own fresh folder');
+      assert.match(session.cwd, new RegExp(`/scratch/[0-9a-f]{16}/${session.id}$`), 'its own fresh folder');
+      assert.equal(session.cwd, confinedFolder(session.id));
       const page = (await call<TranscriptPage>(server, 'GET', `/v1/sessions/${turn.session}/transcript`, { token: DEVICE })).body;
       const prompt = page.items.find((i) => i.kind === 'user_prompt');
       assert.ok(prompt !== undefined && 'text' in prompt && prompt.text.includes('pitcrew session list'));
@@ -165,9 +168,59 @@ describe('the orchestrator', () => {
           assert.equal((await call(server, 'DELETE', '/v1/orchestrator/conversations', { token: DEVICE })).status, 204);
         }
       }
+      // However its id is written in the path.
+      const id = res.body.turns[0]!.session;
+      for (const form of [`ses%5F${id}`, `ses_%${id.charCodeAt(0).toString(16)}${id.slice(1)}`]) {
+        assert.equal((await call(server, 'GET', `/v1/sessions/${form}/transcript`, { token: SECOND })).status, 403, form);
+      }
       // Other sessions' transcripts are as before.
       assert.equal((await call(server, 'GET', `/v1/sessions/${ID.ses1}/transcript`, { token: SECOND })).status, 200);
     }, FAST));
+
+  it("keeps a sub-agent's session, and one whose id is not kept, their asker's", () =>
+    withServer(async (server) => {
+      const res = await ask(server, { text: 'Who worked today?' });
+      assert.equal(res.status, 202);
+      await answered(server);
+      const hub = server.hub;
+      const asked = hub.findSession(res.body.turns[0]!.session)!;
+      const sub: Session = { ...asked, id: ulid(), title: 'Synthetic sub-agent prompt', cwd: '/w', parent: asked.id };
+      const deeper: Session = { ...asked, id: ulid(), title: 'Synthetic deeper prompt', cwd: '/w', parent: sub.id };
+      // Titled Orchestrator, in its confined run's folder, but not among the kept ids.
+      const lost: Session = { ...asked, id: ulid() };
+      lost.cwd = confinedFolder(lost.id);
+      const elsewhere: Session = { ...asked, id: ulid(), cwd: '/home/sam/work' };
+      hub.sessions.push(sub, deeper, lost, elsewhere);
+      for (const session of [asked, sub, deeper, lost]) {
+        assert.equal(askerOf(hub, session.id), ID.sam, session.title);
+        const other = await call(server, 'GET', `/v1/sessions/${session.id}/transcript`, { token: SECOND });
+        assert.equal(other.status, 403, session.title);
+      }
+      assert.equal(askerOf(hub, elsewhere.id), undefined);
+      assert.equal(askerOf(hub, ID.ses1), undefined);
+    }, FAST));
+
+  it('keeps each suggestion once', () =>
+    withServer(async (server) => {
+      const { suggestions } = resolve(
+        server.hub,
+        scan(
+          [
+            'Two things.',
+            'Suggestion: move PAP-1 to review',
+            `Suggestion: open wst_${ID.submission}`,
+            'Suggestion: **move PAP-1 to review**',
+            `Suggestion: move tsk_${ID.pap1} to review`,
+            `Suggestion: open wst_${ID.submission}`,
+            'Suggestion: move PAP-1 to done',
+          ].join('\n'),
+        ),
+      );
+      assert.deepEqual(
+        suggestions.map((s) => (s.kind === 'move_task' ? `${s.key}->${s.to}` : s.label)),
+        ['PAP-1->review', 'Open Submission', 'PAP-1->done'],
+      );
+    }));
 });
 
 describe('a reader token', () => {

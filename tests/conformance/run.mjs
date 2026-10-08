@@ -164,8 +164,9 @@ try {
     // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle. They
     // answer `--version` at once (a Claude Code new enough for onboarding.test.mjs's hooks), and
     // for machine-setup.test.mjs their status commands too (not signed in); a sign-in's "login"
-    // waits like a session. Started for a board draft (in its private folder, `scratch/<session>`),
-    // a stand-in hands its session token to the suite, which proposes as the CLI would.
+    // waits like a session. Started for a board draft (in its private folder,
+    // `scratch/<key>/<session>`), a stand-in hands its session token to the suite, which proposes
+    // as the CLI would.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
     const standIn =
