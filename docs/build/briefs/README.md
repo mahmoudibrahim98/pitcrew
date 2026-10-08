@@ -113,7 +113,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [M-workbench](M-workbench.md) | M · Agent console | `integrator/workbench` | Opus-class (Claude cloud) | **Merged** (PR #53) |
 | [0-remote-files](0-remote-files.md) | 0 · Composition root | `integrator/remote-files` | Codex (cloud) | Deferred: needs a hub-to-runner link (after team hubs); remote workspaces already serve their own files |
 | [K-updater](K-updater.md) | K · Desktop shell | `integrator/updater` | Codex (local, Windows) | **Merged** (PR #51) |
-| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Opus-class (Claude cloud) | In review (PR #54) |
+| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Opus-class (Claude cloud) | **Merged** (PR #54; follow-ups in #59) |
 | [0-create-dialogs](0-create-dialogs.md) | 0 · Composition root | `integrator/create-dialogs` | Codex (cloud) | **Merged** (PR #60) |
 | [0-start-sessions](0-start-sessions.md) | 0 · Composition root | `integrator/start-sessions` | Codex (cloud) | **Merged** (PR #62) |
 | [0-orchestrator-chat](0-orchestrator-chat.md) | 0 · Composition root | `integrator/orchestrator-chat` | Opus-class (Claude cloud) | In review (PR #59) |
