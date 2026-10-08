@@ -896,6 +896,7 @@ function sync(hub: Hub, rec: Record): void {
       labels: fitLabels(item.labels),
       blocked_by: [],
       source: { system, key: item.key, url: item.url },
+      archived: false,
       accept_auto: false,
       subtasks: [],
     };
