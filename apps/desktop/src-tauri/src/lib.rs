@@ -18,6 +18,8 @@
 //! - [`navigate`]: deep links (`pitcrew://…`) and notification clicks, as `gateway://navigate`.
 //! - [`shell`]: the app in the background: "needs you" ([`attention`]), notifications
 //!   ([`notify`]), the tray ([`tray`]) and the [`preferences`] behind them.
+//! - [`portable`]: a copy run from an unzipped folder (`portable.txt` next to it), and
+//!   `--check-layout`.
 //!
 //! **Owned by stream K.**
 
@@ -31,6 +33,7 @@ pub mod keychain;
 pub mod logging;
 pub mod navigate;
 pub mod notify;
+pub mod portable;
 pub mod preferences;
 pub mod redact;
 pub mod registry;
