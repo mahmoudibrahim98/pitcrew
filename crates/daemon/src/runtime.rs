@@ -1380,12 +1380,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn foreign_sessions_are_found() {
-        use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let fake = |name: &str, body: &str| {
             let path = tmp.path().join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_scripts::write_script(&path, &format!("#!/bin/sh\n{body}\n"), 0o755);
             path
         };
         let socket = tmp.path().join("s");

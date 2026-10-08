@@ -47,6 +47,8 @@ mod sessions;
 mod setup;
 mod state;
 mod terminals;
+#[cfg(all(test, unix))]
+mod test_scripts;
 mod transcripts;
 mod visibility;
 

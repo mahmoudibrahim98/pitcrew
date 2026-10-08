@@ -440,13 +440,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn every_engine_is_reported_by_its_own_cli() {
-        use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path();
         let script = |name: &str, body: &str| {
-            let path = bin.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_scripts::write_script(
+                &bin.join(name),
+                &format!("#!/bin/sh\n{body}\n"),
+                0o755,
+            );
         };
         script(
             "claude",

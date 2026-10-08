@@ -683,10 +683,11 @@ mod tests {
     /// pause, as a Node CLI takes a moment to start, and its login is never run here.
     #[cfg(unix)]
     fn stand_in(bin: &Path, name: &str, status: &str) {
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = bin.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\nsleep 0.2\n{status}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scripts::write_script(
+            &bin.join(name),
+            &format!("#!/bin/sh\nsleep 0.2\n{status}\n"),
+            0o755,
+        );
     }
 
     /// `bin` with a stand-in for each CLI, each answering its own status command. The rest of
