@@ -11,6 +11,7 @@ import {
 } from '../data/index.ts';
 import { Badge, Button, FolderIcon, Tree, TreeItem } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
+import { useRegistry } from './context.ts';
 import { askPlaces, countBy, isOpenTask, useMyOpenAsks } from './data.ts';
 import { useWorkspaceId } from './layout.ts';
 import { paths } from './paths.ts';
@@ -62,6 +63,8 @@ export function ProjectsTree() {
   const asks = useMyOpenAsks().data ?? [];
   const expanded = useShell((s) => s.expanded);
   const setExpanded = useShell((s) => s.setExpanded);
+  // The Projects feature's "New project" dialog; without it, nothing to offer.
+  const canCreate = useRegistry().create.some((e) => e.id === 'project' && e.disabled === undefined);
 
   const open = tasks.filter(isOpenTask);
   const openByProject = countBy(open, (t) => t.project);
@@ -74,7 +77,7 @@ export function ProjectsTree() {
   if (visible.length === 0) {
     return <div className="m-1 rounded-md border border-dashed border-line p-3 text-sm text-ink-2">
       <FolderIcon className="mb-2" /><p>No projects yet.</p><p className="mt-1 text-xs">Group your tasks and agent sessions in a project.</p>
-      <Button className="mt-3" onClick={(event) => useShell.getState().setCreating('project', event.currentTarget)}>New project</Button>
+      {canCreate && <Button className="mt-3" onClick={(event) => useShell.getState().setCreating('project', event.currentTarget)}>New project</Button>}
     </div>;
   }
 

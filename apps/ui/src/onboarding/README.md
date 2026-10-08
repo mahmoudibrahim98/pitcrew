@@ -4,10 +4,14 @@ Polish: Welcome illustrates agents → workspace → work. The desktop's existin
 `gateway_local_host` supplies the local machine-name default without replacing a name the
 person typed; the browser retains its editable fallback. Create shows each root, merges a
 suggestion's workstreams into another selected project, and keeps each workstream's original
-location. The target project's root wins when merging. Import uses checkboxes for scanned
-folders (none checked means all folders), with the spelling OpenCode. Hook diffs are folded
-under an agent summary. Safety keeps the hourly limit visible and disabled until opted in.
-Done offers registered create flows and a direct link to the agent sessions.
+location. The target project's root wins when merging. Import ticks folders (none ticked means
+all folders): the scan's, and any added by hand under "Add a folder", which a remote or HPC first
+run without a scan needs; it spells OpenCode. Hooks say per agent, in plain words and by its
+name, what installing does (adds, adds the rest, updates, or nothing: already installed), with
+the hub's detail where the summary alone would hide it; each file's diff is folded. Safety keeps
+the hourly limit visible and disabled until opted in. Done offers the registered "Create a task"
+and "Start a session" (not "Invite someone": there are no invites yet), each opening on its page
+with focus to give back to it, and a direct link to the agent sessions.
 
 The import contract currently includes sub-agents and has no exclusion field; this UI cannot
 offer a working skip-sub-agents control until the contract and backend support it.

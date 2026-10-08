@@ -59,7 +59,7 @@ describe('WhereItStands', () => {
     // The fixture's pending proposal repeats the brief's own text, so it shows up twice: once as
     // "Where it stands", once in the "Proposed update" box below (see the proposal tests below).
     expect(within(paper).getAllByText(PAPER_TEXT)).toHaveLength(2);
-    expect(within(paper).getByText(/From the back office/)).toBeTruthy();
+    expect(within(paper).getByText(/Written automatically from recent work/)).toBeTruthy();
     const receipts = within(paper).getByRole('list', { name: 'Receipts' });
     expect(within(receipts).getAllByRole('button').map((b) => b.textContent)).toEqual(['Event …0010', 'Job 4815162']);
     fireEvent.click(within(receipts).getByRole('button', { name: 'Job 4815162' }));

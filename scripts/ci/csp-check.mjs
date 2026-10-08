@@ -82,10 +82,14 @@ export function checkHtml(html) {
     while ((attr = pattern.exec(rest)) !== null) {
       const key = attr[1].toLowerCase();
       if (/^on/.test(key)) errors.push(`event-handler attribute ${key} on <${name}>`);
+      // Inline styles in the entry point: Tauri adds a nonce to each <style>, which switches off
+      // style-src 'unsafe-inline' for the app's run-time styles, and a nonce never covers style="".
+      if (key === 'style') errors.push(`style attribute on <${name}> in built UI`);
       if (attrs.has(key)) errors.push(`duplicate attribute ${key} on <${name}>`);
       attrs.set(key, attr[2] ?? attr[3] ?? attr[4] ?? '');
     }
     if (name === 'script' && !attrs.get('src')?.trim()) errors.push('inline <script> in built UI');
+    if (name === 'style') errors.push('inline <style> in built UI');
     if (['script', 'style', 'textarea', 'title'].includes(name)) {
       const close = new RegExp(`</${name}\\s*>`, 'ig');
       close.lastIndex = cursor;

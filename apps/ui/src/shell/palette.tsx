@@ -54,8 +54,11 @@ const ICONS = {
 const ROW_HEIGHT = 36;
 const PAGE = 8;
 
-/** Everything the palette finds. A "+ New" dialog it opens gives focus back to `opener`. */
-function useItems(opener: Element | null): Item[] {
+/**
+ * Everything the palette finds. A "+ New" dialog it opens gives focus back to `opener`; an action
+ * on the open task hands its control to `focusAfterClose`, which the palette focuses as it closes.
+ */
+function useItems(opener: Element | null, focusAfterClose: (control: HTMLElement) => void): Item[] {
   const router = useRouter();
   const ws = useWorkspaceId();
   const layout = useLayout();
@@ -83,7 +86,7 @@ function useItems(opener: Element | null): Item[] {
       const control = main?.querySelector<HTMLSelectElement>(`select[aria-label="${field}"]`) ??
         [...(main?.querySelectorAll('label') ?? [])].filter((node) => node.textContent?.trim() === field).map((node) => document.getElementById(node.htmlFor)).find((node) => node instanceof HTMLSelectElement);
       if (!(control instanceof HTMLSelectElement) || control.disabled) continue;
-      actionItems.push({ id: `action:${field}`, kind: 'command', label, hint: 'Open task', fields: [label], run: () => window.setTimeout(() => { control.scrollIntoView({ block: 'nearest' }); control.focus(); }, 0) });
+      actionItems.push({ id: `action:${field}`, kind: 'command', label, hint: 'Open task', fields: [label], run: () => focusAfterClose(control) });
     }
   }
   if (params.session !== undefined && sessions.some((session) => session.id === params.session)) {
@@ -155,10 +158,18 @@ function useItems(opener: Element | null): Item[] {
   ];
 }
 
-function Results({ close, opener }: { close(): void; opener: Element | null }) {
+function Results({
+  close,
+  opener,
+  focusAfterClose,
+}: {
+  close(): void;
+  opener: Element | null;
+  focusAfterClose(control: HTMLElement): void;
+}) {
   // TanStack Virtual keeps state in a mutable object the compiler cannot see change.
   'use no memo';
-  const items = useItems(opener);
+  const items = useItems(opener, focusAfterClose);
   const ws = useWorkspaceId();
   const recent = useShell((s) => s.workspaces[ws]?.recent);
   const [query, setQuery] = useState('');
@@ -194,6 +205,7 @@ function Results({ close, opener }: { close(): void; opener: Element | null }) {
     virtualizer.scrollToIndex(next);
   }
 
+  // Home and End stay with the text field, moving its caret (the ARIA combobox pattern).
   function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     const moves: Record<string, number> = {
       ArrowDown: current + 1,
@@ -208,9 +220,6 @@ function Results({ close, opener }: { close(): void; opener: Element | null }) {
     } else if (event.key === 'Enter') {
       event.preventDefault();
       choose(results[current]);
-    } else if (event.key === 'Home' || event.key === 'End') {
-      event.preventDefault();
-      moveTo(event.key === 'Home' ? 0 : results.length - 1);
     }
   }
 
@@ -304,6 +313,9 @@ export function Palette() {
   // to the page when a result navigated.
   const [opener] = useState(() => document.activeElement);
   const hrefAtRun = useRef<string | null>(null);
+  // A control on the page that a result asked for ("Move open task…"). Focused here, as the
+  // dialog closes: focusing it any earlier, Radix would hand focus back to the opener after it.
+  const focusAfterClose = useRef<HTMLElement | null>(null);
   return (
     <Dialog open onOpenChange={setOpen}>
       <DialogContent
@@ -312,6 +324,12 @@ export function Palette() {
         className="top-[10vh] w-[min(640px,calc(100vw-32px))]"
         onCloseAutoFocus={(event) => {
           event.preventDefault();
+          const control = focusAfterClose.current;
+          if (control !== null && control.isConnected) {
+            control.scrollIntoView({ block: 'nearest' });
+            control.focus();
+            return;
+          }
           // A "New …" result opened its dialog, which holds focus now.
           if (useShell.getState().creating !== null || useShell.getState().linkingSession !== null) return;
           const navigated = hrefAtRun.current !== null && hrefAtRun.current !== window.location.href;
@@ -321,6 +339,9 @@ export function Palette() {
       >
         <Results
           opener={opener}
+          focusAfterClose={(control) => {
+            focusAfterClose.current = control;
+          }}
           close={() => {
             hrefAtRun.current = window.location.href;
             setOpen(false);

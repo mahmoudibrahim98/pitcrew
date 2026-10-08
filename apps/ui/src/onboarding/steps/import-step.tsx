@@ -1,9 +1,11 @@
 // Step 9: all sessions, a filtered set, or start fresh. Sessions are read in place and never
 // moved (ADR-0010); importing is reversible. A dry run always runs before the real import so the
-// count on screen matches what "Continue" is about to do.
+// count on screen matches what "Continue" is about to do. The filter's folders are ticked from the
+// scan's, or added by hand: a remote or HPC first run has no scan.
 
 import { useEffect, useMemo, useState } from 'react';
 import type { Engine } from '../../data/index.ts';
+import { Button } from '../../design/index.ts';
 import type { ImportMode } from '../api.ts';
 import { useOnboardingApi } from '../api-context.tsx';
 import { StepFooter } from '../step-footer.tsx';
@@ -24,6 +26,16 @@ export function ImportStep() {
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<{ key: string; count: number }>();
   const [error, setError] = useState<string>();
+  const [folder, setFolder] = useState('');
+  const [added, setAdded] = useState<string[]>([]);
+  const scanned = state.scanResult?.counts.byFolder ?? [];
+  // Folders added by hand are listed after the scan's, ticked; unticked, they stay to tick again.
+  const folders = [
+    ...scanned,
+    ...[...new Set([...state.importFolders, ...added])]
+      .filter((path) => path.trim() !== '' && !scanned.some((entry) => entry.path === path))
+      .map((path) => ({ path, count: undefined })),
+  ];
 
   const filter = useMemo(() => ({
     mode: state.importMode,
@@ -48,6 +60,18 @@ export function ImportStep() {
     });
     return () => { live = false; };
   }, [api, filter]);
+
+  function toggleFolder(path: string, on: boolean) {
+    patch({ importFolders: on ? [...state.importFolders, path] : state.importFolders.filter((f) => f !== path) });
+  }
+
+  function addFolder() {
+    const path = folder.trim();
+    if (path === '') return;
+    if (!added.includes(path)) setAdded([...added, path]);
+    if (!state.importFolders.includes(path)) toggleFolder(path, true);
+    setFolder('');
+  }
 
   function toggleEngine(engine: Engine) {
     patch({
@@ -107,13 +131,51 @@ export function ImportStep() {
               className="h-7 w-40 rounded-sm border border-line-2 bg-card px-2 text-sm text-ink"
             />
           </div>
-          <fieldset className="flex max-h-48 flex-col gap-2 overflow-y-auto">
-            <legend className="text-xs font-medium text-ink-2">Scanned folders</legend>
-            {(state.scanResult?.counts.byFolder ?? []).map(({ path, count }) => <label key={path} className="flex items-start gap-2 text-sm text-ink">
-              <input type="checkbox" checked={state.importFolders.includes(path)} onChange={(event) => patch({ importFolders: event.target.checked ? [...state.importFolders, path] : state.importFolders.filter((folder) => folder !== path) })} />
-              <span className="min-w-0 break-all">{path} <span className="text-xs text-ink-2">({count} {count === 1 ? 'session' : 'sessions'})</span></span>
-            </label>)}
-            <p className="text-xs text-ink-2">{state.scanResult === undefined ? 'No scan available. ' : ''}Leave all folders unticked to include every folder.</p>
+          <fieldset className="flex flex-col gap-2">
+            <legend className="text-xs font-medium text-ink-2">Folders</legend>
+            {folders.length > 0 && (
+              <div className="flex max-h-48 flex-col gap-2 overflow-y-auto">
+                {folders.map(({ path, count }) => (
+                  <label key={path} className="flex items-start gap-2 text-sm text-ink">
+                    <input
+                      type="checkbox"
+                      checked={state.importFolders.includes(path)}
+                      onChange={(event) => toggleFolder(path, event.target.checked)}
+                    />
+                    <span className="min-w-0 break-all">
+                      {path}
+                      {count !== undefined && (
+                        <span className="text-xs text-ink-2"> ({count} {count === 1 ? 'session' : 'sessions'})</span>
+                      )}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            )}
+            <div className="flex items-center gap-2">
+              <input
+                aria-label="Add a folder"
+                value={folder}
+                placeholder="e.g. /home/sam/work/paper"
+                spellCheck={false}
+                autoComplete="off"
+                onChange={(event) => setFolder(event.target.value)}
+                onKeyDown={(event) => {
+                  // Enter adds the folder here, rather than submitting the step.
+                  if (event.key !== 'Enter') return;
+                  event.preventDefault();
+                  addFolder();
+                }}
+                className="h-7 min-w-0 flex-1 rounded-sm border border-line-2 bg-card px-2 text-sm text-ink placeholder:text-ink-2 placeholder:italic"
+              />
+              <Button type="button" onClick={addFolder} disabled={folder.trim() === ''}>
+                Add folder
+              </Button>
+            </div>
+            <p className="text-xs text-ink-2">
+              {state.scanResult === undefined ? 'There is no scan of this machine: add the folders to import. ' : ''}
+              Leave every folder unticked to include them all.
+            </p>
           </fieldset>
           <div className="flex flex-col gap-1">
             <span className="text-xs font-medium text-ink-2">Engines</span>

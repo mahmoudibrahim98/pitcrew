@@ -78,6 +78,25 @@ describe('feature registration', () => {
     expect(router.state.location.pathname).toBe(`/w/${WORKSPACE}/projects/01JB000000000000000PRJ0001`);
     expect(screen.queryByRole('combobox')).toBeNull();
   });
+  it('leaves Home and End to the search text: they move its caret, not the chosen result', async () => {
+    vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(432);
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(640);
+    renderApp([]);
+    await screen.findByRole('heading', { level: 1, name: 'Home' }, { timeout: 8_000 });
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    const search = await screen.findByRole('combobox', { name: 'Search' });
+    await waitFor(() => expect(screen.getAllByRole('option').length).toBeGreaterThan(2));
+    const chosen = () => screen.getAllByRole('option').findIndex((o) => o.getAttribute('aria-selected') === 'true');
+    fireEvent.keyDown(search, { key: 'ArrowDown' });
+    expect(chosen()).toBe(1);
+    // Not prevented, so the browser moves the caret; the chosen result stays.
+    expect(fireEvent.keyDown(search, { key: 'End' })).toBe(true);
+    expect(fireEvent.keyDown(search, { key: 'Home' })).toBe(true);
+    expect(chosen()).toBe(1);
+    // The arrows still move it, and are taken from the text field.
+    expect(fireEvent.keyDown(search, { key: 'ArrowDown' })).toBe(false);
+    expect(chosen()).toBe(2);
+  });
   it("shows a stub feature's nav entry in the sidebar and routes to its page", async () => {
     const stub = defineFeature({
       id: 'stub',

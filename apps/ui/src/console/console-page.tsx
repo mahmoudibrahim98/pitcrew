@@ -33,7 +33,7 @@ import { StartSessionButton } from './start-session-button.tsx';
 import { useConsoleSessions } from './data.ts';
 import { NO_FACETS, type SessionFacets } from './facets.ts';
 import { onIntent, takeIntent, type ConsoleIntent } from './intent.ts';
-import { NARROW_BELOW, PANE_WIDTH, usePanes } from './panes.ts';
+import { COMPACT_BELOW, NARROW_BELOW, PANE_WIDTH, usePanes } from './panes.ts';
 import {
   facetCount,
   facetsFromSearch,
@@ -84,21 +84,17 @@ function paneStops(root: HTMLElement | null): { pane: HTMLElement; target: HTMLE
 
 const find = (root: HTMLElement | null, selector: string) => root?.querySelector<HTMLElement>(selector) ?? null;
 
-/** Whether the console is narrower than `NARROW_BELOW`: one pane at a time. */
-function useNarrow(root: RefObject<HTMLElement | null>): { narrow: boolean; width: number } {
+/**
+ * The console's width (0 before it is measured): narrower than `NARROW_BELOW`, one pane at a time;
+ * narrower than `COMPACT_BELOW`, the filters start folded away.
+ */
+function useNarrow(root: RefObject<HTMLElement | null>): { narrow: boolean; compact: boolean; width: number } {
   const [width, setWidth] = useState(0);
   useLayoutEffect(() => {
     const element = root.current;
     if (element === null) return;
     // A width of 0 is no layout at all (a hidden tab, a test), not a narrow console.
-    let below = false;
-    const measure = () => {
-      const width = element.clientWidth;
-      setWidth(width);
-      const compact = width > 0 && width < 960;
-      if (compact && !below) usePanes.getState().setFiltersOpen(false);
-      below = compact;
-    };
+    const measure = () => setWidth(element.clientWidth);
     // Measured before the first paint, so a narrow window does not flash the wide layout.
     measure();
     if (typeof ResizeObserver !== 'function') return;
@@ -106,7 +102,7 @@ function useNarrow(root: RefObject<HTMLElement | null>): { narrow: boolean; widt
     observer.observe(element);
     return () => observer.disconnect();
   }, [root]);
-  return { narrow: width > 0 && width < NARROW_BELOW, width };
+  return { narrow: width > 0 && width < NARROW_BELOW, compact: width > 0 && width < COMPACT_BELOW, width };
 }
 
 /** Focus is nowhere in particular: on the page itself, as a closing palette or dialog leaves it. */
@@ -153,12 +149,21 @@ export function ConsolePage() {
   const { sessions, all } = useConsoleSessions(facets);
   const root = useRef<HTMLDivElement>(null);
   const measured = useNarrow(root);
-  const width = measured.width;
+  const { compact, width } = measured;
   const panes = usePanes();
-  const narrow = measured.narrow || (panes.filtersOpen && width > 0 && width < PANE_WIDTH.filters.min + PANE_WIDTH.list.min + PANE_MIN_WIDTH);
+  // In a compact console the filters show only when opened there, and closing or opening them
+  // there leaves the remembered choice alone; crossing the width starts afresh.
+  const [compactFilters, setCompactFilters] = useState(false);
+  const [wasCompact, setWasCompact] = useState(compact);
+  if (wasCompact !== compact) {
+    setWasCompact(compact);
+    setCompactFilters(false);
+  }
+  const filtersOpen = compact ? compactFilters : panes.filtersOpen;
+  const narrow = measured.narrow || (filtersOpen && width > 0 && width < PANE_WIDTH.filters.min + PANE_WIDTH.list.min + PANE_MIN_WIDTH);
   const filterMax = width > 0 ? Math.max(PANE_WIDTH.filters.min, width - PANE_WIDTH.list.min - PANE_MIN_WIDTH) : PANE_WIDTH.filters.max;
   const filterWidth = Math.min(panes.filtersWidth, filterMax);
-  const listMax = width > 0 ? Math.max(PANE_WIDTH.list.min, width - PANE_MIN_WIDTH - (panes.filtersOpen ? filterWidth : 0)) : PANE_WIDTH.list.max;
+  const listMax = width > 0 ? Math.max(PANE_WIDTH.list.min, width - PANE_MIN_WIDTH - (filtersOpen ? filterWidth : 0)) : PANE_WIDTH.list.max;
   const [narrowFilters, setNarrowFilters] = useState(false);
   const focusSoon = useFocusSoon();
 
@@ -255,8 +260,9 @@ export function ConsolePage() {
     return stops[next]?.target;
   };
 
-  const showFilters = (open: boolean) => (narrow ? setNarrowFilters(open) : panes.setFiltersOpen(open));
-  const filtersShown = narrow ? narrowFilters : panes.filtersOpen;
+  const showFilters = (open: boolean) =>
+    narrow ? setNarrowFilters(open) : compact ? setCompactFilters(open) : panes.setFiltersOpen(open);
+  const filtersShown = narrow ? narrowFilters : filtersOpen;
 
   // Requests from the palette (see intent.ts): this page may have just mounted for one.
   const apply = (intent: ConsoleIntent) => {
@@ -406,7 +412,7 @@ export function ConsolePage() {
 
   return (
     <div ref={root} data-console-layout="wide" onKeyDown={onKeyDown} className="flex h-full min-h-0 overflow-hidden">
-      {panes.filtersOpen && (
+      {filtersOpen && (
         <ResizablePanel
           as="section"
           side="left"

@@ -1,4 +1,4 @@
-// The last step: a short summary, then Home.
+// The last step: a short summary, the first things to do, then Home.
 
 import { useRouter } from '@tanstack/react-router';
 import { use } from 'react';
@@ -8,14 +8,26 @@ import { useShell } from '../../shell/store.ts';
 import { RegistryContext } from '../../shell/context.ts';
 import { useWizard } from '../wizard-context.tsx';
 
+/** The "+ New" entries offered as first steps (when registered and enabled), with their labels here. */
+const FIRST_STEPS: Partial<Record<string, string>> = { session: 'Start a session', task: 'Create a task' };
+
 export function DoneStep() {
   const { state } = useWizard();
   const ws = useWorkspaceId();
   const router = useRouter();
   const registry = use(RegistryContext);
+  // Each opens its "+ New" dialog on the page it belongs to. This step is gone by then, so the
+  // dialog gives focus back to that page, as the palette does after it navigates.
   const start = (id: string) => {
-    void router.navigate({ href: id === 'session' ? paths.console(ws) : paths.home(ws), replace: true }).then(() => useShell.getState().setCreating(id));
+    void router
+      .navigate({ href: id === 'session' ? paths.console(ws) : paths.home(ws), replace: true })
+      .then(() => useShell.getState().setCreating(id, document.getElementById('main')));
   };
+  // Inviting someone waits for invites: the hub has no way to add a person yet.
+  const firstSteps = (registry?.create ?? []).flatMap((entry) => {
+    const label = entry.disabled === undefined ? FIRST_STEPS[entry.id] : undefined;
+    return label === undefined ? [] : [{ id: entry.id, label }];
+  });
 
   const setup = state.setupResult;
   const projectCount = state.createResult?.projects.length ?? 0;
@@ -44,9 +56,13 @@ export function DoneStep() {
       </ul>
       <div className="mt-6 rounded-md border border-line bg-sidebar p-4">
         <h2 className="text-sm font-medium text-ink">What would you like to do first?</h2>
-        <p className="mt-1 text-xs text-ink-2">Start a session, create a task, or invite someone to work with you.</p>
+        <p className="mt-1 text-xs text-ink-2">Start an agent session, or create a task to work on.</p>
         <div className="mt-3 flex flex-wrap gap-2">
-          {registry?.create.filter((entry) => ['session', 'task', 'human', 'member'].includes(entry.id) && entry.disabled === undefined).map((entry) => <Button key={entry.id} onClick={() => start(entry.id)}>{entry.id === 'session' ? 'Start a session' : entry.id === 'task' ? 'Create a task' : 'Invite someone'}</Button>)}
+          {firstSteps.map((step) => (
+            <Button key={step.id} onClick={() => start(step.id)}>
+              {step.label}
+            </Button>
+          ))}
           <Button onClick={() => void router.navigate({ href: paths.console(ws), replace: true })}>Open agent sessions</Button>
         </div>
       </div>
