@@ -52,3 +52,26 @@ it('disables checking in unsigned builds and unsubscribes on unmount', async () 
   view.unmount();
   expect(ipc.off).toHaveBeenCalledOnce();
 });
+it('offers a portable copy its release page to download, never an install', async () => {
+  const portable = { enabled: true, prereleases: false, portable: true, version: '1.2.3', notesUrl: 'https://example.com/releases/v1.2.3', downloadUrl: 'https://example.com/releases/v1.2.3' };
+  ipc.invoke.mockResolvedValue(portable);
+  render(<DesktopUpdates><UpdateSettings /></DesktopUpdates>);
+  const download = await screen.findByRole('link', { name: 'Download' });
+  expect(download.getAttribute('href')).toBe('https://example.com/releases/v1.2.3');
+  expect(screen.getByText(/unzip it over this folder/)).toBeTruthy();
+  expect(screen.queryByRole('button', { name: 'Update' })).toBeNull();
+  expect(screen.queryByRole('link', { name: 'Release notes' })).toBeNull();
+  ipc.invoke.mockResolvedValue(undefined);
+  fireEvent.click(download);
+  await waitFor(() => expect(ipc.invoke).toHaveBeenCalledWith('gateway_update_notes', { version: '1.2.3' }));
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(ipc.invoke.mock.calls.some((c) => c[0] === 'gateway_update_install')).toBe(false);
+  expect(screen.getByText(/This is a portable copy: it never installs updates. Checks for new releases/)).toBeTruthy();
+});
+it('says a portable development build checks for nothing', async () => {
+  ipc.invoke.mockResolvedValue({ enabled: false, prereleases: false, portable: true });
+  render(<DesktopUpdates><UpdateSettings /></DesktopUpdates>);
+  await screen.findByText(/It is a development build, so it does not check for updates/);
+  expect(screen.queryByText(/Automatic updates are disabled in this build/)).toBeNull();
+  expect((screen.getByRole('button', { name: 'Check now' }) as HTMLButtonElement).disabled).toBe(true);
+});

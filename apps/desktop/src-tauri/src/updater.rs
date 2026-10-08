@@ -1,4 +1,11 @@
 //! Signed desktop updates, held in Rust until the person accepts the displayed version.
+//!
+//! A portable copy ([`crate::portable`]) never downloads or installs anything. One built from a
+//! release tag (its marker's release channel) checks GitHub's published releases for a newer one
+//! that carries the portable zip ([`PORTABLE_ASSET`]), with or without a compiled public key, and
+//! accepting it opens that release's page, where the zip is. A development build (from `main` or
+//! a pull request) offers nothing.
+use crate::portable::Channel;
 use crate::{app::MAIN, shell::Shell};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -10,12 +17,18 @@ use tauri_plugin_updater::{Update, UpdaterExt as _};
 const REPO: &str = "https://github.com/mahmoudibrahim98/pitcrew";
 const API: &str = "https://api.github.com/repos/mahmoudibrahim98/pitcrew/releases?per_page=100";
 const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
+/// The portable zip's name among a release's assets (`release.yml` attaches it).
+pub const PORTABLE_ASSET: &str = "pitcrew-windows-x64-portable.zip";
 
 /// Serializes checks, channel changes and installation; the UI holds no update resource.
 #[derive(Default)]
 pub struct Updates {
     gate: tokio::sync::Mutex<()>,
     pending: Mutex<Option<Update>>,
+    /// A portable copy's newer release, by version: shown, never installed.
+    portable_pending: Mutex<Option<String>>,
+    /// A portable copy's channel; `None` when installed.
+    portable: Option<Channel>,
 }
 impl std::fmt::Debug for Updates {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -23,10 +36,31 @@ impl std::fmt::Debug for Updates {
     }
 }
 impl Updates {
+    /// No pending update yet; `portable` is a portable copy's channel.
+    #[must_use]
+    pub fn new(portable: Option<Channel>) -> Self {
+        Self {
+            portable,
+            ..Self::default()
+        }
+    }
     fn pending(&self) -> MutexGuard<'_, Option<Update>> {
         self.pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn portable_pending(&self) -> MutexGuard<'_, Option<String>> {
+        self.portable_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    /// The version shown to the person, whichever way it was found.
+    fn pending_version(&self) -> Option<String> {
+        if self.portable.is_some() {
+            self.portable_pending().clone()
+        } else {
+            self.pending().as_ref().map(|u| u.version.clone())
+        }
     }
 }
 
@@ -36,10 +70,31 @@ impl Updates {
 pub struct Status {
     enabled: bool,
     prereleases: bool,
+    /// A portable copy: an update is shown, never installed.
+    portable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes_url: Option<String>,
+    /// A portable copy's pending update: its release's page, where the portable zip is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_url: Option<String>,
+}
+impl Status {
+    fn new(enabled: bool, prereleases: bool, portable: bool, version: Option<String>) -> Self {
+        Self {
+            enabled,
+            prereleases,
+            portable,
+            notes_url: version.as_deref().map(release_page),
+            download_url: version.as_deref().filter(|_| portable).map(release_page),
+            version,
+        }
+    }
+}
+/// A release's fixed GitHub page.
+fn release_page(version: &str) -> String {
+    format!("{REPO}/releases/tag/v{version}")
 }
 fn public_key<R: Runtime>(app: &AppHandle<R>) -> &str {
     app.config()
@@ -50,21 +105,57 @@ fn public_key<R: Runtime>(app: &AppHandle<R>) -> &str {
         .and_then(|v| v.as_str())
         .unwrap_or("")
 }
+/// Whether checks run: a release-channel portable copy always checks (it only shows a version
+/// and a fixed GitHub page), a development build never; an installed copy needs the compiled
+/// public key, and on Linux an AppImage.
+fn checks(portable: Option<Channel>, public_key: &str, appimage: bool) -> bool {
+    match portable {
+        Some(Channel::Release) => true,
+        Some(Channel::Development) => false,
+        None => !public_key.is_empty() && (!cfg!(target_os = "linux") || appimage),
+    }
+}
 fn enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
-    let key = public_key(app);
-    !key.is_empty() && (!cfg!(target_os = "linux") || std::env::var_os("APPIMAGE").is_some())
+    checks(
+        app.state::<Updates>().portable,
+        public_key(app),
+        std::env::var_os("APPIMAGE").is_some(),
+    )
 }
 fn status<R: Runtime>(app: &AppHandle<R>) -> Status {
-    let pending = app.state::<Updates>();
-    let version = pending.pending().as_ref().map(|u| u.version.clone());
-    Status {
-        enabled: enabled(app),
-        prereleases: app.state::<Shell>().preferences.get().update_prereleases,
-        notes_url: version
-            .as_ref()
-            .map(|v| format!("{REPO}/releases/tag/v{v}")),
-        version,
-    }
+    let updates = app.state::<Updates>();
+    Status::new(
+        enabled(app),
+        app.state::<Shell>().preferences.get().update_prereleases,
+        updates.portable.is_some(),
+        updates.pending_version(),
+    )
+}
+/// What accepting an update says in a portable copy, once the release's page is open.
+fn portable_answer(version: &str) -> String {
+    format!(
+        "PitCrew {version} is out. This portable copy does not install updates: its release page \
+         is open in your browser. Download {PORTABLE_ASSET} there, quit PitCrew and unzip it over \
+         this folder; your data and agent hooks stay as they are."
+    )
+}
+/// Opens `url`, a fixed GitHub page, in the system browser.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("/usr/bin/open");
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(url)
+        .spawn()
+        .map_err(|_| "Cannot open the page in the browser")?;
+    Ok(())
 }
 fn main_only<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
     if window.label() == MAIN {
@@ -87,15 +178,44 @@ struct Release {
 struct Asset {
     name: String,
 }
-fn select_release(text: &[u8], current: &Version) -> Result<Option<Version>, String> {
+/// The greatest version newer than `current` among the published releases in `text` that carry
+/// `asset`; pre-releases only with `prereleases`.
+fn select_release(
+    text: &[u8],
+    current: &Version,
+    asset: &str,
+    prereleases: bool,
+) -> Result<Option<Version>, String> {
     let releases: Vec<Release> =
         serde_json::from_slice(text).map_err(|_| "Invalid release list")?;
     Ok(releases
         .into_iter()
-        .filter(|r| !r.draft && r.assets.iter().any(|a| a.name == "latest.json"))
+        .filter(|r| !r.draft && r.assets.iter().any(|a| a.name == asset))
         .filter_map(|r| Version::parse(r.tag_name.strip_prefix('v')?).ok())
-        .filter(|v| newer(current, v, true))
+        .filter(|v| newer(current, v, prereleases))
         .max())
+}
+/// The latest 100 published releases, as GitHub's API lists them.
+async fn fetch_releases() -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::builder()
+        .user_agent("PitCrew updater")
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|_| "Cannot check releases")?;
+    let mut response = client
+        .get(API)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|_| "Cannot reach GitHub releases")?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "Cannot read releases")? {
+        if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
+            return Err("Release list is too large".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 async fn check<R: Runtime>(app: &AppHandle<R>) -> Result<Status, String> {
     let state = app.state::<Updates>();
@@ -110,28 +230,26 @@ async fn check_locked<R: Runtime>(app: &AppHandle<R>) -> Result<Status, String> 
         return Ok(status(app));
     }
     let prereleases = app.state::<Shell>().preferences.get().update_prereleases;
+    if app.state::<Updates>().portable.is_some() {
+        // A release-channel portable copy: no signed feed, only a release that carries the zip.
+        // No such release, or none newer, is no update.
+        let bytes = fetch_releases().await?;
+        let found = select_release(
+            &bytes,
+            &app.package_info().version,
+            PORTABLE_ASSET,
+            prereleases,
+        )?;
+        *app.state::<Updates>().portable_pending() = found.map(|v| v.to_string());
+        return publish(app);
+    }
     let mut endpoint = format!("{REPO}/releases/latest/download/latest.json");
     if prereleases {
-        let client = reqwest::Client::builder()
-            .user_agent("PitCrew updater")
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| "Cannot check releases")?;
-        let mut response = client
-            .get(API)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|_| "Cannot reach GitHub releases")?;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| "Cannot read releases")? {
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err("Release list is too large".into());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = fetch_releases().await?;
         // package_info is the compiled Tauri version, including the release build's override.
-        let Some(version) = select_release(&bytes, &app.package_info().version)? else {
+        let Some(version) =
+            select_release(&bytes, &app.package_info().version, "latest.json", true)?
+        else {
             *app.state::<Updates>().pending() = None;
             return publish(app);
         };
@@ -168,7 +286,7 @@ fn publish<R: Runtime>(app: &AppHandle<R>) -> Result<Status, String> {
 
 /// Starts the check loop; it never downloads or installs anything.
 pub fn start<R: Runtime>(app: &AppHandle<R>) {
-    app.manage(Updates::default());
+    app.manage(Updates::new(crate::portable::channel()));
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
@@ -213,6 +331,7 @@ pub async fn gateway_update_channel<R: Runtime>(
         .update(|p| p.update_prereleases = prereleases)
         .map_err(|_| "Cannot save update preferences")?;
     *state.pending() = None;
+    *state.portable_pending() = None;
     publish(&app)?;
     check_locked(&app).await
 }
@@ -228,6 +347,15 @@ pub async fn gateway_update_install<R: Runtime>(
         .gate
         .try_lock()
         .map_err(|_| "An update operation is already running")?;
+    if state.portable.is_some() {
+        // Never installed: the release's page opens instead, for the pending version only.
+        let version = state
+            .pending_version()
+            .filter(|pending| *pending == version)
+            .ok_or("This update is no longer available; check again")?;
+        open_in_browser(&release_page(&version))?;
+        return Err(portable_answer(&version));
+    }
     let update = state
         .pending()
         .as_ref()
@@ -289,28 +417,12 @@ pub fn gateway_update_notes<R: Runtime>(
     version: String,
 ) -> Result<(), String> {
     main_only(&window)?;
-    let state = app.state::<Updates>();
-    let pending = state.pending();
-    let update = pending
-        .as_ref()
-        .filter(|u| u.version == version)
+    let version = app
+        .state::<Updates>()
+        .pending_version()
+        .filter(|pending| *pending == version)
         .ok_or("Update no longer available")?;
-    let url = format!("{REPO}/releases/tag/v{}", update.version);
-    #[cfg(windows)]
-    let mut command = {
-        let mut c = std::process::Command::new("rundll32.exe");
-        c.arg("url.dll,FileProtocolHandler");
-        c
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("/usr/bin/open");
-    #[cfg(target_os = "linux")]
-    let mut command = std::process::Command::new("xdg-open");
-    command
-        .arg(url)
-        .spawn()
-        .map_err(|_| "Cannot open release notes")?;
-    Ok(())
+    open_in_browser(&release_page(&version)).map_err(|_| "Cannot open release notes".to_owned())
 }
 
 #[cfg(test)]
@@ -334,6 +446,86 @@ mod tests {
         }
     }
     #[test]
+    fn a_release_portable_copy_checks_without_a_key_a_development_one_never() {
+        let release = Some(Channel::Release);
+        let development = Some(Channel::Development);
+        assert!(checks(release, "", false));
+        assert!(checks(release, "key", true));
+        assert!(!checks(development, "key", true));
+        assert!(!checks(development, "", false));
+        assert!(!checks(None, "", true));
+        assert_eq!(checks(None, "key", false), !cfg!(target_os = "linux"));
+        assert!(checks(None, "key", true));
+    }
+    #[test]
+    fn a_portable_status_links_the_release_page_and_never_an_installer() {
+        let portable =
+            serde_json::to_value(Status::new(true, false, true, Some("1.2.3".into()))).unwrap();
+        assert_eq!(
+            portable,
+            serde_json::json!({
+                "enabled": true,
+                "prereleases": false,
+                "portable": true,
+                "version": "1.2.3",
+                "notesUrl": format!("{REPO}/releases/tag/v1.2.3"),
+                "downloadUrl": format!("{REPO}/releases/tag/v1.2.3"),
+            })
+        );
+        // A development build: no checks, nothing pending, no links.
+        assert_eq!(
+            serde_json::to_value(Status::new(false, true, true, None)).unwrap(),
+            serde_json::json!({ "enabled": false, "prereleases": true, "portable": true })
+        );
+        // Installed: the release notes, no download page.
+        assert_eq!(
+            serde_json::to_value(Status::new(true, false, false, Some("1.2.3".into()))).unwrap(),
+            serde_json::json!({
+                "enabled": true,
+                "prereleases": false,
+                "portable": false,
+                "version": "1.2.3",
+                "notesUrl": format!("{REPO}/releases/tag/v1.2.3"),
+            })
+        );
+        let answer = portable_answer("1.2.3");
+        assert!(answer.contains("PitCrew 1.2.3"), "{answer}");
+        assert!(answer.contains("does not install updates"), "{answer}");
+        assert!(answer.contains("unzip it over this folder"), "{answer}");
+        let updates = Updates::new(Some(Channel::Release));
+        assert_eq!(updates.portable, Some(Channel::Release));
+        assert_eq!(updates.pending_version(), None);
+        *updates.portable_pending() = Some("1.2.3".into());
+        assert_eq!(updates.pending_version().as_deref(), Some("1.2.3"));
+        // An installed copy never reads the portable slot.
+        assert_eq!(Updates::default().portable, None);
+    }
+    #[test]
+    fn a_portable_copy_is_offered_only_releases_that_carry_its_zip() {
+        let text = br#"[
+            {"tag_name":"v3.0.0","draft":true,"assets":[{"name":"pitcrew-windows-x64-portable.zip"}]},
+            {"tag_name":"v2.1.0-beta.1","draft":false,"assets":[{"name":"pitcrew-windows-x64-portable.zip"}]},
+            {"tag_name":"v2.0.0","draft":false,"assets":[{"name":"latest.json"}]},
+            {"tag_name":"v1.5.0","draft":false,"assets":[{"name":"latest.json"},{"name":"pitcrew-windows-x64-portable.zip"}]},
+            {"tag_name":"v0.9.0","draft":false,"assets":[{"name":"pitcrew-windows-x64-portable.zip"}]}
+        ]"#;
+        let current = Version::parse("1.0.0").unwrap();
+        let stable = select_release(text, &current, PORTABLE_ASSET, false).unwrap();
+        assert_eq!(stable, Some(Version::parse("1.5.0").unwrap()));
+        let pre = select_release(text, &current, PORTABLE_ASSET, true).unwrap();
+        assert_eq!(pre, Some(Version::parse("2.1.0-beta.1").unwrap()));
+        // Nothing newer with the zip, or no release at all: no update.
+        let newest = Version::parse("2.1.0").unwrap();
+        assert_eq!(
+            select_release(text, &newest, PORTABLE_ASSET, true).unwrap(),
+            None
+        );
+        assert_eq!(
+            select_release(b"[]", &current, PORTABLE_ASSET, false).unwrap(),
+            None
+        );
+    }
+    #[test]
     fn release_list_ignores_drafts_missing_feeds_and_bad_tags() {
         let text = br#"[
             {"tag_name":"v9.0.0","draft":true,"prerelease":false,"assets":[{"name":"latest.json"}]},
@@ -342,9 +534,17 @@ mod tests {
             {"tag_name":"../evil","draft":false,"prerelease":false,"assets":[{"name":"latest.json"}]}
         ]"#;
         assert_eq!(
-            select_release(text, &Version::parse("1.0.0").unwrap()).unwrap(),
+            select_release(text, &Version::parse("1.0.0").unwrap(), "latest.json", true).unwrap(),
             Some(Version::parse("2.0.0-beta.1").unwrap())
         );
-        assert!(select_release(b"{}", &Version::parse("1.0.0").unwrap()).is_err());
+        assert!(
+            select_release(
+                b"{}",
+                &Version::parse("1.0.0").unwrap(),
+                "latest.json",
+                true
+            )
+            .is_err()
+        );
     }
 }

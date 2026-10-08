@@ -2,7 +2,8 @@
 //! plugin uses them). A click on the toast, while the app runs, calls back with its target.
 //!
 //! A toast needs the AppUserModelID of an installed shortcut: the installer's, which is the app's
-//! identifier. A debug build is not installed, so it borrows PowerShell's, as Tauri's plugin does.
+//! identifier. A debug build and a portable copy ([`crate::portable`]) are not installed, so they
+//! borrow PowerShell's, as Tauri's plugin does.
 //! The text goes into the toast's XML as text (`SetInnerText`), never as markup.
 
 use super::{Notice, Notifier, OnClick};
@@ -26,10 +27,11 @@ impl fmt::Debug for ToastNotifier {
 }
 
 impl ToastNotifier {
-    /// Toasts as the app `identifier` (release builds) or as PowerShell (debug builds).
+    /// Toasts as the app `identifier` (installed release builds) or as PowerShell (debug builds
+    /// and portable copies).
     #[must_use]
     pub fn new(identifier: &str, on_click: OnClick, runtime: tokio::runtime::Handle) -> Self {
-        let app_id = if cfg!(debug_assertions) {
+        let app_id = if cfg!(debug_assertions) || crate::portable::here() {
             Toast::POWERSHELL_APP_ID.to_owned()
         } else {
             identifier.to_owned()
