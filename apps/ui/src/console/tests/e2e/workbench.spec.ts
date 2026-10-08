@@ -109,6 +109,15 @@ test('opens, splits, drags, and a reload restores the layout', async ({ page, re
   // Split right: the same session beside it, switched to its terminal.
   await pane(page, 1).getByRole('button', { name: 'Split right' }).click();
   await expect(pane(page, 2)).toBeVisible();
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await expect(page.locator('[data-split][data-stacked="true"]')).toHaveCount(1);
+  for (const number of [1, 2]) {
+    expect((await pane(page, number).boundingBox())?.width).toBeGreaterThanOrEqual(320);
+  }
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await expect(page.locator('[data-split][data-stacked="true"]')).toHaveCount(0);
+  await expect(tabs(page, 1)).toHaveCount(1);
+  await expect(tabs(page, 2)).toHaveCount(1);
   await pane(page, 2).getByRole('radio', { name: 'Terminal' }).click();
   await expect(pane(page, 2).getByRole('group', { name: 'Terminal' })).toBeVisible();
   await expect(pane(page, 1).getByRole('group', { name: 'Transcript' })).toBeVisible();
@@ -174,6 +183,38 @@ test('opens, splits, drags, and a reload restores the layout', async ({ page, re
   });
   await expect(pane(page, 2).getByRole('group', { name: 'Terminal' })).toBeVisible();
   await expect(tabs(page, 1).filter({ hasText: 'Draft method section' })).toHaveAttribute('aria-selected', 'true');
+});
+
+test('a dragged divider keeps each pane at its minimum width; a stacked split has no divider', async ({ page }) => {
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await openConsole(page, consolePath(SES1));
+  await expect(tabs(page, 1)).toHaveCount(1);
+  await pane(page, 1).getByRole('button', { name: 'Split right' }).click();
+  await expect(pane(page, 2)).toBeVisible();
+  const stacked = page.locator('[data-split][data-stacked="true"]');
+  await expect(stacked).toHaveCount(0);
+
+  // Dragged far past pane 1's minimum: the split stays side by side, pane 1 at its minimum.
+  const divider = page.getByRole('separator', { name: 'Resize the panes side by side' });
+  const box = await divider.boundingBox();
+  if (box === null) throw new Error('no divider');
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x - 900, box.y + box.height / 2, { steps: 12 });
+  await page.mouse.up();
+  await expect(stacked).toHaveCount(0);
+  const width = (await pane(page, 1).boundingBox())?.width ?? 0;
+  expect(width).toBeGreaterThanOrEqual(319);
+  expect(width).toBeLessThan(330);
+  const position = (await divider.getAttribute('aria-valuenow')) ?? '';
+
+  // Too narrow for both: stacked, with nothing to drag; wide again, the saved split is back.
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await expect(stacked).toHaveCount(1);
+  await expect(page.locator('[data-splitter]')).toHaveCount(0);
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await expect(stacked).toHaveCount(0);
+  await expect(divider).toHaveAttribute('aria-valuenow', position);
 });
 
 test('the keys and the palette switch, move and close tabs', async ({ page }) => {

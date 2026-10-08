@@ -1,5 +1,13 @@
 # shell (stream L)
 
+The loading screen appears while lazy routes load, with a static first-paint message in
+`index.html`. Navigation uses SVG icons even for entries that omit their own icon.
+The palette puts up to twelve recently visited live items first, scoped to the workspace;
+deleted items disappear. On an open task it focuses the existing status, assignee or dispatch
+control as it closes (so Radix's own focus return cannot take it back), and on an open session
+it opens the existing link dialog. No palette command silently submits a change. Arrows, Page
+Up/Down and Enter navigate the results; Home and End stay with the search text, moving its caret.
+
 The frame every feature lives in: the sidebar, the two layouts and their switcher, the
 workspace-scoped routes, the palette, the Orchestrator panel, "+ New", and the **feature
 registration interface** through which the console (M), projects (N) and onboarding (O) plug in.
@@ -11,7 +19,7 @@ See `docs/build/streams/L.md` and ADR-0008.
 | `index.ts` | What features import from the shell. |
 | `routes.tsx` | `createAppRouter(features)`: `/`, `/w/$ws` (the frame), the features' routes and the placeholders. |
 | `registry.ts` | Composes the shell's own feature with the registered ones; `servedPaths`, `withLayout`. |
-| `core.tsx` | The shell's own feature: Home, Inbox, My tasks, Agent console, its commands, placeholder routes and "+ New" dialogs. |
+| `core.tsx` | The shell's own feature: Home, Inbox, My tasks, Agent console, its commands and placeholder routes. |
 | `layout.ts` | Which layout is on, switching (`switchLayout`), and remembering where each layout was left. |
 | `store.ts` | UI state (zustand, persisted as `pitcrew.shell`). |
 | `frame.tsx`, `sidebar.tsx`, `projects-tree.tsx`, `top-bar.tsx`, `orchestrator.tsx`, `create.tsx` | The frame's parts. The frame sits in the workspace's data scope (`WorkspaceScope`, keyed by `$ws`). |
@@ -304,10 +312,10 @@ projects, workstreams, tasks (by key and title) and sessions from the live query
 
 ## "+ New"
 
-The shell has placeholder dialogs for `task`, `agent`, `project` and `team`. A feature's
-`CreateEntry` with the same `id` replaces the placeholder; other ids add items. `dialog` is the
-body (it gets `close()`); the shell supplies the modal, its title (`title`, default "New
-<label>"), focus handling and a Suspense boundary. The palette lists every item as "New …".
+Features register the items; the shell has none of its own. `dialog` is the body (it gets
+`close()`); the shell supplies the modal, its title (`title`, default "New <label>"), focus
+handling and a Suspense boundary. The palette lists every item as "New …". The projects tree's
+empty state offers "New project" only while an enabled `project` item is registered.
 
 An entry with `disabled` (a reason) shows in the menu disabled, with that reason as an accessible
 description; it stays focusable, so the reason is reachable from the keyboard, but selecting it

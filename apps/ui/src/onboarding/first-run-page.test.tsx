@@ -98,7 +98,7 @@ describe('the first-run route', () => {
     await screen.findByText('This will import 0 sessions.');
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     expect(screen.queryByRole('button', {name: 'Skip hooks'})).toBeNull();
-    await screen.findByLabelText('Let the back office accept low-risk actions automatically');
+    await screen.findByLabelText('Accept low-risk agent requests automatically');
     await waitFor(() => expect((screen.getByRole('button', {name: 'Continue'}) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole('button', {name: 'Continue'}));
     await heading("You're set up");

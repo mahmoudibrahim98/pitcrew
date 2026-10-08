@@ -75,6 +75,22 @@ test('the projects tree works from the keyboard', async ({ page }) => {
   await expect(paper).toBeFocused();
 });
 
+test('navigation uses icons and the palette reopens a recent project from the keyboard', async ({ page }) => {
+  await openShell(page);
+  for (const id of ['projects-list', 'members', 'calendar', 'integrations']) {
+    await expect(sidebar(page).locator(`[data-nav="${id}"] svg`)).toHaveCount(1);
+  }
+  await tree(page).getByRole('treeitem', { name: /^Paper · Diffusion study/ }).click();
+  await expect(heading(page, 'Paper · Diffusion study')).toBeVisible();
+  await sidebar(page).getByRole('link', { name: 'Home', exact: true }).click();
+  await expect(heading(page, 'Home')).toBeVisible();
+  await page.keyboard.press('Control+KeyK');
+  await expect(page.getByRole('option').first()).toContainText('Recent · Project');
+  await page.keyboard.press('Enter');
+  await expect(page).toHaveURL(new RegExp(`/projects/${PAPER}$`));
+  await expect(heading(page, 'Paper · Diffusion study')).toBeVisible();
+});
+
 test('Ctrl . switches layouts, and each layout reopens where it was left', async ({ page }) => {
   await openShell(page);
   await tree(page).getByRole('treeitem', { name: /^Tooling/ }).click();
@@ -147,6 +163,68 @@ test('Ctrl K opens the palette and jumps to PAP-4', async ({ page }, info) => {
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(search).toBeFocused();
+});
+
+test("the first paint's colours give way to the app's theme, even against the system's", async ({ page }) => {
+  // The splash (public/splash.css) follows the system; the app is set to the opposite.
+  for (const [system, theme] of [['dark', 'light'], ['light', 'dark']] as const) {
+    await page.emulateMedia({ colorScheme: system });
+    await page.addInitScript((choice) => {
+      window.localStorage.setItem('pitcrew.theme', JSON.stringify({ state: { theme: choice }, version: 0 }));
+    }, theme);
+    await openShell(page);
+    await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+    const colours = await page.evaluate(() => {
+      const probe = document.createElement('span');
+      probe.style.color = 'var(--pc-ink)';
+      probe.style.backgroundColor = 'var(--pc-bg)';
+      document.body.append(probe);
+      const root = getComputedStyle(document.documentElement);
+      const want = getComputedStyle(probe);
+      const out = { color: [root.color, want.color], background: [root.backgroundColor, want.backgroundColor] };
+      probe.remove();
+      return out;
+    });
+    expect(colours.color[0]).toBe(colours.color[1]);
+    expect(colours.background[0]).toBe(colours.background[1]);
+  }
+});
+
+test("the palette's actions on the open task focus its controls; Home and End stay in the text", async ({ page }) => {
+  await openShell(page);
+  const input = page.getByRole('combobox', { name: 'Search' });
+  await page.keyboard.press('Control+KeyK');
+  await expect(input).toBeFocused();
+  await page.keyboard.type('PAP-4');
+  await expect(page.getByRole('option').first()).toContainText('PAP-4');
+  await page.keyboard.press('Enter');
+  await expect(heading(page, /^PAP-4 · Run seeds/)).toBeVisible();
+
+  for (const [label, field] of [['Move open task', 'Status'], ['Assign open task', 'Assignee']] as const) {
+    const control = page.locator(`#main select[aria-label="${field}"]`);
+    await expect(control).toBeEnabled();
+    await page.keyboard.press('Control+KeyK');
+    await expect(input).toBeFocused();
+    await page.keyboard.type(label);
+    await expect(page.getByRole('option').first()).toContainText(label);
+    await page.keyboard.press('Enter');
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(control).toBeFocused();
+    // And it stays there: nothing hands focus back to what had it before the palette.
+    await page.evaluate(() => new Promise((done) => setTimeout(done, 200)));
+    await expect(control).toBeFocused();
+  }
+
+  // Home and End move the caret in the search text.
+  await page.keyboard.press('Control+KeyK');
+  await expect(input).toBeFocused();
+  await page.keyboard.type('seed');
+  await page.keyboard.press('Home');
+  expect(await input.evaluate((field: HTMLInputElement) => field.selectionStart)).toBe(0);
+  await page.keyboard.press('End');
+  expect(await input.evaluate((field: HTMLInputElement) => field.selectionStart)).toBe(4);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
 });
 
 test('Ctrl J opens the Orchestrator panel; it resizes and stays open after a reload', async ({ page }) => {

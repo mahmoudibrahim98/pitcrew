@@ -51,7 +51,7 @@ export const RESERVED_HANDLES: readonly string[] = ['@office'];
 export function checkHandle(handle: string): string | undefined {
   if (handle === '') return 'Give yourself a handle.';
   if (!HANDLE.test(handle)) return 'A handle is "@" and 1 to 32 lower-case letters, digits, "_" or "-".';
-  if (RESERVED_HANDLES.includes(handle)) return `${handle} is the back office’s handle. Choose another.`;
+  if (RESERVED_HANDLES.includes(handle)) return `${handle} is reserved for automatic request handling. Choose another.`;
   return undefined;
 }
 

@@ -28,6 +28,9 @@ import {
   shiftTab,
   splitGroup,
   stepGroup,
+  minimumWidth,
+  PANE_MIN_WIDTH,
+  splitFits,
   stepTab,
   toStored,
   type Layout,
@@ -270,6 +273,41 @@ describe('the layout model', () => {
     expect(sizes(resizeSplit(layout, id, 0, -2))).toEqual([LIMITS.minSize, 1 - LIMITS.minSize]);
     expect(resizeSplit(layout, id, 0, Number.NaN)).toBe(layout);
     expect(resizeSplit(layout, 'nope', 0, 0.1)).toBe(layout);
+  });
+
+  it('stacks a row split only when its panes cannot all have their minimum width', () => {
+    const one = openTab(emptyLayout(), file('a'));
+    const [layout] = splitGroup(one, one.activeGroup, 'right');
+    const split = layout.root as Split;
+    expect(minimumWidth(split)).toBe(2 * PANE_MIN_WIDTH);
+    expect(splitFits(split, 2 * PANE_MIN_WIDTH - 1)).toBe(false);
+    expect(splitFits(split, 2 * PANE_MIN_WIDTH)).toBe(true);
+    // The saved shares do not decide it: a divider dragged far over never stacks the split.
+    expect(splitFits({ ...split, sizes: [0.1, 0.9] }, 1000)).toBe(true);
+    expect(splitFits({ ...split, direction: 'column' }, 400)).toBe(true);
+    // Not measured yet.
+    expect(splitFits(split, 0)).toBe(true);
+    // Nested rows add up; a column needs only its widest child.
+    const nested = openTab(layout, file('b'), { side: 'right' });
+    expect(minimumWidth(nested.root)).toBe(3 * PANE_MIN_WIDTH);
+    expect(minimumWidth(openTab(layout, file('c'), { side: 'down' }).root)).toBe(2 * PANE_MIN_WIDTH);
+  });
+
+  it('keeps each side of a row split at its minimum width while resizing', () => {
+    let layout = openTab(emptyLayout(), file('a'));
+    [layout] = splitGroup(layout, layout.activeGroup, 'right');
+    const id = layout.root.id;
+    const sizes = (l: Layout) => (l.root as Split).sizes.map((s) => Math.round(s * 100) / 100);
+    // 1000 px wide: each pane needs 0.32 of it, by drag or by Home and End.
+    expect(sizes(resizeSplit(layout, id, 0, -1, 1000))).toEqual([0.32, 0.68]);
+    expect(sizes(resizeSplit(layout, id, 0, 1, 1000))).toEqual([0.68, 0.32]);
+    expect(sizes(resizeSplit(layout, id, 0, 0.1, 1000))).toEqual([0.6, 0.4]);
+    // Unmeasured, or too narrow for both minimums (drawn stacked): only the share floor applies.
+    expect(sizes(resizeSplit(layout, id, 0, -1))).toEqual([LIMITS.minSize, 1 - LIMITS.minSize]);
+    expect(sizes(resizeSplit(layout, id, 0, -1, 500))).toEqual([LIMITS.minSize, 1 - LIMITS.minSize]);
+    // A stacked (column) split keeps the share floor only.
+    const column = { ...layout, root: { ...(layout.root as Split), direction: 'column' as const } };
+    expect(sizes(resizeSplit(column, id, 0, -1, 1000))).toEqual([LIMITS.minSize, 1 - LIMITS.minSize]);
   });
 
   it('keeps the details sidebar in range', () => {

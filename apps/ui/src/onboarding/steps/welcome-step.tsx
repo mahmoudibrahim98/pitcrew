@@ -2,7 +2,7 @@
 // the rest of the app reads, so the choice is visible immediately.
 
 import { RadioGroup } from 'radix-ui';
-import { applyTheme, useTheme, type ThemeChoice } from '../../design/index.ts';
+import { applyTheme, ConsoleIcon, FolderIcon, CheckCircleIcon, useTheme, type ThemeChoice } from '../../design/index.ts';
 import { cx } from '../../lib/cx.ts';
 import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
@@ -34,6 +34,14 @@ export function WelcomeStep() {
         PitCrew tracks your AI coding agents across every machine you work on. Let's get your first
         workspace set up.
       </p>
+
+      <figure aria-label="Agents on your machines feed sessions into projects and tasks" className="mt-5 flex items-center justify-between gap-3 rounded-lg border border-line bg-sidebar p-5 text-ink">
+        <span className="flex flex-col items-center gap-2 text-xs"><ConsoleIcon className="size-7" />Your agents</span>
+        <span aria-hidden className="text-ink-2">→</span>
+        <span className="flex flex-col items-center gap-2 text-xs"><FolderIcon className="size-7" />One workspace</span>
+        <span aria-hidden className="text-ink-2">→</span>
+        <span className="flex flex-col items-center gap-2 text-xs"><CheckCircleIcon className="size-7" />Work you can follow</span>
+      </figure>
 
       <fieldset className="mt-6 flex flex-col gap-2">
         <legend className="text-sm font-medium text-ink">Theme</legend>

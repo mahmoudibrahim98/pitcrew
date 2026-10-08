@@ -72,6 +72,24 @@ export const LIMITS = {
 } as const;
 
 export const DETAILS_WIDTH = { min: 240, max: 520, initial: 300 } as const;
+/** No pane is drawn narrower than this; a row split that cannot give each pane this much stacks. */
+export const PANE_MIN_WIDTH = 320;
+
+/** The narrowest a node can be drawn side by side: its panes' minimums, added up across rows. */
+export function minimumWidth(node: LayoutNode): number {
+  if (node.type === 'group') return PANE_MIN_WIDTH;
+  const widths = node.children.map(minimumWidth);
+  return node.direction === 'row' ? widths.reduce((a, b) => a + b, 0) : Math.max(...widths);
+}
+
+/**
+ * Whether a split can be drawn as saved in `width` pixels (0: not measured yet). Only the total
+ * matters, not the saved shares: dragging a divider never turns a row into a stack, and the view
+ * keeps each pane at its minimum width.
+ */
+export function splitFits(split: Split, width: number): boolean {
+  return width <= 0 || split.direction === 'column' || width >= minimumWidth(split);
+}
 
 // ─── Reading ────────────────────────────────────────────────────────────────────────────────────
 
@@ -500,9 +518,10 @@ export function shiftTab(layout: Layout, groupId: string, tabId: string, step: 1
 
 /**
  * Moves the boundary between child `index` and `index + 1` of split `splitId` by `delta` (a share
- * of the split), keeping both sides at least `LIMITS.minSize`.
+ * of the split), keeping both sides at least `LIMITS.minSize`. Given the split's `width` in pixels,
+ * a row split also keeps each side at its minimum width (`minimumWidth`) where both can have it.
  */
-export function resizeSplit(layout: Layout, splitId: string, index: number, delta: number): Layout {
+export function resizeSplit(layout: Layout, splitId: string, index: number, delta: number, width = 0): Layout {
   let changed = false;
   const walk = (node: LayoutNode): LayoutNode => {
     if (node.type === 'group') return node;
@@ -514,7 +533,13 @@ export function resizeSplit(layout: Layout, splitId: string, index: number, delt
     const b = node.sizes[index + 1];
     if (a === undefined || b === undefined || !Number.isFinite(delta)) return node;
     const pair = a + b;
-    const nextA = Math.min(pair - LIMITS.minSize, Math.max(LIMITS.minSize, a + delta));
+    const share = (child: LayoutNode | undefined) =>
+      node.direction === 'row' && width > 0 && child !== undefined ? minimumWidth(child) / width : 0;
+    let low = Math.max(LIMITS.minSize, share(node.children[index]));
+    let high = pair - Math.max(LIMITS.minSize, share(node.children[index + 1]));
+    // Too narrow for both minimums: the view stacks this split, so the shares only keep their floor.
+    if (low > high) [low, high] = [LIMITS.minSize, pair - LIMITS.minSize];
+    const nextA = Math.min(high, Math.max(low, a + delta));
     if (Math.abs(nextA - a) < 1e-9) return node;
     changed = true;
     const sizes = [...node.sizes];

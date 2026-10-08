@@ -54,7 +54,7 @@ import { paths, type CommandContext } from '../../shell/index.ts';
 import { createAppRouter } from '../../shell/routes.tsx';
 import { initialShellState, useShell } from '../../shell/store.ts';
 import { feature } from '../index.ts';
-import { initialPanes, NARROW_BELOW, PANE_WIDTH, usePanes } from '../panes.ts';
+import { COMPACT_BELOW, initialPanes, NARROW_BELOW, PANE_WIDTH, usePanes } from '../panes.ts';
 import { clearDrafts } from '../workbench/drafts.ts';
 import { resetWorkbenchStores } from '../workbench/store.ts';
 import { eventually, ID, renderWithHub, startHub, stubLayout, unmountAndSettle, type HubProcess } from './harness.tsx';
@@ -269,6 +269,46 @@ describe('the Agent console', () => {
       else Object.defineProperty(HTMLElement.prototype, 'clientWidth', saved);
     }
   }, 20_000);
+
+  it('folds the filters away in a compact console, without changing the remembered choice', async () => {
+    const saved = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
+    let width = COMPACT_BELOW - 40;
+    Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
+      configurable: true,
+      get(this: HTMLElement) {
+        return this.hasAttribute('data-console-layout') ? width : 0;
+      },
+    });
+    const filtersGroup = () => screen.queryByRole('group', { name: 'Session filters' });
+    try {
+      renderConsole(`/w/${WS}/console`);
+      await screen.findByRole('listbox', { name: 'Sessions' }, { timeout: 8_000 });
+      expect(document.querySelector('[data-console-layout]')?.getAttribute('data-console-layout')).toBe('wide');
+      const toggle = screen.getByRole('button', { name: 'Filters' });
+      expect(toggle.getAttribute('aria-pressed')).toBe('false');
+      expect(filtersGroup()).toBeNull();
+      expect(usePanes.getState().filtersOpen).toBe(true);
+
+      // Opened and closed here: shown while open, and the remembered choice stays as it was.
+      fireEvent.click(toggle);
+      await screen.findByRole('group', { name: 'Session filters' });
+      expect(toggle.getAttribute('aria-pressed')).toBe('true');
+      fireEvent.click(toggle);
+      expect(filtersGroup()).toBeNull();
+      expect(usePanes.getState().filtersOpen).toBe(true);
+      expect(localStorage.getItem('pitcrew.console') ?? '').not.toContain('"filtersOpen":false');
+
+      // A wide console shows them again, as remembered.
+      await unmountAndSettle();
+      width = COMPACT_BELOW + 400;
+      renderConsole(`/w/${WS}/console`);
+      await screen.findByRole('group', { name: 'Session filters' }, { timeout: 8_000 });
+      expect(screen.getByRole('button', { name: 'Filters' }).getAttribute('aria-pressed')).toBe('true');
+    } finally {
+      if (saved === undefined) Reflect.deleteProperty(HTMLElement.prototype, 'clientWidth');
+      else Object.defineProperty(HTMLElement.prototype, 'clientWidth', saved);
+    }
+  }, 30_000);
 
   it('remembers the pane sizes and whether the filters show', async () => {
     renderConsole(`/w/${WS}/console`);

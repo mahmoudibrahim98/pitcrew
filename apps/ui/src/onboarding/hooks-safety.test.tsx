@@ -17,6 +17,10 @@ it('only confirms the displayed revision and refreshes after stale refusal', asy
   const api = { ...createFakeOnboardingApi({ speed: 0 }), hooksDiff, installHooks };
   render(<OnboardingApiProvider api={api}><WizardProvider><HooksStep /></WizardProvider></OnboardingApiProvider>);
   await screen.findByText('/home/sam/.codex/config.toml');
+  const disclosure = screen.getByText('/home/sam/.codex/config.toml').closest('details');
+  expect(disclosure).toHaveProperty('open', false);
+  fireEvent.click(disclosure?.querySelector('summary') as HTMLElement);
+  expect(screen.getByLabelText('Diff: /home/sam/.codex/config.toml').textContent).toContain('+after');
   expect(installHooks).not.toHaveBeenCalled();
   fireEvent.click(screen.getByRole('button', { name: 'Install hooks' }));
   await screen.findByRole('alert');
@@ -58,8 +62,32 @@ it('does not install an empty preview and allows nonconflicting files', async ()
   cleanup();
   api.hooksDiff.mockResolvedValue({ revision: 'mixed', engines: [{engine: 'codex', status: 'conflicting', detail: 'Foreign notify.'}], files: [{path: '/home/sam/.config/opencode/plugin/pitcrew.js', before: null, after: 'synthetic plugin'}] });
   render(<OnboardingApiProvider api={api}><WizardProvider><HooksStep /></WizardProvider></OnboardingApiProvider>);
-  await screen.findByText('codex: Foreign notify.');
+  // The engine by its name, not the hub's id.
+  await screen.findByText('Codex: Foreign notify.');
   expect(screen.getByRole('button', { name: 'Install hooks' })).toHaveProperty('disabled', false);
   fireEvent.click(screen.getByRole('button', { name: 'Install hooks' }));
   await waitFor(() => expect(installHooks).toHaveBeenCalledOnce());
+});
+
+it('says in plain words what installing does for each engine, with the detail where it matters', async () => {
+  const preview = {
+    revision: 'plans',
+    engines: [
+      { engine: 'claude', status: 'partial', detail: 'Synthetic: 3 of 5 events wired up.' },
+      { engine: 'codex', status: 'stale', detail: 'Synthetic: the executable path changed.' },
+      { engine: 'opencode', status: 'missing', detail: 'Synthetic plugin.' },
+      { engine: 'example-cli', status: 'missing', detail: 'Synthetic: a CLI this build does not know.' },
+    ],
+    files: [{ path: '/home/sam/.claude/settings.json', before: '{}', after: '{"hooks":{}}' }],
+  };
+  const api = { ...createFakeOnboardingApi({ speed: 0 }), hooksDiff: vi.fn().mockResolvedValue(preview) };
+  render(<OnboardingApiProvider api={api}><WizardProvider><HooksStep /></WizardProvider></OnboardingApiProvider>);
+  await screen.findByText('Some Claude Code hooks are installed; this adds the rest.');
+  expect(screen.getByText('Synthetic: 3 of 5 events wired up.')).toBeTruthy();
+  expect(screen.getByText('Codex hooks are out of date; this updates them.')).toBeTruthy();
+  expect(screen.getByText('Synthetic: the executable path changed.')).toBeTruthy();
+  expect(screen.getByText('Adds an OpenCode plugin to report session activity to PitCrew.')).toBeTruthy();
+  expect(screen.queryByText('Synthetic plugin.')).toBeNull();
+  expect(screen.getByText('Adds hooks to example-cli.')).toBeTruthy();
+  expect(screen.getByText('Synthetic: a CLI this build does not know.')).toBeTruthy();
 });

@@ -182,7 +182,7 @@ function Field({
         maxLength={max === undefined ? 64 : max * 2}
         onChange={(event) => onChange(event.target.value)}
         className={cx(
-          'h-8 rounded-sm border bg-card px-2.5 text-sm text-ink outline-none focus-visible:border-accent',
+          'h-8 rounded-sm border bg-card px-2.5 text-sm text-ink outline-none placeholder:italic placeholder:text-ink-2 focus-visible:border-accent',
           error === undefined ? 'border-line-2' : 'border-risk',
         )}
       />
