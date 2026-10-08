@@ -343,7 +343,8 @@ interface NavigateTarget {
 ## Desktop updates
 
 Main window only; no updater plugin permissions are granted to the webview.
-`gateway_update_status()` returns `{ enabled, prereleases, version?: string, notesUrl?: string }`.
+`gateway_update_status()` returns `{ enabled, prereleases, portable: boolean, version?: string,
+notesUrl?: string, downloadUrl?: string }`.
 `gateway_update_check()` checks now and returns the same status.
 `gateway_update_channel({ prereleases: boolean })` saves the choice (default false), discards
 the pending update, and checks again. `gateway://update` carries the status after each check.
@@ -359,6 +360,14 @@ Stable checks use the GitHub latest release's `latest.json`; opting in selects t
 eligible semantic version with a feed from GitHub's latest 100 published releases, including
 pre-releases. Downgrades and equal versions are never offered. Linux self-update is for
 AppImage installs; deb/rpm users update through their package manager.
+
+**A portable copy** (`portable.txt` next to the app's executable: the portable Windows zip) has
+`portable: true`. It checks whether or not a public key is compiled in (`enabled` is always true),
+but never downloads or installs: `gateway_update_install` for the pending version opens the fixed
+page of the portable workflow's successful runs on `main` (where the newest
+`pitcrew-windows-x64-portable.zip` is) in the system browser, and fails with a sentence saying
+so, for the UI to show. While an update is pending, `downloadUrl` is that page (portable copies
+only). An installed copy has `portable: false` and no `downloadUrl`.
 
 ## Security notes
 
