@@ -78,11 +78,12 @@ export function useSessions(filters: SessionFilters = {}) {
   });
 }
 
-export function useSession(id: string) {
+export function useSession(id: string | undefined) {
   const api = useApi();
   return useLiveQuery({
-    queryKey: keys.sessions.detail(id),
-    queryFn: ({ signal }) => api.session(id, signal),
+    queryKey: keys.sessions.detail(id ?? ''),
+    queryFn: ({ signal }) => api.session(id ?? '', signal),
+    enabled: id !== undefined,
   });
 }
 

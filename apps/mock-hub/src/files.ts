@@ -1,5 +1,6 @@
 // Device-only in-memory file trees, scoped by machine and stored location root.
 import { createHash } from 'node:crypto';
+import { ignoreMatcher } from './file-ignore.ts';
 import type { Hub } from './state.ts';
 import { ApiFailure, forbidden, invalid, isRecord, notFound } from './validate.ts';
 
@@ -14,7 +15,12 @@ function tree(hub: Hub, key: string): Map<string, Entry> {
   if (!entries) {
     entries = new Map([
       ['', { kind: 'folder', bytes: Buffer.alloc(0), at: 0 }],
+      ['.git', { kind: 'file', bytes: Buffer.from('synthetic git worktree marker'), at: 0 }],
+      ['.gitignore', { kind: 'file', bytes: Buffer.from('*.log\n'), at: 0 }],
+      ['debug.log', { kind: 'file', bytes: Buffer.from('synthetic ignored file'), at: 0 }],
       ['src', { kind: 'folder', bytes: Buffer.alloc(0), at: 0 }],
+      ['sections', { kind: 'folder', bytes: Buffer.alloc(0), at: 0 }],
+      ['sections/method.tex', { kind: 'file', bytes: Buffer.from(Array.from({ length: 40 }, (_, i) => `Synthetic method line ${i + 1}`).join('\n')), at: 0 }],
       ['src/hello.txt', { kind: 'file', bytes: Buffer.from('hello\n'), at: 0 }],
       ['large.bin', { kind: 'file', bytes: Buffer.alloc(CAP + 1), at: 0 }],
       ['outside', { kind: 'link', bytes: Buffer.alloc(0), at: 0 }],
@@ -60,8 +66,14 @@ export function files(hub: Hub, id: string, query: URLSearchParams, body: unknow
     if (!entry) throw notFound('Directory not found.');
     if (entry.kind !== 'folder') throw invalid('Not a directory.');
     const prefix = path ? `${path}/` : '';
+    const ignored = ignoreMatcher(path, p => {
+      const entry = entries.get(p);
+      if (entry?.kind !== 'file') return undefined;
+      const text = entry.bytes.toString('utf8');
+      return Buffer.from(text).equals(entry.bytes) ? text : undefined;
+    });
     const all = [...entries].filter(([p]) => p.startsWith(prefix) && p !== path && !p.slice(prefix.length).includes('/'))
-      .map(([p, e]) => ({ name: p.slice(prefix.length), kind: e.kind, size: e.bytes.length, modified_at: e.at }))
+      .map(([p, e]) => ({ name: p.slice(prefix.length), kind: e.kind, size: e.bytes.length, modified_at: e.at, ignored: ignored(p, e.kind === 'folder') }))
       .sort((a,b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
     return { status: 200, body: { entries: all.slice(0, 5000), truncated: all.length > 5000 } };
   }

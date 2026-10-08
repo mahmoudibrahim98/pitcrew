@@ -11,12 +11,14 @@ import { getDraft, setDraft, useDrafts } from './drafts.ts';
 export interface FileTabProps {
   ws: string;
   tabId: string;
+  paneNumber: number;
   workstream: string;
   location: number;
   path: string;
+  line?: number | undefined;
 }
 
-export function FileTab({ ws, tabId, workstream, location, path }: FileTabProps) {
+export function FileTab({ ws, tabId, paneNumber, workstream, location, path, line }: FileTabProps) {
   const api = useApi();
   const client = useMemo(() => fileClient(api, workstream, location), [api, workstream, location]);
   const stream = useWorkstreamById(workstream).data;
@@ -39,6 +41,10 @@ export function FileTab({ ws, tabId, workstream, location, path }: FileTabProps)
           <FileViewer
             client={client}
             path={path}
+            line={line}
+            breadcrumbsLabel={`File breadcrumbs in pane ${paneNumber}`}
+            copyPath={folder === undefined ? path : `${folder.replace(/[\\/]$/, '')}/${path}`}
+            onFolder={(directory) => window.dispatchEvent(new CustomEvent('pitcrew:file-folder', { detail: { workstream, location, directory } }))}
             draft={draft}
             onDraftChange={(next) => setDraft(ws, tabId, next)}
           />

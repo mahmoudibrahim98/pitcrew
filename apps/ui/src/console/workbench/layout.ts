@@ -16,7 +16,7 @@ export const SESSION_VIEWS: readonly SessionView[] = ['chat', 'terminal', 'work'
 
 export type TabRef =
   | { kind: 'session'; session: string; view: SessionView }
-  | { kind: 'file'; workstream: string; location: number; path: string };
+  | { kind: 'file'; workstream: string; location: number; path: string; line?: number };
 
 export interface Tab {
   id: string;
@@ -289,7 +289,7 @@ export function openTab(
   const group = findGroup(layout, groupId);
   if (group === undefined) return layout;
   const existing = group.tabs.find((t) => sameRef(t.ref, ref));
-  if (existing !== undefined) return activateIn(layout, groupId, existing.id, keepTab);
+  if (existing !== undefined) return activateIn(layout, groupId, existing.id, tab => ref.kind === 'file' && tab.ref.kind === 'file' && ref.line !== undefined && ref.line !== tab.ref.line ? ({ ...keepTab(tab), ref }) : keepTab(tab));
   return openIn(layout, groupId, ref, false);
 }
 
@@ -561,7 +561,8 @@ function parseRef(raw: unknown): TabRef | undefined {
     const { workstream, location, path } = raw;
     if (!isText(workstream, LIMITS.idLength) || !isText(path, LIMITS.pathLength)) return undefined;
     if (typeof location !== 'number' || !Number.isSafeInteger(location) || location < 0) return undefined;
-    return { kind: 'file', workstream, location, path };
+    if (raw.line !== undefined && (typeof raw.line !== 'number' || !Number.isSafeInteger(raw.line) || raw.line < 1)) return undefined;
+    return { kind: 'file', workstream, location, path, ...(raw.line === undefined ? {} : { line: raw.line as number }) };
   }
   return undefined;
 }

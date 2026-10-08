@@ -268,6 +268,15 @@ test.tsx`'s proposal tests use the mock's demo data (the PAP project brief has a
 for Accept and Keep current; a `next` step on the proposal itself is injected at the `fetch` layer
 (`withProposedNext`) since that fixture's own proposal has none.
 
+## Files everywhere
+
+The workspace sidebar’s Files entry opens `files-page.tsx`, with a workstream picker.
+Workstream pages expose `file-explorer.tsx` beside their work; the Files tab keeps its
+inline viewer and can open that file in the console workbench. `file-search.ts` bounds
+recursive filename search across locations, skips links, and ranks fuzzy matches.
+`file-breadcrumbs.tsx` provides folder navigation and full-path copying. Hidden dot
+names and the API’s ignored hints are off by default and can be shown explicitly.
+The shared viewer accepts an optional line target, including virtualized text.
 ## Start session
 
 A workstream's **Start session** opens the console's shared New session dialog with its

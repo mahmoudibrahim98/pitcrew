@@ -1,5 +1,18 @@
 # console (stream M)
 
+Files are reachable from the workspace sidebar and the active workbench's Explorer panel,
+without opening session details. It collapses, lists locations with file-type icons, hides
+dot names and `.gitignore` matches by default, and offers Show hidden. Ctrl P (Cmd P on macOS)
+searches filenames across the current workstream's locations; terminal control keeps that key.
+The search examines at most 128 directories and 5,000 entries, never follows links, and reports
+truncated or unavailable folders. Search results and explorer files use the existing tabs and splits.
+
+Read, Edit and Write transcript calls expose file links where a path resolves inside a location
+on the session's machine. Edit receipts target the first changed line; new-side diff line numbers
+can open a specific line. File tabs retain line targets across reloads and splits, show breadcrumbs,
+and copy the full location path. Contents and drafts retain the existing revision/conflict behavior.
+The desktop's Reveal in folder and Open in editor actions are deferred to a desktop-shell brief.
+
 The Agent console. See `docs/build/streams/M.md`. `index.ts` registers it with the shell (`feature`)
 and exports its components. The app imports `index.ts` at start, so it stays small: the page and
 every component are lazy chunks (render the components inside a `<Suspense>`).

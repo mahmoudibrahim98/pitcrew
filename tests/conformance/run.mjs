@@ -101,6 +101,9 @@ try {
   await mkdir(join(filesRoot, 'src'), { recursive: true });
   await mkdir(outside);
   await writeFile(join(filesRoot, 'src', 'hello.txt'), 'hello\n');
+  await writeFile(join(filesRoot, '.git'), 'synthetic git worktree marker');
+  await writeFile(join(filesRoot, '.gitignore'), '*.log\n');
+  await writeFile(join(filesRoot, 'debug.log'), 'synthetic ignored file');
   await writeFile(join(filesRoot, 'large.bin'), Buffer.alloc(8 * 1024 * 1024 + 1));
   await writeFile(join(outside, 'secret'), 'synthetic outside');
   try {

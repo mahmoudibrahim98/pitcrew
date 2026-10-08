@@ -15,6 +15,7 @@ function projectsRoutes(parent: WorkspaceRoute): AnyRoute[] {
   });
   return [
     projectsLayout.addChildren([
+      createRoute({ getParentRoute: () => projectsLayout, path: 'files', staticData: { layout: 'both', title: 'Files' }, component: lazyRouteComponent(() => import('./files-page.tsx'), 'FilesPage') }),
       createRoute({
         getParentRoute: () => projectsLayout,
         path: 'home',

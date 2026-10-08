@@ -11,6 +11,9 @@ fn device_files_routes_resolve_roots_and_enforce_limits() -> Result<(), Box<dyn 
     let root = tmp.path().join("files");
     fs::create_dir(&root)?;
     fs::write(root.join("hello.txt"), "hello")?;
+    fs::write(root.join(".gitignore"), "*.log\n")?;
+    fs::write(root.join(".git"), "synthetic worktree marker")?;
+    fs::write(root.join("debug.log"), "synthetic ignored file")?;
     fs::File::create(root.join("large"))?.set_len(8 * 1024 * 1024 + 1)?;
     let mut daemon = Daemon::start(
         &tmp.path().join("state"),
@@ -27,6 +30,20 @@ fn device_files_routes_resolve_roots_and_enforce_limits() -> Result<(), Box<dyn 
     let list = format!("/v1/workstreams/{stream_id}/files?loc=0&path=");
     let file = format!("/v1/workstreams/{stream_id}/files/content?loc=0&path=hello.txt");
     assert_eq!(daemon.get(&list, Some(&token)).status, 200);
+    let entries = daemon.get(&list, Some(&token)).json();
+    let entries = entries["entries"].as_array().expect("entries");
+    assert_eq!(
+        entries
+            .iter()
+            .find(|e| e["name"] == "debug.log")
+            .expect("ignored file")["ignored"],
+        true
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["name"] == ".git" && e["kind"] == "file")
+    );
     for path in [&list, &file] {
         assert_eq!(daemon.get(path, Some(&agent)).status, 403);
     }

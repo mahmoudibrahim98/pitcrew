@@ -49,7 +49,7 @@ test('navigates Home → a project → a workstream', async ({ page }, info) => 
 
 test('the projects tree works from the keyboard', async ({ page }) => {
   await openShell(page);
-  await sidebar(page).getByRole('link', { name: /^Agent console/ }).focus();
+  await sidebar(page).getByRole('link', { name: 'Files', exact: true }).focus();
   await page.keyboard.press('Tab');
   const paper = tree(page).getByRole('treeitem', { name: /^Paper · Diffusion study/ });
   await expect(paper).toBeFocused();

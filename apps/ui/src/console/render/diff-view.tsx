@@ -33,7 +33,7 @@ function withMarks(line: DiffLine): ReactNode {
   return parts;
 }
 
-export function DiffView({ diff, label }: { diff: string; label?: string }) {
+export function DiffView({ diff, label, onLine }: { diff: string; label?: string; onLine?: ((line: number) => void) | undefined }) {
   const parsed = useParsed('diff', diff);
   const frame = 'overflow-x-auto rounded-md border border-line bg-card font-mono text-xs leading-5';
   if (parsed === undefined) {
@@ -54,7 +54,7 @@ export function DiffView({ diff, label }: { diff: string; label?: string }) {
           ) : (
             <div key={i} className={cx('col-span-4 grid grid-cols-subgrid', LINE[line.type])} data-line={line.type}>
               <span className="px-2 text-right text-ink-2 select-none">{line.old ?? ''}</span>
-              <span className="px-2 text-right text-ink-2 select-none">{line.new ?? ''}</span>
+              <span className="px-2 text-right text-ink-2 select-none">{line.new !== undefined && onLine ? <button className="text-accent-text underline" aria-label={`Open line ${line.new}`} onClick={() => onLine(line.new as number)}>{line.new}</button> : line.new ?? ''}</span>
               <span className="pl-1 text-ink-2 select-none" aria-hidden>
                 {SIGN[line.type]}
               </span>

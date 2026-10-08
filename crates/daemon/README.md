@@ -1340,6 +1340,9 @@ Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
 
+The files route passes through additive location-local `ignored` listing hints from
+the runner. Its HTTP tests cover the worktree `.git` file, ignored logs and unchanged
+access rules alongside the existing T80 refusals.
 Session options expose `first_prompt_forbidden` for Windows `.cmd`/`.bat` programs. The API returns
 400 for those first prompts, with advice to start without a prompt and enter it in the terminal.
 No automatic prompt typing or shell escaping is attempted. Omitted permission mode reads the

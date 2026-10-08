@@ -140,6 +140,9 @@ to (`403`) and of a sent write (`409`); the task's writes and their events in or
 approval ask an agent raised itself, which proposes nothing. The daemon sends writes in the
 background, so the test polls for each outcome.
 
+The shared files checks also cover an ignored log’s listing hint and explicit read,
+and a worktree `.git` file that remains listed by the API. The UI hides these by
+default; authorization remains independent of ignore rules.
 Start-session review coverage also checks raw-title controls before trimming, non-local starts,
 preflight refusals leaving no sessions, omitted mode using saved safety, supported prompt limits,
 and two no-prompt person starts sharing a folder with distinct terminals.

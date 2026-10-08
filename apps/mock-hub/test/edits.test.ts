@@ -38,6 +38,7 @@ const UNKNOWN = {
   task: '01JB000000000000000TSK0099',
 };
 const LAPTOP = '01JB000000000000000MCH0001';
+const localRoot = (path: string) => process.platform === 'win32' ? `C:${path}` : path;
 /** @office, the back office's agent. */
 const OFFICE = '01JB000000000000000MEM0006';
 const JOB = { kind: 'job', scheduler: 'slurm', id: '4815170' } as const;
@@ -88,7 +89,7 @@ describe('POST /v1/projects', () => {
           status: 'planning',
           start: '2026-10-01',
           due: '2026-10-01',
-          root: { machine: LAPTOP, path: '/work/ablations', branch: 'main' },
+          root: { machine: LAPTOP, path: localRoot('/work/ablations'), branch: 'main' },
         },
       });
       assert.equal(res.status, 201);
@@ -96,7 +97,7 @@ describe('POST /v1/projects', () => {
       assert.deepEqual(res.body.members, [ID.writer, ID.runner, ID.sam]);
       assert.equal(res.body.status, 'planning');
       assert.deepEqual([res.body.start, res.body.due], ['2026-10-01', '2026-10-01']);
-      assert.deepEqual(res.body.root, { machine: LAPTOP, path: '/work/ablations', branch: 'main' });
+      assert.deepEqual(res.body.root, { machine: LAPTOP, path: localRoot('/work/ablations'), branch: 'main' });
     }));
 
   it('answers 409 when the key is already used', () =>
@@ -166,7 +167,7 @@ describe('POST /v1/workstreams', () => {
 
   it('keeps a given status and locations', () =>
     withServer(async (server) => {
-      const locations = [{ machine: LAPTOP, path: '/work/paper/figures' }];
+      const locations = [{ machine: LAPTOP, path: localRoot('/work/paper/figures') }];
       const res = await call<Workstream>(server, 'POST', '/v1/workstreams', {
         token: DEVICE,
         json: { project: `prj_${ID.tooling}`, name: 'Packaging', status: 'idea', locations },

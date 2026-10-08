@@ -9,6 +9,8 @@ import { Component, lazy, Suspense, useEffect, useId, useMemo, useRef, useState,
 import { ApiError, useLiveQuery } from '../data/index.ts';
 import type { FileClient, FileContent } from '../data/files.ts';
 import { cx } from '../lib/cx.ts';
+import { FileBreadcrumbs } from './file-breadcrumbs.tsx';
+import { visibleFile } from './file-search.ts';
 import { highlightLines, type Token, type TokenKind } from './highlight.ts';
 
 const PdfView = lazy(() => import('./pdf-view.tsx'));
@@ -124,7 +126,7 @@ function Line({ number, tokens, width }: { number: number; tokens: readonly Toke
 }
 
 /** A file's text with line numbers, coloured when its name says a language the viewer knows. */
-export function TextView({ text, path }: { text: string; path: string }) {
+export function TextView({ text, path, line }: { text: string; path: string; line?: number | undefined }) {
   'use no memo'; // TanStack Virtual's instance changes under the React Compiler's memoisation.
   const { language, lines } = useMemo(() => highlightLines(text, path), [text, path]);
   const scroller = useRef<HTMLDivElement>(null);
@@ -136,6 +138,12 @@ export function TextView({ text, path }: { text: string; path: string }) {
     estimateSize: () => LINE_HEIGHT,
     overscan: 40,
   });
+  useEffect(() => {
+    if (line === undefined) return;
+    const index = Math.max(0, Math.min(lines.length - 1, line - 1));
+    if (virtual) virtualizer.scrollToIndex(index, { align: 'start' });
+    else if (scroller.current) scroller.current.scrollTop = index * LINE_HEIGHT;
+  }, [line, lines.length, virtual, virtualizer]);
   const width = Math.max(3, String(lines.length).length);
   return (
     <div
@@ -143,6 +151,7 @@ export function TextView({ text, path }: { text: string; path: string }) {
       className="max-h-[65vh] overflow-auto rounded-sm border border-line bg-card p-3 font-mono text-sm leading-5"
       tabIndex={0}
       aria-label="File text"
+      data-line={line}
       data-language={language?.id ?? 'plain'}
     >
       {virtual ? (
@@ -165,6 +174,10 @@ export function TextView({ text, path }: { text: string; path: string }) {
 export interface FileViewerProps {
   client: FileClient;
   path: string;
+  line?: number | undefined;
+  copyPath?: string | undefined;
+  breadcrumbsLabel?: string | undefined;
+  onFolder?: ((path: string) => void) | undefined;
   onDirty?: ((dirty: boolean) => void) | undefined;
   onBusy?: ((busy: boolean) => void) | undefined;
   /**
@@ -175,7 +188,7 @@ export interface FileViewerProps {
   onDraftChange?: ((draft: FileDraft | undefined) => void) | undefined;
 }
 
-export function FileViewer({ client, path, onDirty, onBusy, draft: keptDraft, onDraftChange }: FileViewerProps) {
+export function FileViewer({ client, path, line, copyPath, breadcrumbsLabel, onFolder, onDirty, onBusy, draft: keptDraft, onDraftChange }: FileViewerProps) {
   const [file, setFile] = useState<FileContent>();
   const [ownDraft, setOwnDraft] = useState<FileDraft>();
   const [error, setError] = useState<unknown>();
@@ -245,6 +258,7 @@ export function FileViewer({ client, path, onDirty, onBusy, draft: keptDraft, on
       <h2 id={heading} className="font-medium break-all">
         {path}
       </h2>
+      <FileBreadcrumbs label={breadcrumbsLabel} path={path} {...(copyPath === undefined ? {} : { copyPath })} onFolder={onFolder} />
       {error !== undefined && (
         <div role="alert">
           <p>{conflict ? 'Changed since you opened it' : fileProblem(error)}</p>
@@ -308,7 +322,7 @@ export function FileViewer({ client, path, onDirty, onBusy, draft: keptDraft, on
                 >
                   Edit
                 </button>
-                <TextView text={file.content} path={path} />
+                <TextView text={file.content} path={path} line={line} />
               </>
             ))}
         </>
@@ -319,7 +333,7 @@ export function FileViewer({ client, path, onDirty, onBusy, draft: keptDraft, on
 
 // ─── The folder tree ────────────────────────────────────────────────────────────────────────────
 
-function Folder({ client, scope, path, openFile }: { client: FileClient; scope: readonly unknown[]; path: string; openFile: (path: string) => void }) {
+function Folder({ client, scope, path, openFile, showHidden }: { client: FileClient; scope: readonly unknown[]; path: string; openFile: (path: string) => void; showHidden: boolean }) {
   const listing = useLiveQuery({
     queryKey: [...scope, 'list', path],
     queryFn: ({ signal }) => client.list(path, signal),
@@ -342,7 +356,7 @@ function Folder({ client, scope, path, openFile }: { client: FileClient; scope: 
     <>
       {listing.data.entries.length === 0 && <p className="text-sm text-ink-2">Empty folder</p>}
       <ul className="space-y-1 pl-3">
-        {listing.data.entries.map((entry) => {
+        {listing.data.entries.filter(entry => visibleFile(entry, showHidden)).map((entry) => {
           const child = path ? `${path}/${entry.name}` : entry.name;
           const isOpen = expanded.includes(child);
           return (
@@ -367,10 +381,11 @@ function Folder({ client, scope, path, openFile }: { client: FileClient; scope: 
                     }
                   }}
                 >
+                  <span aria-hidden className="mr-1">{entry.kind === 'folder' ? '▱' : /\.(png|jpe?g)$/i.test(entry.name) ? '▧' : /\.pdf$/i.test(entry.name) ? '▤' : /\.(rs|tsx?|jsx?|py|tex)$/i.test(entry.name) ? '‹›' : '▯'}</span>
                   {entry.kind === 'folder' ? `${isOpen ? '▾' : '▸'} ${entry.name}` : entry.name}
                 </button>
               )}
-              {entry.kind === 'folder' && isOpen && <Folder client={client} scope={scope} path={child} openFile={openFile} />}
+              {entry.kind === 'folder' && isOpen && <Folder client={client} scope={scope} path={child} openFile={openFile} showHidden={showHidden} />}
             </li>
           );
         })}
@@ -409,15 +424,21 @@ export function FileTree({
   scope,
   openFile,
   className,
+  showHidden = false,
+  rootPath = '',
+  label = 'Folder tree',
 }: {
   client: FileClient;
   scope: readonly unknown[];
   openFile: (path: string) => void;
   className?: string;
+  showHidden?: boolean;
+  rootPath?: string;
+  label?: string;
 }) {
   return (
-    <nav aria-label="Folder tree" onKeyDown={treeKeys} className={cx('min-w-0', className)}>
-      <Folder client={client} scope={scope} path="" openFile={openFile} />
+    <nav aria-label={label} onKeyDown={treeKeys} className={cx('min-w-0', className)}>
+      <Folder client={client} scope={scope} path={rootPath} openFile={openFile} showHidden={showHidden} />
     </nav>
   );
 }

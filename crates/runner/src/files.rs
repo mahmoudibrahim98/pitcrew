@@ -167,6 +167,36 @@ fn bytes(file: &mut File) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn ignored_entry(rules: &[ignore::gitignore::Gitignore], path: &Path, directory: bool) -> bool {
+    let Some(root) = rules.first().map(ignore::gitignore::Gitignore::path) else {
+        return false;
+    };
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        let is_directory = index + 1 < components.len() || directory;
+        let mut ignored = false;
+        for matcher in rules {
+            if !current.starts_with(matcher.path()) || current == matcher.path() {
+                continue;
+            }
+            match matcher.matched(&current, is_directory) {
+                ignore::Match::Ignore(_) => ignored = true,
+                ignore::Match::Whitelist(_) => ignored = false,
+                ignore::Match::None => {}
+            }
+        }
+        if ignored {
+            return true;
+        }
+    }
+    false
+}
+
 /// One daemon's file service. The lock serializes writes and backup retention across roots.
 #[derive(Debug)]
 pub struct Files {
@@ -190,6 +220,7 @@ impl Files {
         }
         let mut entries = std::collections::BTreeMap::new();
         let mut truncated = false;
+        let ignores = self.ignore_rules(root, path);
         for entry in fs::read_dir(&checked.path)? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -213,6 +244,7 @@ impl Files {
                     kind,
                     size: meta.len(),
                     modified_at,
+                    ignored: ignored_entry(&ignores, &entry.path(), kind == FileKind::Folder),
                 },
             );
             if entries.len() > MAX_ENTRIES {
@@ -225,6 +257,48 @@ impl Files {
             entries: entries.into_values().collect(),
             truncated,
         })
+    }
+    fn ignore_rules(&self, root: &Path, path: &str) -> Vec<ignore::gitignore::Gitignore> {
+        let mut rules = Vec::new();
+        let mut directory = String::new();
+        let mut remaining = 256 * 1024;
+        let mut lines_left = 4096;
+        for component in std::iter::once("")
+            .chain(path.split('/').filter(|p| !p.is_empty()))
+            .take(64)
+        {
+            if !component.is_empty() {
+                if !directory.is_empty() {
+                    directory.push('/');
+                }
+                directory.push_str(component);
+            }
+            let relative = if directory.is_empty() {
+                ".gitignore".to_owned()
+            } else {
+                format!("{directory}/.gitignore")
+            };
+            // read() retains the Files API's no-follow handles and identity checks.
+            let Ok(file) = self.read(root, &relative) else {
+                continue;
+            };
+            if file.encoding != FileEncoding::Utf8 || file.content.len() > remaining {
+                continue;
+            }
+            remaining -= file.content.len();
+            let mut builder = ignore::gitignore::GitignoreBuilder::new(root.join(&directory));
+            for line in file.content.lines().take(lines_left) {
+                lines_left -= 1;
+                let _ = builder.add_line(None, line);
+            }
+            if let Ok(matcher) = builder.build() {
+                rules.push(matcher);
+            }
+            if remaining == 0 || lines_left == 0 {
+                break;
+            }
+        }
+        rules
     }
     /// Read checked, regular bytes only.
     pub fn read(&self, root: &Path, path: &str) -> Result<FileContent> {
@@ -431,6 +505,84 @@ impl Checked {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignore_hints_are_bounded_checked_and_never_access_rules() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "*.log\n!keep.log\nbuild/\n/root.txt\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/.gitignore"), "!local.log\n*.tmp\n").unwrap();
+        for path in [
+            "debug.log",
+            "keep.log",
+            "root.txt",
+            "src/local.log",
+            "src/debug.log",
+            "src/a.tmp",
+            "src/root.txt",
+            "build/keep.log",
+        ] {
+            fs::write(root.join(path), "synthetic").unwrap();
+        }
+        let files = Files::new(&temp.path().join("state"));
+        let listing = files.list(&root, "").unwrap();
+        for name in ["debug.log", "root.txt", "build"] {
+            assert!(
+                listing
+                    .entries
+                    .iter()
+                    .find(|e| e.name == name)
+                    .unwrap()
+                    .ignored
+            );
+        }
+        assert!(
+            !listing
+                .entries
+                .iter()
+                .find(|e| e.name == "keep.log")
+                .unwrap()
+                .ignored
+        );
+        let nested = files.list(&root, "src").unwrap();
+        for name in ["local.log", "root.txt"] {
+            assert!(
+                !nested
+                    .entries
+                    .iter()
+                    .find(|e| e.name == name)
+                    .unwrap()
+                    .ignored
+            );
+        }
+        for name in ["debug.log", "a.tmp"] {
+            assert!(
+                nested
+                    .entries
+                    .iter()
+                    .find(|e| e.name == name)
+                    .unwrap()
+                    .ignored
+            );
+        }
+        assert!(files.list(&root, "build").unwrap().entries[0].ignored);
+        assert_eq!(files.read(&root, "debug.log").unwrap().content, "synthetic");
+        fs::write(root.join(".gitignore"), "x".repeat(256 * 1024 + 1)).unwrap();
+        assert!(
+            !files
+                .list(&root, "")
+                .unwrap()
+                .entries
+                .iter()
+                .any(|e| e.ignored)
+        );
+    }
     type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
     #[test]
     fn check_open_swap_is_refused() -> TestResult {

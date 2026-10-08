@@ -221,6 +221,12 @@ splits `summary.text` into its receipted clauses and the plain joining text, con
 byte spans correctly — never `summary.text.slice(span.range.start, span.range.end)`, which is
 wrong as soon as the text holds a character outside ASCII.
 
+## File listing hints
+
+`FileListing` accepts the additive `ignored` boolean (absent means false on an older
+hub). It is presentation data, not authorization. File reads and writes still use the
+workstream location index, relative paths, revisions and the existing transport.
+`useSession(undefined)` is idle, allowing the workbench’s file tabs to omit a session lookup.
 `api.sessionOptions(machine)` reads installed engines/platform/allowed modes;
 `api.startSession(start)` sends the launch request and returns the new session with its terminal.
 The console's shared dialog sets that detail cache immediately and invalidates session lists;

@@ -1,6 +1,7 @@
 // One chat row per kind: prompts, assistant markdown, tool calls with their results, file edits
 // with their diffs, plans, questions and turn ends. Everything from the transcript is text.
 
+import { TranscriptFile, changedLine, useTranscriptFile, toolFileTarget } from './file-links.tsx';
 import type { Ask, PlanItem, Session, TranscriptItemOf } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import { clockTime, fullTime } from './format.ts';
@@ -60,6 +61,7 @@ function ToolRowView({
   ctx: RowContext;
 }) {
   const { use, result } = row;
+  const file = use === undefined ? undefined : toolFileTarget(use.tool, use.target, use.input);
   const open = ctx.expanded.has(row.key);
   const running = result === undefined && ctx.session?.state === 'working';
   const status = result === undefined ? (running ? 'running' : 'no result') : result.is_error ? 'error' : 'ok';
@@ -87,6 +89,7 @@ function ToolRowView({
           {status === 'ok' ? firstLine(result?.summary ?? '') || 'done' : status}
         </span>
       </button>
+      {ctx.session && file && <TranscriptFile sessionId={ctx.session.id} path={file.path} line={file.line} />}
       {open && (
         <div id={detailsId} className="flex flex-col gap-2 border-t border-line px-2.5 py-2">
           {use !== undefined && (
@@ -116,6 +119,7 @@ function ToolRowView({
 
 function EditRowView({ row, ctx }: { row: Extract<ChatRow, { type: 'edit' }>; ctx: RowContext }) {
   const { item } = row;
+  const openFile = useTranscriptFile(ctx.session?.id, item.path);
   const open = ctx.expanded.has(row.key);
   const detailsId = `pc-edit-${row.key}`;
   return (
@@ -134,12 +138,13 @@ function EditRowView({ row, ctx }: { row: Extract<ChatRow, { type: 'edit' }>; ct
           <span className="text-ok">+{item.added}</span> <span className="text-risk">−{item.removed}</span>
         </span>
       </button>
+      {ctx.session && <TranscriptFile sessionId={ctx.session.id} path={item.path} line={changedLine(item.diff)} />}
       {open && (
         <div id={detailsId} className="border-t border-line p-2">
           {item.diff === undefined ? (
             <p className="text-xs text-ink-2">The CLI recorded no diff for this edit.</p>
           ) : (
-            <DiffView diff={item.diff} label={`Changes to ${item.path}`} />
+            <DiffView diff={item.diff} label={`Changes to ${item.path}`} onLine={openFile} />
           )}
         </div>
       )}

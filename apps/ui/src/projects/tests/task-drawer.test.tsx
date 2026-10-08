@@ -153,7 +153,7 @@ describe('TaskDrawer', () => {
     };
     renderWithHub(drawer(demo.pap6), hub, { fetch: transport });
     const dialog = await screen.findByRole('dialog', { name: 'Aggregate the results table' });
-    const select = within(dialog).getByRole('combobox', { name: 'Dispatch to' });
+    const select = await within(dialog).findByRole('combobox', { name: 'Dispatch to' });
     await within(select).findByRole('option', { name: /@writer/ });
     expect(within(select).queryByRole('option', { name: /@sync|@office/ })).toBeNull();
   });

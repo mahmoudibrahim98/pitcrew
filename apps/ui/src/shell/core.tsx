@@ -97,6 +97,7 @@ export const shellFeature: Feature = {
   layout: 'both',
   routes: placeholderRoutes,
   nav: [
+    { id: 'files', label: 'Files', to: 'files', order: 45 },
     { id: 'home', label: 'Home', to: 'home', icon: HomeIcon, layout: 'projects', order: 10 },
     { id: 'inbox', label: 'Inbox', to: 'inbox', icon: InboxIcon, badge: InboxCount, order: 20 },
     {
@@ -111,6 +112,7 @@ export const shellFeature: Feature = {
     { id: 'console', label: 'Agent console', to: 'console', icon: ConsoleIcon, badge: ConsoleCount, order: 40 },
   ],
   commands: [
+    { id: 'quick-open', label: 'Quick open a file…', group: 'Files', keys: ['mod', 'p'], run: c => { if (document.querySelector('[aria-label="File explorer"]')) window.dispatchEvent(new Event('pitcrew:quick-open')); else c.go('files?quick=1'); } },
     { id: 'go-home', label: 'Go to Home', group: 'Go to', layout: 'projects', run: (c) => c.go('home') },
     { id: 'go-inbox', label: 'Go to Inbox', group: 'Go to', run: (c) => c.go('inbox') },
     { id: 'go-my-tasks', label: 'Go to My tasks', group: 'Go to', layout: 'projects', run: (c) => c.go('my-tasks') },
