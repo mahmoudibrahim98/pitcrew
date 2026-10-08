@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { RunningServer } from '../src/server.ts';
-import type { ApiError, Brief, Event, Project, Task, Workstream } from '../src/types.ts';
+import type { ApiError, Brief, Dispatch, Event, Project, Task, Workstream } from '../src/types.ts';
 import { AGENT, DEVICE, ID, call, withServer } from './helpers.ts';
 
 interface Activity {
@@ -62,6 +62,31 @@ it('archives and restores a task with its original key, plan and history', () =>
   assert.equal(restored.status, 200);
   assert.deepEqual(restored.body, { ...original.body, archived: false });
   assert.equal(await rev(server), before + 2);
+}));
+
+it('refuses dispatching an archived task until it is restored', () => withServer(async (server) => {
+  await call(server, 'PATCH', '/v1/tasks/PAP-5', { token: DEVICE, json: { archived: true } });
+  const before = await rev(server);
+  const res = await call(server, 'POST', '/v1/tasks/PAP-5/dispatch', { token: DEVICE, json: { agent: ID.runner } });
+  refused(res, 409, 'archived');
+  assert.match((res.body as ApiError).message, /archived/);
+  assert.equal(await rev(server), before, 'nothing appended');
+  await call(server, 'PATCH', '/v1/tasks/PAP-5', { token: DEVICE, json: { archived: false } });
+  assert.equal((await call(server, 'POST', '/v1/tasks/PAP-5/dispatch', { token: DEVICE, json: { agent: ID.runner } })).status, 202);
+}));
+
+it('reads a task’s runs for people only, leaving out runs whose session is excluded', () => withServer(async (server) => {
+  const dispatched = await call<Dispatch>(server, 'POST', '/v1/tasks/PAP-5/dispatch', { token: DEVICE, json: { agent: ID.runner } });
+  assert.equal(dispatched.status, 202);
+  const runs = () => call<Dispatch[]>(server, 'GET', '/v1/tasks/PAP-5/dispatches', { token: DEVICE });
+  const shown = await runs();
+  assert.equal(shown.status, 200);
+  assert.deepEqual(shown.body.map((run) => run.session), [dispatched.body.session]);
+  refused(await call(server, 'GET', '/v1/tasks/PAP-5/dispatches', { token: AGENT }), 403, 'person only');
+  assert.equal((await call(server, 'PUT', '/v1/import', { token: DEVICE, json: { mode: 'none' } })).status, 200);
+  assert.deepEqual((await runs()).body, []);
+  assert.equal((await call(server, 'PUT', '/v1/import', { token: DEVICE, json: { mode: 'all' } })).status, 200);
+  assert.deepEqual((await runs()).body, shown.body);
 }));
 
 describe('POST /v1/projects', () => {

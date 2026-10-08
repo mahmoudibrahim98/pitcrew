@@ -989,6 +989,7 @@ const dispatchTask: Handler = (hub, ctx) => {
   if (task.status === 'done' || task.status === 'canceled') {
     throw conflict(`${task.key} is ${task.status}; reopen it before dispatching.`);
   }
+  if (task.archived === true) throw conflict(`${task.key} is archived; restore it before dispatching.`);
   requireLive(place.machine);
   const me = ctx.caller.memberId;
   if (task.assignee === undefined) {
@@ -1646,9 +1647,14 @@ const ROUTES: Route[] = [
   route('PUT', '/v1/tasks/:id/subtasks', 'agent', replaceSubtasks),
   route('POST', '/v1/tasks/:id/comments', 'agent', postComment),
   route('POST', '/v1/tasks/:id/dispatch', 'device', dispatchTask),
-  route('GET', '/v1/tasks/:id/dispatches', 'agent', (hub, ctx) => {
+  route('GET', '/v1/tasks/:id/dispatches', 'device', (hub, ctx) => {
     const task = taskAt(hub, ctx.param('id'));
-    return ok(hub.dispatches.filter((run) => run.task === task.id));
+    // A run whose session the import choice excludes is left out with its session.
+    return ok(hub.dispatches.filter((run) => {
+      if (run.task !== task.id) return false;
+      const session = run.session === undefined ? undefined : hub.sessions.find((s) => s.id === run.session);
+      return session === undefined || includesSession(hub.importChoice, session);
+    }));
   }),
   // Sessions.
   route('POST', '/v1/machines/:id/hooks/diff', 'device', (hub, ctx) => ok(hooksDiff(hub, ctx.caller.memberId, ctx.param('id')))),

@@ -119,13 +119,13 @@ async fn archive_and_restore_keep_the_task_and_emit_only_changes() {
 }
 
 #[tokio::test]
-async fn dispatch_reads_resolve_tasks_and_allow_both_token_scopes() {
+async fn dispatch_reads_resolve_tasks_for_people_only() {
     let hub = hub();
     let keyed = get(&hub.app, person(SAM), "/v1/tasks/PAP-1/dispatches").await;
     expect(&keyed, 200);
     let by_id = get(
         &hub.app,
-        agent(WRITER),
+        person(SAM),
         &format!("/v1/tasks/{PAP1}/dispatches"),
     )
     .await;
@@ -141,6 +141,9 @@ async fn dispatch_reads_resolve_tasks_and_allow_both_token_scopes() {
     );
     let missing = get(&hub.app, person(SAM), "/v1/tasks/PAP-99999/dispatches").await;
     expect(&missing, 404);
+    // Agents read neither the runs nor, through them, the sessions the import choice hides.
+    let refused = get(&hub.app, agent(WRITER), "/v1/tasks/PAP-1/dispatches").await;
+    expect(&refused, 403);
 }
 
 #[tokio::test]

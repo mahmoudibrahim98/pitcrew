@@ -41,7 +41,7 @@ Every failure returns an `ApiError` body, `{"code": "…", "message": "…"}`:
 | `unauthorized` | 401 | No token, or an unknown one |
 | `forbidden` | 403 | The token's scope does not allow it, or an agent writes to something not its own |
 | `not_found` | 404 | No such resource **in the path**; also an unknown route or method |
-| `conflict` | 409 | An allowed caller, but the rules say no: a move `can_move` rejects, dispatching a done or canceled task, a project key already in use, a `blocked_by` cycle |
+| `conflict` | 409 | An allowed caller, but the rules say no: a move `can_move` rejects, dispatching a done, canceled or archived task, a project key already in use, a `blocked_by` cycle |
 | `invalid` | 400 | Malformed body or query, unknown enum value, an unknown id **in the body**, a body over 1 MiB, a WebSocket route called without an upgrade |
 | `unavailable` | 503 | The session's machine is unreachable |
 | `internal` | 500 | Anything else |
@@ -270,7 +270,7 @@ replaces the workstream's linked external items (an empty list unlinks them all)
 | `PUT /v1/tasks/{id}/subtasks` | `Subtask[]` → `Task` | A `device` token replaces the whole list. An `agent` token (own task) replaces only **its own** `agent_plan` lines and keeps every other line. Emits `subtasks_replaced` with the full resulting list. **agent** |
 | `POST /v1/tasks/{id}/comments` | `{ "text": String, "mentions": MemberId[] }` → `Event` (201) | Emits `comment_posted`. **agent** |
 | `POST /v1/tasks/{id}/dispatch` | `{ "agent": MemberId, "brief"?: String, "machine"?: MachineId }` → `Dispatch` (202) | See "Dispatch" below. |
-| `GET /v1/tasks/{id-or-key}/dispatches` | → `Dispatch[]` | Runs for this task, including completed runs with `ended`, `outcome` and `summary`, oldest first. Unknown task is 404. **agent** |
+| `GET /v1/tasks/{id-or-key}/dispatches` | → `Dispatch[]` | Runs for this task, including completed runs with `ended`, `outcome` and `summary`, oldest first. Unknown task is 404. A run whose session the import choice excludes is left out, as `GET /v1/sessions` leaves the session out. People only (`403` for an agent). |
 
 `NewTask`: `{ "project": ProjectId, "workstream"?: WorkstreamId, "title": String,
 "description"?: String, "status"?: TaskStatus (default "todo"), "priority"?: Priority,
@@ -284,7 +284,8 @@ replaces the workstream's linked external items (an empty list unlinks them all)
 `TaskPatch` also accepts `archived?: bool`. Tasks default to `archived: false` when reading
 older events. Setting it emits `task_updated`; setting it back to false restores the same task,
 key, dependencies and history. Archived tasks remain readable by id/key and are excluded from
-boards, calendars and task lists in the UI. This is reversible archival, not permanent deletion;
+boards, calendars, task lists, open-task counts and search in the UI. Dispatching an archived task
+is `409 conflict` until it is restored. This is reversible archival, not permanent deletion;
 `GET /v1/tasks` still includes them so dependencies can be resolved and undo does not lose data.
 - A field left out is unchanged. `null` clears `workstream`, `start` and `due`; on the other fields
   `null` is the same as leaving the field out. `labels` and `blocked_by` replace the whole list.
@@ -311,8 +312,8 @@ another person's agent or one with no owner (explicit sharing may come later).
 - Refusals, in this order, with nothing recorded: `404` an unknown task; `400` an unknown agent or
   machine, a person named as the agent, or a brief (the one given, or the task's description or
   title it defaults to) longer than 64 KiB; `403 forbidden` an agent the caller does not own;
-  `409 conflict` if the task is done or canceled, or the agent already holds an active dispatch on
-  it; `503 unavailable` when no machine can run it (none is live, the hub has no runner attached
+  `409 conflict` if the task is done, canceled or archived, or the agent already holds an active
+  dispatch on it; `503 unavailable` when no machine can run it (none is live, the hub has no runner attached
   yet, or the machine's runner cannot be reached).
 - If the task has no assignee, it is assigned to the agent (`task_assigned`).
 - The machine and folder default to the workstream's first location, then the project's root,

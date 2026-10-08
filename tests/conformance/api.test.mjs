@@ -110,11 +110,12 @@ check('task archival is reversible, typed, authorized and event based', async ()
   assert.deepEqual(after, before);
 });
 
-check('task dispatch reads resolve keys and ids for both token scopes', async () => {
+check('task dispatch reads resolve keys and ids for people only', async () => {
   const task = await api('/v1/tasks/PAP-1', 200, schemas.task);
   const runs = await api('/v1/tasks/PAP-1/dispatches', 200, list(schemas.dispatch));
   assert.ok(runs.every((run) => run.task === task.id));
-  assert.deepEqual(await api(`/v1/tasks/${task.id}/dispatches`, 200, list(schemas.dispatch), { token: agent }), runs);
+  assert.deepEqual(await api(`/v1/tasks/${task.id}/dispatches`, 200, list(schemas.dispatch)), runs);
+  await api(`/v1/tasks/${task.id}/dispatches`, 403, undefined, { token: agent });
   await api('/v1/tasks/PAP-99999/dispatches', 404);
   await api('/v1/tasks/PAP-1/dispatches', 401, undefined, { token: '' });
 });
@@ -426,6 +427,15 @@ check('comment author cannot be forged', async () => {
   assert.ok(!Object.hasOwn(event, 'on_behalf_of'));
   assert.equal(event.body.type, 'comment_posted');
   assert.equal(event.body.data.task, context.task.id);
+});
+check('dispatch archived conflict', async () => {
+  const path = `/v1/tasks/${context.task.id}`;
+  await api(path, 200, schemas.task, { method: 'PATCH', body: { archived: true } });
+  try {
+    await api(`${path}/dispatch`, 409, undefined, { method: 'POST', body: { agent: context.agentMe.id } });
+  } finally {
+    await api(path, 200, schemas.task, { method: 'PATCH', body: { archived: false } });
+  }
 });
 check('dispatch success', async () => {
   const d = await api(`/v1/tasks/${context.task.id}/dispatch`, 202, schemas.dispatch, {

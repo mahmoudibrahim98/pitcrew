@@ -1483,3 +1483,88 @@ async fn dispatch_without_persona_is_refused_without_events_or_runner_calls() {
     assert_eq!(work.store().latest_rev().expect("rev"), rev);
     assert!(runner.calls().is_empty());
 }
+
+#[tokio::test]
+async fn an_archived_task_is_not_dispatched_until_it_is_restored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let pap5 = TaskRef::parse("PAP-5").expect("key");
+    let archive = |archived| TaskPatch {
+        archived: Some(archived),
+        ..TaskPatch::default()
+    };
+    work.patch_task(&person(SAM), &pap5, archive(true))
+        .expect("archive");
+    let rev = work.store().latest_rev().expect("rev");
+    let res = dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await;
+    expect(&res, 409);
+    assert!(
+        res.1["message"]
+            .as_str()
+            .expect("message")
+            .contains("archived"),
+        "{res:?}"
+    );
+    assert_eq!(
+        work.store().latest_rev().expect("rev"),
+        rev,
+        "nothing appended"
+    );
+    assert!(runner.calls().is_empty(), "the runner link was never asked");
+    work.patch_task(&person(SAM), &pap5, archive(false))
+        .expect("restore");
+    expect(
+        &dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await,
+        202,
+    );
+}
+
+#[tokio::test]
+async fn a_tasks_runs_leave_out_sessions_the_import_choice_excludes() {
+    use pitcrew_protocol::import::{ImportFilter, ImportMode};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let demo = demo();
+    let work = Arc::new(
+        WorkService::new(open(&dir.path().join("hub.db")), demo.workspace.clone())
+            .with_dispatcher(Recorder::new(Answer::Start))
+            .with_import_file(dir.path().join("import.json"))
+            .expect("import file"),
+    );
+    work.seed(&demo).expect("seed");
+    let (_, session) = dispatched(&work).await;
+    let app = app(&work);
+    let runs = |caller| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                Some(caller),
+                "GET",
+                "/v1/tasks/PAP-5/dispatches",
+                None,
+            )
+            .await
+        }
+    };
+    let shown = runs(person(SAM)).await;
+    expect(&shown, 200);
+    assert_eq!(shown.1[0]["session"], json!(session));
+
+    // Nothing imported from before now: the dispatched session is excluded, and its run with it.
+    work.commit_import(ImportFilter {
+        mode: ImportMode::None,
+        ..ImportFilter::default()
+    })
+    .expect("exclude");
+    assert!(!work.session_included(&session).expect("included"));
+    let hidden = runs(person(SAM)).await;
+    expect(&hidden, 200);
+    assert_eq!(hidden.1, json!([]));
+    expect(&runs(agent(WRITER)).await, 403);
+
+    // The choice is reversible: the run is shown again with its session.
+    work.commit_import(ImportFilter::default())
+        .expect("include");
+    assert_eq!(runs(person(SAM)).await.1, shown.1);
+}
