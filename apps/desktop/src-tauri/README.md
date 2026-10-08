@@ -553,7 +553,8 @@ Startup and daily checks are independent of the webview; reloading retrieves the
 
 Builds without a configured public key disable update checks, except a portable copy's. A
 portable copy checks the same feed, with or without the key, but never downloads or installs:
-"Update" opens the portable workflow's successful runs on `main`, where the newest
+"Update" opens the portable workflow's successful runs for pushes to `main` (`event:push`: a
+pull request's head branch may be named `main` too, a fork's included), where the newest
 `pitcrew-windows-x64-portable.zip` is, and answers with a sentence saying so; its status has
 `portable: true` and that page as `downloadUrl` (see the contract). Release packaging compiles the
 public key from the repository variable only when signing is enabled. See

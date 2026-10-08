@@ -14,9 +14,11 @@ use tauri_plugin_updater::{Update, UpdaterExt as _};
 const REPO: &str = "https://github.com/mahmoudibrahim98/pitcrew";
 const API: &str = "https://api.github.com/repos/mahmoudibrahim98/pitcrew/releases?per_page=100";
 const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
-/// Where a portable copy's update comes from: the portable workflow's successful runs on `main`,
-/// each with `pitcrew-windows-x64-portable.zip` as its artifact.
-pub const PORTABLE_DOWNLOADS: &str = "https://github.com/mahmoudibrahim98/pitcrew/actions/workflows/release-portable.yml?query=branch%3Amain+is%3Asuccess";
+/// Where a portable copy's update comes from: the portable workflow's successful runs for pushes
+/// to `main`, each with `pitcrew-windows-x64-portable.zip` as its artifact. `event:push` matters:
+/// `branch:` alone also matches a pull request whose head branch is named `main`, a fork's
+/// included.
+pub const PORTABLE_DOWNLOADS: &str = "https://github.com/mahmoudibrahim98/pitcrew/actions/workflows/release-portable.yml?query=branch%3Amain+event%3Apush+is%3Asuccess";
 
 /// Serializes checks, channel changes and installation; the UI holds no update resource.
 #[derive(Default)]
@@ -418,6 +420,11 @@ mod tests {
             })
         );
         assert!(PORTABLE_DOWNLOADS.starts_with(&format!("{REPO}/actions/workflows/")));
+        // Only pushes to main: a pull request from a fork's `main` must never be offered.
+        assert!(
+            PORTABLE_DOWNLOADS.ends_with("?query=branch%3Amain+event%3Apush+is%3Asuccess"),
+            "{PORTABLE_DOWNLOADS}"
+        );
         // Nothing pending: no links at all.
         assert_eq!(
             serde_json::to_value(Status::new(true, true, true, None)).unwrap(),

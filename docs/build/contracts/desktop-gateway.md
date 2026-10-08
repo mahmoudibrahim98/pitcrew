@@ -364,7 +364,8 @@ AppImage installs; deb/rpm users update through their package manager.
 **A portable copy** (`portable.txt` next to the app's executable: the portable Windows zip) has
 `portable: true`. It checks whether or not a public key is compiled in (`enabled` is always true),
 but never downloads or installs: `gateway_update_install` for the pending version opens the fixed
-page of the portable workflow's successful runs on `main` (where the newest
+page of the portable workflow's successful runs for pushes to `main` (`event:push`, never a
+pull request's run, whose head branch may also be named `main`; where the newest
 `pitcrew-windows-x64-portable.zip` is) in the system browser, and fails with a sentence saying
 so, for the UI to show. While an update is pending, `downloadUrl` is that page (portable copies
 only). An installed copy has `portable: false` and no `downloadUrl`.

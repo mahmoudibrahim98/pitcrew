@@ -115,7 +115,10 @@ jobs:
         run: ./packaging/portable/smoke.ps1 -Zip dist/portable/pitcrew-windows-x64-portable.zip
 
       # The zip itself, not zipped again: the artifact is pitcrew-windows-x64-portable.zip.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      # Never for a fork's pull request: its code is not this repository's, and its run's zip must
+      # not sit among the builds people download.
+      - if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: dist/portable/pitcrew-windows-x64-portable.zip
           archive: false

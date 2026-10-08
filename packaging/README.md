@@ -341,8 +341,12 @@ run programs from, and start PitCrew there. No installer, no administrator, no r
 
 ### Getting it
 
-1. On GitHub, **Actions → Portable Windows zip**, and a successful run on `main` (the newest is
-   at the top; a pull request's run has one too). Downloading needs a GitHub sign-in.
+1. On GitHub, **Actions → Portable Windows zip**, filtered to successful pushes to `main`
+   ([this query](https://github.com/mahmoudibrahim98/pitcrew/actions/workflows/release-portable.yml?query=branch%3Amain+event%3Apush+is%3Asuccess);
+   `branch:main` alone also lists pull requests whose head branch is named `main`, a fork's
+   included), and the newest run. Pull requests from this repository's branches carry a zip too,
+   for review; a fork's pull request builds and checks one but uploads nothing. Downloading needs
+   a GitHub sign-in.
 2. Under **Artifacts**, `pitcrew-windows-x64-portable.zip`. It is the zip itself (uploaded with
    `archive: false`), kept for 30 days. Its SHA-256 is in the run's summary, with its files and
    their sizes, and in the upload step's log as the artifact's digest.
@@ -392,7 +396,7 @@ see the desktop's README, "A portable copy"):
   programs, so moving between the zip and the installer keeps it. The smoke test checks nothing
   is written into the unzipped folder.
 - **Updates** are never installed: a newer version is shown as usual, and **Update** opens the
-  workflow's successful runs on `main` instead (the
+  workflow's successful runs for pushes to `main` instead (`event:push`; the
   [contract](../docs/build/contracts/desktop-gateway.md#desktop-updates)).
 - **Notifications** show as Windows PowerShell's: Windows shows toasts only for an
   AppUserModelID a Start menu shortcut registers.
