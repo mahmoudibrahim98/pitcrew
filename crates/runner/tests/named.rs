@@ -250,6 +250,7 @@ fn start(engine: Engine, cwd: &Path, session: Option<SessionId>) -> RunnerComman
         account: None,
         permission_mode: PermissionMode::Default,
         session,
+        confined: false,
     }
 }
 

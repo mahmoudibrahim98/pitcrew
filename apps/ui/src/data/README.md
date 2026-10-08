@@ -14,6 +14,9 @@ See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 device; it is excluded from recap invalidation. Each workspace's existing data scope
 keeps its cursor cache separate, and failed mutations retain the previous cursor.
 
+The board drafts' events (`board_draft_started`, `board_proposed`, `board_draft_reviewed`)
+invalidate `['board-drafts']`, the projects feature's draft queries (`projects/board-drafts.ts`).
+
 | File | What |
 |---|---|
 | `transport.ts` | The seam every request and socket goes through: `Transport` (`request(method, path, body) → { status, contentType, body }`, `openSocket(path) → TransportSocket`, and, in the desktop app, `storeCredential(integration, secret)`: an integration's secret through the gateway's own command, never `request`). `browserTransport()`: `fetch` and `WebSocket` with the bearer token (development). `TransportSocket.bufferedAmount` is bytes sent but not yet taken: the real `WebSocket`'s own, here. `isDesktop()`: `window.__TAURI_INTERNALS__` exists. |

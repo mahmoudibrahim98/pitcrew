@@ -77,6 +77,11 @@ export const invalidationMap: InvalidationMap = {
   write_started: () => [keys.writes.all],
   write_retry_requested: () => [keys.writes.all],
   write_finished: (d) => (d.task === undefined ? [keys.writes.all] : [keys.writes.all, ...task(d.task)]),
+  // Board drafts' own keys (`projects/board-drafts.ts`); the tasks a review creates come as
+  // `task_created`, and its links as `session_linked`.
+  board_draft_started: () => [['board-drafts']],
+  board_proposed: () => [['board-drafts']],
+  board_draft_reviewed: () => [['board-drafts']],
 };
 
 function keysFor(body: EventBody, cache: CacheLookup): QueryKey[] {

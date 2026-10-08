@@ -9,6 +9,8 @@ import { StartSessionButton } from '../console/start-session-button.tsx';
 import { ReadScope } from './read-scope.tsx';
 import { StatusPill } from '../design/index.ts';
 import { ActivityFeed } from './activity.tsx';
+import { DraftBoardPanel, useWaitingProposal } from './board-draft.tsx';
+import { Button } from '../design/index.ts';
 import { AgentsNow } from './agents.tsx';
 import { Board } from './board.tsx';
 import { useNames, useWorkstreams } from './data.ts';
@@ -46,6 +48,7 @@ function NotFound() {
 export function WorkstreamPage() {
   const { workstream: id }: { workstream?: string } = useParams({ strict: false });
   const [tab, setTab] = useState<Tab>('stands');
+  const [drafting, setDrafting] = useState(false);
   const [filesDirty, setFilesDirty] = useState(false);
   const [filesBusy, setFilesBusy] = useState(false);
   useBlocker({
@@ -89,10 +92,16 @@ export function WorkstreamPage() {
                 {WORKSTREAM_STATUS[workstream.status].label}
               </StatusPill>
               <StatusPill tone={HEALTH[workstream.health].tone}>{HEALTH[workstream.health].label}</StatusPill>
+              <Button className="ml-auto" aria-expanded={drafting} onClick={() => setDrafting((d) => !d)}>
+                Draft board
+              </Button>
             </>
           )}
         </div>
         {workstream !== undefined && <WorkstreamLinks workstream={workstream} />}
+        {workstream !== undefined && !drafting && (
+          <WaitingProposal workstream={workstream.id} onReview={() => setDrafting(true)} />
+        )}
         <ToggleGroup.Root
           type="single"
           value={tab}
@@ -113,6 +122,9 @@ export function WorkstreamPage() {
         </ToggleGroup.Root>
       </header>
 
+      {workstream !== undefined && drafting && (
+        <DraftBoardPanel workstream={workstream.id} onClose={() => setDrafting(false)} />
+      )}
       {workstream !== undefined && (
         <>
           {tab === 'stands' && <WorkstreamOverviewBody workstream={workstream.id} />}
@@ -124,5 +136,21 @@ export function WorkstreamPage() {
         </>
       )}
     </div>
+  );
+}
+
+/** A notice when an agent's drafted board waits for this person's review. */
+function WaitingProposal({ workstream, onReview }: { workstream: string; onReview: () => void }) {
+  const waiting = useWaitingProposal(workstream);
+  if (waiting === undefined) return null;
+  const count = waiting.proposal?.tasks.length ?? 0;
+  return (
+    <p role="status" className="flex flex-wrap items-center gap-2 rounded-sm border border-line bg-accent-soft px-3 py-2 text-sm text-ink">
+      A drafted board of {count} task{count === 1 ? '' : 's'} is waiting for your review. Nothing is created until you
+      accept it.
+      <Button variant="secondary" onClick={onReview}>
+        Review the draft
+      </Button>
+    </p>
   );
 }

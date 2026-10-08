@@ -30,11 +30,13 @@ pub const HOME_VARIABLES: [&str; 4] = ["HOME", "USERPROFILE", "APPDATA", "LOCALA
 
 /// The variables that send a lookup somewhere other than the home: [`private_home`] removes them.
 /// A test may set one again, to a temporary folder of its own.
-pub const REDIRECT_VARIABLES: [&str; 7] = [
+pub const REDIRECT_VARIABLES: [&str; 8] = [
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
+    // PitCrew's cache folder, where confined runs (board drafts) get their private folders.
+    "XDG_CACHE_HOME",
     "OPENCODE_CONFIG_DIR",
     "HOMEDRIVE",
     "HOMEPATH",

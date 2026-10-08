@@ -38,6 +38,7 @@
 //! released last.
 
 use crate::cli::{ListenArg, ServeArgs, TerminalRuntimeArg};
+use crate::confined::{ConfinedRuns, HubTokens};
 use crate::dispatch::{AgentEnv, RunnerLink};
 use crate::host::HostInfoNow;
 use crate::office::Office;
@@ -67,7 +68,7 @@ use pitcrew_store::{Projection, Store, StoreOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
@@ -212,6 +213,10 @@ struct Hub {
     attached: Arc<Attached>,
     /// What the CLIs the runner starts for sessions the hub stored get.
     session_env: Arc<AgentEnv>,
+    /// The session tokens of confined runs: in memory only.
+    session_tokens: Arc<FileTokenStore>,
+    /// Confined runs (board drafts): their folders, files and tokens.
+    confined: Arc<ConfinedRuns>,
 }
 
 /// Steps 1–6: the token registry, the store, the workspace and its service, the demo, the device
@@ -270,21 +275,36 @@ fn open_with(
     // --no-runner, a dispatch answers 503 and records nothing.
     let (signal, set_up) = crate::setup::signal();
     let attached = Arc::new(Attached::default());
+    // Confined runs (board drafts): their own folders under the cache folder, and session tokens
+    // kept in memory only (`crate::confined`).
+    let session_tokens = Arc::new(FileTokenStore::in_memory());
+    let confined = Arc::new(ConfinedRuns::new(
+        crate::confined::default_root(),
+        state.root(),
+        Arc::clone(&session_tokens),
+    ));
+    let work_cell: Arc<OnceLock<Weak<WorkService>>> = Arc::default();
+    let link = RunnerLink::new(Arc::clone(&attached))
+        .with_confined(Arc::clone(&confined), Arc::clone(&work_cell));
     // The recap index keeps its blocks on disk, in a cache file of its own next to the store
     // (replaced when the index is built, removed when the daemon stops; on a local disk instead
     // when the state directory is on a network filesystem), not in memory.
     let work = Arc::new(
         WorkService::new(Arc::clone(&store), workspace)
             .with_setup_listener(Arc::new(signal))
-            .with_dispatcher(Arc::new(RunnerLink::new(Arc::clone(&attached))))
+            .with_dispatcher(Arc::new(link))
             .with_recap_file(state.root().join(RECAP_FILE))
             .with_import_file(state.root().join("import.json"))?,
     );
-    let session_env = Arc::new(AgentEnv::new(
-        &work,
-        Arc::clone(&tokens) as Arc<dyn TokenStore>,
-        state.agents(),
-    ));
+    let _ = work_cell.set(Arc::downgrade(&work));
+    let session_env = Arc::new(
+        AgentEnv::new(
+            &work,
+            Arc::clone(&tokens) as Arc<dyn TokenStore>,
+            state.agents(),
+        )
+        .with_confined(Arc::clone(&confined)),
+    );
     let machines = match &demo {
         Some(demo) => demo.machines.clone(),
         None => work.machines().context("cannot list the machines")?,
@@ -342,6 +362,8 @@ fn open_with(
         set_up: person.is_none().then_some(set_up),
         attached,
         session_env,
+        session_tokens,
+        confined,
     })
 }
 
@@ -536,6 +558,8 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         set_up,
         attached,
         session_env,
+        session_tokens,
+        confined,
     } = hub;
     warm_up_recaps(&work);
 
@@ -547,6 +571,15 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         // Nothing is stopping yet.
         let _ = workers.keep_runner(runner);
     }
+    // No confined run outlives the daemon: its session token was in the last one's memory. Their
+    // folders go, and the drafts still running end (their CLIs too, with a runner attached).
+    confined.sweep();
+    match work.end_running_drafts("the hub restarted, which ended the draft's token") {
+        Ok(0) => {}
+        Ok(ended) => tracing::info!(ended, "ended the board drafts the last daemon left running"),
+        Err(e) => tracing::warn!(error = %e, "cannot end the board drafts left running"),
+    }
+    drop(confined);
 
     let _locations = crate::locations::watch(&work, &workers);
 
@@ -609,7 +642,11 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         .device(transcripts.routes())
         .device(sessions.routes())
         .device(crate::integrations::routes(Arc::clone(&integrations)))
-        .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))));
+        .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))))
+        // Board drafts (api-v1.md, "Board drafts"): the drafting session's proposal (its session
+        // token only), and the rest.
+        .session(pitcrew_hub_work::board_session_routes().layer(Extension(Arc::clone(&work))))
+        .device(pitcrew_hub_work::board_device_routes().layer(Extension(Arc::clone(&work))));
     // The roles and capabilities as they are at each request (the runner may start later).
     let info = Arc::new(HostInfoNow::new(Arc::clone(&attached)));
 
@@ -642,7 +679,9 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         None if cfg!(windows) => session_env.listening("PITCREW_PIPE", at.clone()),
         None => session_env.listening("PITCREW_SOCKET", at.clone()),
     }
-    let token_store: Arc<dyn TokenStore> = Arc::clone(&tokens) as Arc<dyn TokenStore>;
+    // The registry's tokens, and the confined runs' session tokens (in memory).
+    let token_store: Arc<dyn TokenStore> =
+        Arc::new(HubTokens::new(Arc::clone(&tokens), session_tokens));
     let mut app = pitcrew_api::router(info.now(), token_store, parts).layer(
         axum::middleware::from_fn_with_state(info, crate::host::answer),
     );

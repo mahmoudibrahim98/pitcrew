@@ -233,6 +233,41 @@ const upstreamWrite = object({
   'result?': writeResult,
   'retry_requested_by?': id,
 });
+// Board drafts (api-v1.md, "Board drafts").
+const draftCost = object({
+  sessions: integer,
+  sessions_left_out: integer,
+  tasks: integer,
+  summary_bytes: integer,
+  prompt_bytes: integer,
+  redacted: integer,
+  estimate: object({ input_tokens: integer, output_tokens: integer }),
+});
+const proposedTask = object({
+  title: text,
+  status: enumeration('backlog', 'todo', 'in_progress', 'review', 'done'),
+  'description?': text,
+  evidence: list(id),
+});
+const boardProposal = object({ tasks: list(proposedTask), 'note?': text });
+const draftedTask = object({ item: integer, task: id });
+const boardDraft = object({
+  id,
+  workstream: id,
+  agent: id,
+  engine: enumeration('claude', 'codex', 'opencode'),
+  session: id,
+  by: id,
+  prompt: text,
+  cost: draftCost,
+  started: integer,
+  state: enumeration('running', 'proposed', 'reviewed', 'ended'),
+  'proposal?': boardProposal,
+  'proposed?': integer,
+  'reviewed?': integer,
+  accepted: list(draftedTask),
+  rejected: list(integer),
+});
 const eventData = {
   safety_changed: object({ settings: object({ permission_mode: enumeration("default", "plan", "accept_edits", "bypass_permissions"), back_office_enabled: bool, back_office_caps: object({ max_auto_accept_per_hour: integer }) }) }),
   cursor_moved: object({ scope: text, rev: integer }),
@@ -317,6 +352,22 @@ const eventData = {
   write_started: object({ ask: id, 'task?': id, attempt: integer }),
   write_retry_requested: object({ ask: id, 'task?': id, by: id }),
   write_finished: object({ ask: id, 'task?': id, result: writeResult }),
+  board_draft_started: object({
+    draft: id,
+    workstream: id,
+    agent: id,
+    engine: enumeration('claude', 'codex', 'opencode'),
+    session: id,
+    prompt: text,
+    cost: draftCost,
+  }),
+  board_proposed: object({ draft: id, workstream: id, tasks: list(proposedTask), 'note?': text }),
+  board_draft_reviewed: object({
+    draft: id,
+    workstream: id,
+    accepted: list(draftedTask),
+    rejected: list(integer),
+  }),
 };
 const eventBody = (v) => {
   object({ type: enumeration(...Object.keys(eventData)), data: empty })(v);
@@ -524,6 +575,9 @@ export const schemas = {
     checks: list(object({ scope: text, ok: bool, message: text })),
     warnings: list(text),
   }),
+  boardDraft,
+  draftPreview: object({ workstream: id, prompt: text, cost: draftCost, summary: text, digest: text }),
+  draftReviewed: object({ draft: boardDraft, tasks: list(task) }),
   error: object({
     code: enumeration(
       'unauthorized',

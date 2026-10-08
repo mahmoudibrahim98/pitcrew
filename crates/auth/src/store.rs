@@ -6,7 +6,7 @@
 use crate::private::{
     ExclusiveLock, create_new_private_file, create_private_dir, open_private_file,
 };
-use crate::token::{SecretToken, TokenHash, TokenId, claimed_scope};
+use crate::token::{SecretToken, TokenHash, TokenId, claimed_prefix, prefix};
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::model::TimestampMs;
 use serde::{Deserialize, Serialize};
@@ -32,8 +32,11 @@ pub struct TokenInfo {
 /// Failures of a token store.
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
-    /// An agent token needs an owner, and a device token must not have one.
-    #[error("an agent token needs an owner (on_behalf_of), and a device token must not have one")]
+    /// An agent or session token needs an owner, and a device token must not have one.
+    #[error(
+        "an agent or session token needs an owner (on_behalf_of), and a device token must not \
+         have one"
+    )]
     InvalidCaller,
     /// No token has this id.
     #[error("no token {0}")]
@@ -218,7 +221,7 @@ impl FileTokenStore {
 
 impl TokenStore for FileTokenStore {
     fn verify(&self, token: &str) -> Option<Caller> {
-        let scope = claimed_scope(token)?;
+        let claimed = claimed_prefix(token)?;
         let hash = TokenHash::of(token);
         let entries = self.entries.read().unwrap_or_else(PoisonError::into_inner);
         // Visit every entry, without stopping at a match.
@@ -228,7 +231,7 @@ impl TokenStore for FileTokenStore {
                 found = Some(entry.info.caller);
             }
         }
-        found.filter(|caller| caller.scope == scope)
+        found.filter(|caller| prefix(caller.scope) == claimed)
     }
 
     fn mint(&self, caller: Caller) -> Result<(TokenInfo, SecretToken), TokenError> {
@@ -278,7 +281,9 @@ impl TokenStore for FileTokenStore {
 
 fn check_caller(caller: &Caller) -> Result<(), TokenError> {
     match (caller.scope, caller.on_behalf_of) {
-        (TokenScope::Device, None) | (TokenScope::Agent, Some(_)) => Ok(()),
+        (TokenScope::Device, None) | (TokenScope::Agent | TokenScope::Session(_), Some(_)) => {
+            Ok(())
+        }
         _ => Err(TokenError::InvalidCaller),
     }
 }
@@ -442,6 +447,20 @@ mod tests {
         let (_, token) = store.mint(person()).unwrap();
         let swapped = token.expose().replacen("pcd_", "pca_", 1);
         assert_eq!(store.verify(&swapped), None);
+        // A session token verifies as its session's, and never passes for an agent's token, nor
+        // the other way round.
+        let session = Caller {
+            scope: TokenScope::Session(pitcrew_protocol::ids::SessionId::new()),
+            ..agent(MemberId::new())
+        };
+        let (_, minted) = store.mint(session).unwrap();
+        assert!(minted.expose().starts_with("pcs_"));
+        assert_eq!(store.verify(minted.expose()), Some(session));
+        let swapped = minted.expose().replacen("pcs_", "pca_", 1);
+        assert_eq!(store.verify(&swapped), None);
+        let (_, agent_token) = store.mint(agent(MemberId::new())).unwrap();
+        let swapped = agent_token.expose().replacen("pca_", "pcs_", 1);
+        assert_eq!(store.verify(&swapped), None);
     }
 
     #[test]
@@ -457,6 +476,14 @@ mod tests {
         ));
         assert!(matches!(
             store.mint(bad_device),
+            Err(TokenError::InvalidCaller)
+        ));
+        let bad_session = Caller {
+            scope: TokenScope::Session(pitcrew_protocol::ids::SessionId::new()),
+            ..bad_agent
+        };
+        assert!(matches!(
+            store.mint(bad_session),
             Err(TokenError::InvalidCaller)
         ));
     }

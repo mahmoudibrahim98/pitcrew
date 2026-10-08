@@ -112,6 +112,7 @@ fn start_claude(cwd: &Path) -> RunnerCommand {
         account: None,
         permission_mode: PermissionMode::Default,
         session: None,
+        confined: false,
     }
 }
 
@@ -411,6 +412,7 @@ fn personal_folder_starts_coexist_but_a_named_start_still_conflicts() {
         account: None,
         permission_mode: PermissionMode::Default,
         session: Some(session),
+        confined: false,
     };
     let (first, second) = (SessionId::new(), SessionId::new());
     detail(&r.commands.run_unclaimed(CommandId::new(), &start(first)));

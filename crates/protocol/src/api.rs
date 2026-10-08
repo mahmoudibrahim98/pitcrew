@@ -7,7 +7,7 @@
 //! - Live changes arrive on one WebSocket, `GET /v1/stream?since=<rev>`, as [`StreamFrame`]s.
 
 use crate::events::Event;
-use crate::ids::{MemberId, ProjectId, ProjectKey, WorkstreamId};
+use crate::ids::{MemberId, ProjectId, ProjectKey, SessionId, WorkstreamId};
 use crate::model::{
     Date, Engine, Location, Machine, MachineInfo, Member, PermissionMode, Priority, ProjectStatus,
     TaskStatus, TimestampMs, Workspace, WorkstreamStatus,
@@ -90,7 +90,7 @@ pub struct HostInfo {
     pub capabilities: Vec<Capability>,
 }
 
-/// The two kinds of token (ADR-0006).
+/// The kinds of token (ADR-0006).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +99,24 @@ pub enum TokenScope {
     Device,
     /// An agent or hook. It is limited to agent verbs, for its owner's workspace.
     Agent,
+    /// A session token: minted for one session PitCrew starts on its own behalf (a board
+    /// draft's), bound to that session, and given to its CLI instead of its agent's token. It
+    /// acts as the session's agent, for its owner, but may call only the routes mounted for
+    /// session tokens, and each of those only for its own session's resource (a draft's
+    /// proposal). It is kept in the daemon's memory only, and revoked when its run has done its
+    /// one thing or ends (api-v1.md, "Tokens").
+    Session(SessionId),
+}
+
+impl TokenScope {
+    /// The session a session token is bound to.
+    #[must_use]
+    pub fn session(self) -> Option<SessionId> {
+        match self {
+            Self::Session(session) => Some(session),
+            Self::Device | Self::Agent => None,
+        }
+    }
 }
 
 /// Machine-readable error codes.

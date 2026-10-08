@@ -15,8 +15,9 @@ node tests/conformance/run.mjs daemon
 Both commands run `onboarding.test.mjs` on its own, then the same `api.test.mjs`, `scan.test.mjs`,
 `files.test.mjs` and `machine-setup.test.mjs`, then `import.test.mjs` on its own, then `integrations.test.mjs` on its own
 (its syncs append events, which the main suite's exact-revision checks must not see), then
-`writes.test.mjs` on its own (it connects the same repository). Every phase runs, and the first
-failure decides the exit code. No npm dependency is needed. The
+`writes.test.mjs` on its own (it connects the same repository), then `board.test.mjs` on its own
+(board drafts start an agent's CLI and create tasks). Every phase runs, and the first failure
+decides the exit code. No npm dependency is needed. The
 daemon runner builds `pitcrewd` and `pitcrew-ptyd` with the locked workspace dependencies, starts a
 seeded demo on an OS-assigned free loopback port, and reads its two private token files without
 printing them. Each runner creates an empty temporary home and cleans up its child process and
@@ -92,6 +93,19 @@ and link target inside its own temporary folder. Windows daemon conformance keep
 Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
+
+`board.test.mjs` runs on both targets, alone, last ("Board drafts"): the
+preview's shape, sizes and estimate, and that it stores nothing; a start refused for a stale
+digest, a person or an unknown member as the agent, and while another draft runs; device-only
+routes; only the draft's session token proposes (its agent's token is refused, and the session
+token reaches no other route: `GET /v1/me`, `/v1/tasks`, `/v1/board-drafts`), within the bounds
+(evidence of another workstream's session, `canceled`, a blank title, a body over 32 KiB), and
+stops once it has (`401`); a proposal creates no task; a review creates exactly the accepted
+items, labelled `drafted`, and nothing for the rejected one, once; and the three events' shapes.
+The suite proposes with the session token as the draft's CLI would: `run.mjs` makes a private
+folder (`PITCREW_CONFORMANCE_SESSION_TOKENS`) where the mock writes each draft's token
+(`sessionTokenDir`) and, on the daemon, the stand-in `claude` (confined, in its private folder in
+the temporary home's cache) copies the one it was given; it never proposes by itself.
 
 Session launch coverage now checks person-only machine options, platform and supported modes,
 unknown/unreachable machines, title validation, and an unnamed no-prompt start returning a

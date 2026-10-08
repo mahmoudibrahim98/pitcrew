@@ -95,7 +95,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-dispatch-followups-2](0-dispatch-followups-2.md) | 0 · Composition root | `integrator/dispatch-followups-2` | Codex | **Merged** (PR #41) |
 | [0-flaky-tests-3](0-flaky-tests-3.md) | 0 · Contracts | `integrator/flaky-tests-3` | Codex (local, Windows) | **Merged** (PR #42) |
 | [0-onboarding-scan](0-onboarding-scan.md) | 0 · Contracts | `integrator/onboarding-scan` | Opus-class | **Merged** (PR #32) |
-| [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Codex | In progress (Codex, cloud) |
+| [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Codex | **Merged** (PR #44) |
 | [0-idle-cpu](0-idle-cpu.md) | 0 · Composition root | `integrator/idle-cpu` | Codex | **Merged** (PR #40; Linux re-measure after the 10 ms cap pending) |
 | [0-scan-followups](0-scan-followups.md) | 0 · Contracts | `integrator/scan-followups` | Codex | **Merged** (PR #38) |
 | [0-docs-followups](0-docs-followups.md) | 0 · Contracts | `integrator/docs-followups` | Codex | **Merged** (PR #35) |
@@ -107,24 +107,26 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-onboarding-import](0-onboarding-import.md) | 0 · Contracts | `integrator/onboarding-import` | Codex | **Merged** (PR #46) |
 | [P-installer-size-2](P-installer-size-2.md) | P · Packaging | `integrator/installer-size-2` | Codex (cloud, Linux) | **Merged** (PR #50) |
 | [O-onboarding-hooks-safety](O-onboarding-hooks-safety.md) | O · Onboarding | `integrator/onboarding-hooks-safety` | Codex (cloud) | **Merged** (PR #56) |
-| [O-onboarding-machines](O-onboarding-machines.md) | O · Onboarding | `integrator/onboarding-machines` | Opus-class (Claude cloud) | In review (PR #55) |
-| [G-sync-wiring](G-sync-wiring.md) | G · Integrations | `integrator/sync-wiring` | Opus-class (Claude cloud) | In review (PR #52) |
-| [G-approval-writes](G-approval-writes.md) | G · Integrations | `integrator/approval-writes` | Opus-class (Claude cloud) | In review (PR #58) |
+| [O-onboarding-machines](O-onboarding-machines.md) | O · Onboarding | `integrator/onboarding-machines` | Opus-class (Claude cloud) | **Merged** (PR #55, in batch PR #61) |
+| [G-sync-wiring](G-sync-wiring.md) | G · Integrations | `integrator/sync-wiring` | Opus-class (Claude cloud) | **Merged** (PR #52, in batch PR #61) |
+| [G-approval-writes](G-approval-writes.md) | G · Integrations | `integrator/approval-writes` | Opus-class (Claude cloud) | **Merged** (PR #58, in batch PR #61) |
 | [M-workbench](M-workbench.md) | M · Agent console | `integrator/workbench` | Opus-class (Claude cloud) | **Merged** (PR #53) |
 | [0-remote-files](0-remote-files.md) | 0 · Composition root | `integrator/remote-files` | Codex (cloud) | Deferred: needs a hub-to-runner link (after team hubs); remote workspaces already serve their own files |
 | [K-updater](K-updater.md) | K · Desktop shell | `integrator/updater` | Codex (local, Windows) | **Merged** (PR #51) |
-| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Opus-class (Claude cloud) | In review (PR #54) |
-| [0-create-dialogs](0-create-dialogs.md) | 0 · Composition root | `integrator/create-dialogs` | Codex (cloud) | In review (PR #60) |
-| [0-start-sessions](0-start-sessions.md) | 0 · Composition root | `integrator/start-sessions` | Codex (cloud) | In review (PR #62) |
+| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Opus-class (Claude cloud) | **Merged** (PR #54; follow-ups in #59) |
+| [0-create-dialogs](0-create-dialogs.md) | 0 · Composition root | `integrator/create-dialogs` | Codex (cloud) | **Merged** (PR #60) |
+| [0-start-sessions](0-start-sessions.md) | 0 · Composition root | `integrator/start-sessions` | Codex (cloud) | **Merged** (PR #62) |
 | [0-orchestrator-chat](0-orchestrator-chat.md) | 0 · Composition root | `integrator/orchestrator-chat` | Opus-class (Claude cloud) | In review (PR #59) |
-| [0-trusted-data](0-trusted-data.md) | 0 · Composition root | `integrator/trusted-data` | Opus-class (Claude cloud) | Ready |
-| [0-tasks-that-work](0-tasks-that-work.md) | 0 · Composition root | `integrator/tasks-that-work` | Codex (local) | Ready |
-| [0-settings](0-settings.md) | 0 · Composition root | `integrator/settings` | Codex (local) | Ready |
-| [0-files-everywhere](0-files-everywhere.md) | 0 · Composition root | `integrator/files-everywhere` | Codex (local) | Ready |
-| [L-shell-polish](L-shell-polish.md) | L · Shell | `integrator/shell-polish` | Codex (local) | Ready |
-| [0-resume-sessions](0-resume-sessions.md) | 0 · Composition root | `integrator/resume-sessions` | Codex | After 0-start-sessions (#62) |
-| [L-home-inbox](L-home-inbox.md) | L · Shell | `integrator/home-inbox` | Opus-class | After 0-tasks-that-work |
-| [N-projects-boards](N-projects-boards.md) | N · Projects layout | `integrator/projects-boards` | Opus-class | After 0-tasks-that-work and 0-trusted-data |
+| [0-trusted-data](0-trusted-data.md) | 0 · Composition root | `integrator/trusted-data` | Opus-class (Claude cloud) | In review (PR #67) |
+| [0-tasks-that-work](0-tasks-that-work.md) | 0 · Composition root | `integrator/tasks-that-work` | Codex (local) | In review (PR #66; fixes by the Claude orchestrator) |
+| [0-settings](0-settings.md) | 0 · Composition root | `integrator/settings` | Codex (local) | In review (PR #64) |
+| [0-files-everywhere](0-files-everywhere.md) | 0 · Composition root | `integrator/files-everywhere` | Codex (local) | In review (PR #63) |
+| [L-shell-polish](L-shell-polish.md) | L · Shell | `integrator/shell-polish` | Codex (local) | In review (PR #65; fixes by the Claude orchestrator) |
+| [0-resume-sessions](0-resume-sessions.md) | 0 · Composition root | `integrator/resume-sessions` | Opus-class (Claude cloud) | Ready |
+| [K-desktop-followups](K-desktop-followups.md) | K · Desktop shell | `integrator/desktop-followups` | Opus-class (Claude cloud) | After #63 and #64 |
+| [P-portable-windows](P-portable-windows.md) | P · Packaging | `integrator/portable-windows` | Opus-class (Claude cloud) | Ready |
+| [L-home-inbox](L-home-inbox.md) | L · Shell | `integrator/home-inbox` | Opus-class (Claude cloud) | After 0-tasks-that-work (#66) |
+| [N-projects-boards](N-projects-boards.md) | N · Projects layout | `integrator/projects-boards` | Opus-class (Claude cloud) | After 0-tasks-that-work (#66) and 0-trusted-data (#67) |
 | [0-team-hubs](0-team-hubs.md) | 0 · Contracts | `integrator/team-hubs` | Opus-class (Claude cloud) | Last (after the route-heavy briefs) |
 | [0-ci-security](0-ci-security.md) | 0 · Contracts | `integrator/ci-security` | Codex | **Merged** (PR #22) |
 | [0-protocol-ts](0-protocol-ts.md) | 0 · Contracts | `integrator/protocol-ts` | Codex | **Merged** (PR #23) |

@@ -21,7 +21,7 @@ The first-run wizard, and connecting a remote machine in the desktop app. See
 | `api-context.tsx` | `OnboardingApiProvider`, `useOnboardingApi()`. No default: nothing falls back to the fake. |
 | `wizard-state.ts` | `WizardState`: one plain object per run, never persisted (a reload starts over). |
 | `wizard-context.tsx` | `WizardProvider`, `useWizard()`: the state, the steps (`stepsFor(api)`), the current step, and `next`/`back`/`skip`/`goTo`. `patch` is stable (`useCallback`, no deps) — see the comment there for why that matters to any step whose effect both starts a stream and calls `patch`. |
-| `steps.ts` | The first-run steps, in order, and the calls each needs: `stepsFor(api)` leaves out a step whose calls are unavailable. |
+| `steps.ts` | The first-run steps, in order, and the calls each needs: `stepsFor(api, { target, draft })` leaves out a step whose calls are unavailable, the install step where `target` (the hub's own machine by default) needs no helper, and the optional draft step unless `draft` (below). |
 | `wizard-shell.tsx` | The stepper (a vertical Radix `Tabs.Root`, so arrow keys move between reached steps) and the current step's content. |
 | `step-footer.tsx` | The Back / Skip / primary-action row every step ends with, inside a `<form onSubmit>` so Enter submits it. |
 | `steps/*.tsx` | One component per step. `workspace-step.tsx` is the setup form; once the hub has taken it, going Back only shows what was set, and never sends it again. |
@@ -35,7 +35,8 @@ The first-run wizard, and connecting a remote machine in the desktop app. See
 A fresh hub answers `GET /v1/workspace` with `setup_needed: true`, and the shell sends the
 workspace to `paths.setup(ws)`, this feature's first-run wizard, from any page (see
 `src/shell/README.md`, "The first run"). Against the real hub the wizard is **Welcome, Workspace,
-Machine check, Sign in, Scan, Create, Import, Hooks, Safety, Done**, then Home:
+Machine check, Sign in, Scan, Create, Import, Hooks, Safety, Done**, then Home (with **Draft
+boards** after Import when the run has something to draft; see "Drafting the boards from history"):
 
 - **Workspace** is `POST /v1/setup`: the workspace's name, your name, your handle (suggested from
   the first word of your name, `Sam Rivera` → `@sam`, until you type one), and this machine's name
@@ -216,6 +217,23 @@ is its only implementation. Types are in `api.ts`, reusing `Engine`, `Project`, 
 "Add a machine" wizard and its palette command are retired: its machine-picker-led flow ran only
 against the fake, and connecting a remote hub is now the connect wizard above. Adding a machine to
 an existing hub (a runner reporting to it) comes back when those routes land.
+
+## Drafting the boards from history (optional)
+
+After Import, the real first run can offer **Draft boards** (`steps/draft-step.tsx`,
+`draft-board.tsx`; brief 0-draft-board, api-v1.md "Board drafts"): for each workstream created in
+this run, what would be sent to an agent the person already uses (no API key: its own CLI), its
+size and the agent's estimated usage, and a start the person confirms per workstream. Proposals
+are reviewed later on each workstream's page ("Draft board"); nothing is created until then.
+
+The step goes through the data layer (`../projects/board-drafts.ts`), not `OnboardingApi`, so
+`api.ts` and `hub-api.ts` are unchanged. It is in the stepper (`stepsFor(api, { draft })`, from
+`WizardProvider`) only when `DraftStepProvider` is around the wizard (the hub's first run puts it
+there; the fake and the other tests do not) and the run has something to draft (`showDraftStep`:
+workstreams were created, and the import kept some sessions, or was not made). A first run that
+imports nothing, as against a fresh hub, has no such step, so the sequence stays Welcome,
+Workspace, Machine check, Sign in, Scan, Create, Import, Hooks, Safety, Done; with it, Draft boards
+comes between Import and Hooks, as `docs/build/streams/O.md` orders them.
 
 ## Running this stream's tests
 

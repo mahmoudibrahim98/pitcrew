@@ -99,10 +99,22 @@ fn unverifiable(s: &LinkState) -> bool {
 
 /// Sends `data` through one connection, half-closes, and reads to the end.
 fn echo(rt: &tokio::runtime::Runtime, connector: &Connector, data: &[u8]) -> Vec<u8> {
-    rt.block_on(async {
+    rt.block_on(within(STEP, "the echo through the tunnel", async {
         let stream = connector.connect().await.unwrap();
         exchange(stream, data.to_vec()).await
-    })
+    }))
+}
+
+/// The longest one step of a case may take before the case fails, naming it: a stalled link
+/// then fails the case at once instead of the whole run at CI's job limit.
+const STEP: Duration = Duration::from_secs(90);
+
+/// `future`, or a panic naming `what` once `limit` has passed.
+async fn within<T>(limit: Duration, what: &str, future: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(limit, future).await {
+        Ok(out) => out,
+        Err(_) => panic!("{what} did not finish within {} s", limit.as_secs()),
+    }
 }
 
 async fn exchange(stream: pitcrew_remote::TunnelStream, data: Vec<u8>) -> Vec<u8> {
@@ -894,7 +906,12 @@ fn tunnel_a_job_that_ended_then_moved() {
 
     // A new job, on another node.
     sim.set(|c| c.node = "node018".to_owned());
-    let started = crate::unix::block_on(launcher.start(&m.plain())).unwrap();
+    let started = crate::unix::block_on(within(
+        STEP,
+        "the new job's start",
+        launcher.start(&m.plain()),
+    ))
+    .unwrap();
     assert_eq!(started.endpoint.host, "node018");
     wait_for(
         &rt,
@@ -926,11 +943,16 @@ fn tunnel_a_job_that_ended_then_moved() {
     assert_eq!(forwards, ["node017", "node018"]);
 
     // Stopped with the launcher, which forgets it (the connector may see it end first).
-    crate::unix::block_on(launcher.cancel(&m.plain())).unwrap();
+    crate::unix::block_on(within(
+        STEP,
+        "the job's cancel",
+        launcher.cancel(&m.plain()),
+    ))
+    .unwrap();
     wait_for(&rt, &connector, "no job", Duration::from_secs(30), |s| {
         not_running(s) && s.to_string().contains("no helper job")
     });
-    rt.block_on(connector.close());
+    rt.block_on(within(STEP, "the connector's close", connector.close()));
 }
 
 /// Answers prompts from a queue (then with the password), counting them.
