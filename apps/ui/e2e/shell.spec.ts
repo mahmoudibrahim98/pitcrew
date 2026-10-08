@@ -194,6 +194,7 @@ test("the palette's actions on the open task focus its controls; Home and End st
   await openShell(page);
   const input = page.getByRole('combobox', { name: 'Search' });
   await page.keyboard.press('Control+KeyK');
+  await expect(input).toBeFocused();
   await page.keyboard.type('PAP-4');
   await expect(page.getByRole('option').first()).toContainText('PAP-4');
   await page.keyboard.press('Enter');
@@ -216,6 +217,7 @@ test("the palette's actions on the open task focus its controls; Home and End st
 
   // Home and End move the caret in the search text.
   await page.keyboard.press('Control+KeyK');
+  await expect(input).toBeFocused();
   await page.keyboard.type('seed');
   await page.keyboard.press('Home');
   expect(await input.evaluate((field: HTMLInputElement) => field.selectionStart)).toBe(0);
