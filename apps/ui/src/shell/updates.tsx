@@ -2,7 +2,8 @@ import { createContext, useContext, useEffect, useRef, useState, type ReactNode 
 import { Button, Dialog, DialogContent, DialogFooter } from '../design/index.ts';
 import { Page } from './pages/page.tsx';
 
-interface Status { enabled: boolean; prereleases: boolean; version?: string; notesUrl?: string }
+/** `portable`: a portable copy, which never installs; `downloadUrl` is its pending release's page. */
+interface Status { enabled: boolean; prereleases: boolean; portable?: boolean; version?: string; notesUrl?: string; downloadUrl?: string }
 interface UpdateState { status: Status | undefined; busy: boolean; message: string; run(command: string, args?: Record<string, unknown>): Promise<void> }
 const Updates = createContext<UpdateState | null>(null);
 const invoke = async <T,>(command: string, args?: Record<string, unknown>): Promise<T> =>
@@ -47,17 +48,19 @@ export function DesktopUpdates({ children }: { children: ReactNode }) {
     {children}
     {status?.version !== undefined && status.version !== dismissed && <aside aria-label="Desktop update" className="fixed right-4 bottom-4 z-30 max-w-sm rounded-lg border border-line bg-card p-4 text-sm text-ink shadow-pop">
       <p>PitCrew {status.version} is available.</p>
+      {status.portable === true && <p className="mt-1 text-ink-2">This portable copy does not install updates. Download the new zip, quit PitCrew, and unzip it over this folder.</p>}
       <div className="mt-2 flex gap-2">
         <a
-          href={status.notesUrl}
+          href={status.portable === true ? status.downloadUrl : status.notesUrl}
           aria-disabled={busy}
           className="inline-flex items-center font-medium hover:underline"
           onClick={(event) => {
             event.preventDefault();
+            // The release's page, opened by Rust: for a portable copy it carries the zip.
             if (!busy) void run('gateway_update_notes', { version: status.version });
           }}
-        >Release notes</a>
-        <Button disabled={busy} onClick={() => setConfirm(status.version)}>Update</Button>
+        >{status.portable === true ? 'Download' : 'Release notes'}</a>
+        {status.portable !== true && <Button disabled={busy} onClick={() => setConfirm(status.version)}>Update</Button>}
         <Button disabled={busy} onClick={() => setDismissed(status.version)}>Later</Button>
       </div>
       {message && <p role="status">{message}</p>}
@@ -80,8 +83,10 @@ export function UpdateSettings() {
     <section className="space-y-3 text-sm">
       <h2 className="font-semibold">Desktop updates</h2>
       {updates === null ? <p>Updates are managed by the desktop app.</p> : <>
-        <p>Checks run on startup and daily. Updates are installed only after you agree.</p>
-        {updates.status?.enabled === false && <p>Automatic updates are disabled in this build or installation. On Linux, deb/rpm installations use the package manager.</p>}
+        {updates.status?.portable === true
+          ? <p>This is a portable copy: it never installs updates. {updates.status.enabled ? 'Checks for new releases run on startup and daily.' : 'It is a development build, so it does not check for updates; newer builds are on GitHub Actions.'}</p>
+          : <p>Checks run on startup and daily. Updates are installed only after you agree.</p>}
+        {updates.status?.enabled === false && updates.status.portable !== true && <p>Automatic updates are disabled in this build or installation. On Linux, deb/rpm installations use the package manager.</p>}
         <Button disabled={updates.busy || updates.status?.enabled !== true} onClick={() => void updates.run('gateway_update_check')}>Check now</Button>
         <label className="flex items-center gap-2"><input type="checkbox" checked={updates.status?.prereleases ?? false} disabled={updates.busy || updates.status === undefined} onChange={(e) => void updates.run('gateway_update_channel', { prereleases: e.target.checked })} />Include pre-releases</label>
         {updates.status?.version !== undefined && <p>Version {updates.status.version} is available.</p>}
