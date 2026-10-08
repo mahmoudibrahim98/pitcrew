@@ -1,8 +1,11 @@
 import { cx } from '../lib/cx.ts';
+import type { Engine } from '../data/index.ts';
+import { EngineLogo } from './engine-logo.tsx';
 
 export interface AvatarMember {
   kind: 'human' | 'agent';
   name: string;
+  engine?: Engine;
 }
 
 type Size = 'sm' | 'md' | 'lg';
@@ -60,7 +63,7 @@ export function Avatar({
             : 'rounded-pill bg-ink text-bg',
         )}
       >
-        {initials(member.name)}
+        {agent && member.engine !== undefined ? <EngineLogo engine={member.engine} /> : initials(member.name)}
       </span>
       {agent && owner !== undefined && (
         <span

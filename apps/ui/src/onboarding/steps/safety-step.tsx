@@ -88,10 +88,9 @@ export function SafetyStep() {
             checked={state.safety.backOfficeEnabled}
             onChange={(e) => patch({ safety: { ...state.safety, backOfficeEnabled: e.target.checked } })}
           />
-          Let the back office accept low-risk actions automatically
+          Accept low-risk agent requests automatically
         </label>
-        {state.safety.backOfficeEnabled && (
-          <div className="flex items-center gap-2 pl-6">
+          <div className="flex min-h-7 items-center gap-2 pl-6">
             <label htmlFor={capsId} className="text-xs text-ink-2">
               Up to
             </label>
@@ -100,6 +99,7 @@ export function SafetyStep() {
               type="number"
               min={0}
               max={100}
+              disabled={!loaded || !state.safety.backOfficeEnabled}
               value={state.safety.backOfficeCaps.maxAutoAcceptPerHour}
               onChange={(e) =>
                 patch({
@@ -115,7 +115,6 @@ export function SafetyStep() {
             />
             <span className="text-xs text-ink-2">per hour, without asking.</span>
           </div>
-        )}
       </fieldset>
 
       <StepFooter nextLabel="Continue" busy={busy} nextDisabled={!loaded} />

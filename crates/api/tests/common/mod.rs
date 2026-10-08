@@ -1,4 +1,5 @@
-//! A small app for the API tests: one agent route, one device route, one device WebSocket.
+//! A small app for the API tests: one agent route, one session route, one device route, one
+//! device WebSocket.
 
 #![allow(dead_code)]
 
@@ -20,8 +21,10 @@ pub struct Fixture {
     pub tokens: Arc<FileTokenStore>,
     pub person: Caller,
     pub agent: Caller,
+    pub session: Caller,
     pub device_token: String,
     pub agent_token: String,
+    pub session_token: String,
 }
 
 impl Fixture {
@@ -37,14 +40,21 @@ impl Fixture {
             scope: TokenScope::Agent,
             on_behalf_of: Some(person.member),
         };
+        let session = Caller {
+            scope: TokenScope::Session(pitcrew_protocol::SessionId::new()),
+            ..agent
+        };
         let (_, device_token) = tokens.mint(person).unwrap();
         let (_, agent_token) = tokens.mint(agent).unwrap();
+        let (_, session_token) = tokens.mint(session).unwrap();
         Self {
             tokens,
             person,
             agent,
+            session,
             device_token: device_token.into_string(),
             agent_token: agent_token.into_string(),
+            session_token: session_token.into_string(),
         }
     }
 
@@ -62,6 +72,7 @@ impl Fixture {
                     .route("/v1/me", whoami.clone())
                     .nest("/v1/agent-files", nested("agent fallback")),
             )
+            .session(Router::new().route("/v1/session-answer", whoami.clone()))
             .device(
                 Router::new()
                     .route("/v1/device-only", whoami)

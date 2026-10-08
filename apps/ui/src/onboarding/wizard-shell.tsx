@@ -10,6 +10,7 @@ import type { StepId } from './steps.ts';
 import { useWizard } from './wizard-context.tsx';
 import { CreateStep } from './steps/create-step.tsx';
 import { DoneStep } from './steps/done-step.tsx';
+import { DraftStep } from './steps/draft-step.tsx';
 import { HooksStep } from './steps/hooks-step.tsx';
 import { ImportStep } from './steps/import-step.tsx';
 import { InstallHelperStep } from './steps/install-helper-step.tsx';
@@ -31,6 +32,7 @@ const STEP_COMPONENTS: Record<StepId, ComponentType> = {
   scan: ScanStep,
   create: CreateStep,
   import: ImportStep,
+  draft: DraftStep,
   hooks: HooksStep,
   safety: SafetyStep,
   done: DoneStep,

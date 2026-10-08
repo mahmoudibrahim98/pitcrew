@@ -14,6 +14,11 @@ import {
 } from '../data/index.ts';
 import {
   Avatar,
+  CalendarIcon,
+  FolderIcon,
+  MembersIcon,
+  LinkIcon,
+  ConsoleIcon,
   ChevronsUpDownIcon,
   FOCUS_RING,
   Menu,
@@ -154,7 +159,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
 
 function NavLink({ entry, collapsed }: { entry: ResolvedNav; collapsed: boolean }) {
   const ws = useWorkspaceId();
-  const Icon = entry.icon;
+  const Icon = entry.icon ?? ({ 'projects-list': FolderIcon, members: MembersIcon, calendar: CalendarIcon, integrations: LinkIcon }[entry.id] ?? ConsoleIcon);
   const Count = entry.badge;
   const link = (
     <Link
@@ -163,13 +168,7 @@ function NavLink({ entry, collapsed }: { entry: ResolvedNav; collapsed: boolean 
       data-nav={entry.id}
       className={cx(ITEM, collapsed && 'justify-center px-0')}
     >
-      {Icon === undefined ? (
-        <span aria-hidden className="inline-flex size-4 shrink-0 items-center justify-center text-xs font-semibold">
-          {entry.label.slice(0, 1)}
-        </span>
-      ) : (
-        <Icon className="size-4 shrink-0" />
-      )}
+      <Icon className="size-4 shrink-0" />
       {!collapsed && <span className="min-w-0 flex-1 truncate">{entry.label}</span>}
       {!collapsed && Count !== undefined && <Count />}
     </Link>

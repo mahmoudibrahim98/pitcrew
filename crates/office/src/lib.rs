@@ -37,14 +37,23 @@
 //! Checked in code for every action, whatever a rule or an event says: never send anything
 //! outward (no approval asks, only internal events), never mark a task done unless it allows
 //! automatic acceptance, never answer an ask addressed to a person.
+//!
+//! ## Prompts and what they send
+//!
+//! [`prompts`] holds the versioned prompt templates (`prompts/<name>/v<n>.md`); [`board`] builds
+//! the bounded, redacted summary a board draft sends its agent, and its cost; [`redact`] is what
+//! never leaves in a prompt.
 
 #![forbid(unsafe_code)]
 
 mod action;
+pub mod board;
 mod caps;
 mod commands;
 mod guard;
 mod office;
+pub mod prompts;
+pub mod redact;
 mod rule;
 mod rules;
 mod runlog;

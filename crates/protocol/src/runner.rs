@@ -187,6 +187,14 @@ pub enum RunnerCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(optional))]
         session: Option<SessionId>,
+        /// A run PitCrew starts on its own behalf (a board draft's): the runner starts the CLI in
+        /// its confined, read-mostly shape, whatever the person's own settings for it say, in
+        /// `cwd`, a private folder the hub prepared with the run's prompt and settings files. The
+        /// permission mode must be `default`; OpenCode is refused on Windows. See the runner's
+        /// README, "Confined runs".
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(feature = "ts", ts(as = "Option<bool>", optional))]
+        confined: bool,
     },
     /// Resume an existing CLI session by its native id.
     ResumeSession {

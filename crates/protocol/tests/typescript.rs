@@ -60,6 +60,19 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     pitcrew_protocol::files::FileList::export_all(&config)?;
     pitcrew_protocol::files::FileContent::export_all(&config)?;
     pitcrew_protocol::files::WriteFile::export_all(&config)?;
+    // Board drafts (api-v1.md, "Board drafts").
+    pitcrew_protocol::board::BoardDraft::export_all(&config)?;
+    pitcrew_protocol::board::BoardProposal::export_all(&config)?;
+    pitcrew_protocol::board::DraftCost::export_all(&config)?;
+    pitcrew_protocol::board::DraftPreview::export_all(&config)?;
+    pitcrew_protocol::board::DraftReview::export_all(&config)?;
+    pitcrew_protocol::board::DraftReviewed::export_all(&config)?;
+    pitcrew_protocol::board::DraftState::export_all(&config)?;
+    pitcrew_protocol::board::DraftedTask::export_all(&config)?;
+    pitcrew_protocol::board::ProposedTask::export_all(&config)?;
+    pitcrew_protocol::board::StartDraft::export_all(&config)?;
+    pitcrew_protocol::board::UsageEstimate::export_all(&config)?;
+    pitcrew_protocol::ids::DraftId::export_all(&config)?;
     api::ReadCursor::export_all(&config)?;
     api::MoveCursor::export_all(&config)?;
     api::Caller::export_all(&config)?;
@@ -507,6 +520,48 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
             command: vec!["claude".into(), "auth".into(), "login".into()],
             running: true,
             started: 42,
+        },
+    )?;
+    // A board draft waiting for review: optional fields omitted, the proposal's included.
+    fixture(
+        &config,
+        &mut examples,
+        "boardDraft",
+        pitcrew_protocol::board::BoardDraft {
+            id: "01J00000000000000000000000".parse()?,
+            workstream: "01J00000000000000000000000".parse()?,
+            agent: "01J00000000000000000000000".parse()?,
+            engine: model::Engine::Claude,
+            session: "01J00000000000000000000000".parse()?,
+            by: "01J00000000000000000000000".parse()?,
+            prompt: "draft-board/v1".into(),
+            cost: pitcrew_protocol::board::DraftCost {
+                sessions: 1,
+                sessions_left_out: 0,
+                tasks: 0,
+                summary_bytes: 300,
+                prompt_bytes: 2400,
+                redacted: 0,
+                estimate: pitcrew_protocol::board::UsageEstimate {
+                    input_tokens: 15_600,
+                    output_tokens: 8192,
+                },
+            },
+            started: 42,
+            state: pitcrew_protocol::board::DraftState::Proposed,
+            proposal: Some(pitcrew_protocol::board::BoardProposal {
+                tasks: vec![pitcrew_protocol::board::ProposedTask {
+                    title: "Synthetic task".into(),
+                    status: model::TaskStatus::Todo,
+                    description: None,
+                    evidence: vec!["01J00000000000000000000000".parse()?],
+                }],
+                note: None,
+            }),
+            proposed: Some(43),
+            reviewed: None,
+            accepted: Vec::new(),
+            rejected: Vec::new(),
         },
     )?;
     // Request dimensions may be omitted even though Rust serializes their defaults.

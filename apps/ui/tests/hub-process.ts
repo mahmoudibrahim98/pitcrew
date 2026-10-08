@@ -23,9 +23,10 @@ export interface HubProcess {
   close(): Promise<void>;
 }
 
-export async function spawnHub(port: number): Promise<HubProcess> {
+/** The mock hub on `port`, with `env` added to its environment (`PITCREW_MOCK_*` settings). */
+export async function spawnHub(port: number, env: Record<string, string> = {}): Promise<HubProcess> {
   const child = spawn(process.execPath, ['--import', CLOCK, SERVER], {
-    env: { ...process.env, PORT: String(port) },
+    env: { ...process.env, ...env, PORT: String(port) },
     stdio: ['ignore', 'pipe', 'inherit'],
   });
   await new Promise<void>((ready, fail) => {

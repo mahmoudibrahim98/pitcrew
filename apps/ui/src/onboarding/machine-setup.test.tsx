@@ -351,7 +351,7 @@ describe('installing the helper', () => {
     expect(api.unavailable.has('launcherOptions')).toBe(true);
     expect(api.unavailable.has('streamInstallHelper')).toBe(true);
     // Not even for a machine that needs the helper.
-    expect(stepsFor(api, { kind: 'ssh', host: 'hpc-login' }).map((s) => s.id)).not.toContain('install-helper');
+    expect(stepsFor(api, { target: { kind: 'ssh', host: 'hpc-login' } }).map((s) => s.id)).not.toContain('install-helper');
     await expect(api.launcherOptions({ kind: 'ssh', host: 'hpc-login' })).rejects.toThrow('not available');
     expect(() =>
       api.streamInstallHelper({ machine: { kind: 'ssh', host: 'hpc-login' }, launcher: 'tmux', plan: 'plan-1' }, () => undefined),

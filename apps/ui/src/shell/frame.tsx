@@ -26,6 +26,7 @@ import { TopBar } from './top-bar.tsx';
 
 const loadPalette = () => import('./palette.tsx');
 const Palette = lazy(() => loadPalette().then((m) => ({ default: m.Palette })));
+const PaletteLinkSession = lazy(() => import('./link-session.tsx').then((m) => ({ default: m.PaletteLinkSession })));
 
 /** Fetches the palette's chunk once the shell is idle, so Ctrl K opens at once. */
 function usePrefetchPalette(): void {
@@ -159,6 +160,7 @@ function FullFrame({ unavailable }: { unavailable: GatewayWorkspace | undefined 
   const ws = useWorkspaceId();
   const layout = useLayout();
   const paletteOpen = useShell((s) => s.paletteOpen);
+  const linkingSession = useShell((s) => s.linkingSession);
   const orchestratorOpen = useShell((s) => s.orchestratorOpen);
   useShellShortcuts(router, ws);
   usePrefetchPalette();
@@ -184,6 +186,7 @@ function FullFrame({ unavailable }: { unavailable: GatewayWorkspace | undefined 
       </div>
       <LayoutMemory />
       <CreateDialog />
+      {linkingSession !== null && <Suspense fallback={null}><PaletteLinkSession id={linkingSession} /></Suspense>}
       {paletteOpen && (
         <Suspense fallback={null}>
           <Palette />

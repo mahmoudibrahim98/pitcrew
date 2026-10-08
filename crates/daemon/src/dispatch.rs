@@ -46,10 +46,11 @@
 //!   an adoption still on its way to the hub is allowed to arrive first.
 
 use crate::agents::HubAgents;
+use crate::confined::{ConfinedRuns, Ender, GRACE};
 use crate::runner::{Attached, Parts};
 use crate::state::{read_token, write_token};
 use pitcrew_auth::TokenStore;
-use pitcrew_hub_work::{DispatchError, DispatchRequest, Dispatcher, WorkService};
+use pitcrew_hub_work::{DispatchError, DispatchRequest, Dispatcher, SessionRequest, WorkService};
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::{CommandId, MachineId, MemberId, SessionId};
@@ -80,13 +81,35 @@ const ENDPOINTS: [&str; 3] = ["PITCREW_SOCKET", "PITCREW_PIPE", "PITCREW_URL"];
 #[derive(Debug)]
 pub struct RunnerLink {
     attached: Arc<Attached>,
+    /// Confined runs (board drafts): their folders, files, tokens and ends.
+    confined: Option<Ender>,
 }
 
 impl RunnerLink {
-    /// Starts dispatched sessions with the runner `attached` has, once it has one.
+    /// Starts dispatched sessions with the runner `attached` has, once it has one. No confined
+    /// run starts: see [`RunnerLink::with_confined`].
     #[must_use]
     pub fn new(attached: Arc<Attached>) -> Self {
-        Self { attached }
+        Self {
+            attached,
+            confined: None,
+        }
+    }
+
+    /// Starts confined runs too (`SessionRequest::confinement`, a board draft's) with `runs`; the
+    /// work model is given to `work` once it is made (see [`crate::confined`]).
+    #[must_use]
+    pub fn with_confined(
+        mut self,
+        runs: Arc<ConfinedRuns>,
+        work: Arc<OnceLock<Weak<WorkService>>>,
+    ) -> Self {
+        self.confined = Some(Ender {
+            attached: Arc::clone(&self.attached),
+            runs,
+            work,
+        });
+        self
     }
 
     /// The runner, if one is attached and runs on `machine`.
@@ -132,6 +155,91 @@ impl Dispatcher for RunnerLink {
             CommandOutcome::Failed { error } => Err(DispatchError::Unavailable(error)),
         }
     }
+
+    /// A session the hub stored for an agent outside a dispatch (a board draft's): started as a
+    /// dispatch's is, under the session the hub stored. A confined one (all board drafts) is
+    /// prepared first ([`ConfinedRuns::prepare`]: its fresh folder, its files, its session token,
+    /// which [`AgentEnv`] gives its CLI in place of its agent's), started in its confined shape,
+    /// and watched until it ends or runs past its time.
+    fn start_session(&self, request: &SessionRequest) -> Result<(), DispatchError> {
+        let _starting = self.attached.starting(request.session);
+        let runner = self.runner(&request.machine)?;
+        let mut command = request.start_command();
+        let confined = match (&request.confinement, &self.confined) {
+            (Some(confinement), Some(ender)) => {
+                let (folder, stop) = ender
+                    .runs
+                    .prepare(request, confinement)
+                    .map_err(DispatchError::Unavailable)?;
+                let folder = folder.into_os_string().into_string().map_err(|_| {
+                    DispatchError::Unavailable("the scratch folder is not UTF-8".into())
+                });
+                let folder = match folder {
+                    Ok(folder) => folder,
+                    Err(e) => {
+                        ender.runs.finish(&request.session);
+                        return Err(e);
+                    }
+                };
+                Some((ender, folder, stop, confinement.max_runtime))
+            }
+            (Some(_), None) => {
+                return Err(DispatchError::Unavailable(
+                    "this hub's runner link starts no confined runs".into(),
+                ));
+            }
+            (None, _) => None,
+        };
+        let cwd_for = match &confined {
+            Some((_, folder, ..)) => folder.clone(),
+            None => folder(&request.cwd).map_err(DispatchError::Rejected)?,
+        };
+        if let RunnerCommand::StartSession { cwd, .. } = &mut command {
+            *cwd = cwd_for;
+        }
+        let outcome = runner.commands.run(CommandId::new(), &command);
+        match (outcome, confined) {
+            (CommandOutcome::Ok { .. }, confined) => {
+                tracing::info!(session = %request.session, agent = %request.agent, confined = confined.is_some(), "started a session's CLI for an agent");
+                if let Some((ender, _, stop, max_runtime)) = confined {
+                    ender.watch(request.session, max_runtime, stop);
+                }
+                self.attached.started();
+                Ok(())
+            }
+            (failed, confined) => {
+                if let Some((ender, ..)) = confined {
+                    ender.runs.finish(&request.session);
+                }
+                match failed {
+                    CommandOutcome::Rejected { reason } => Err(DispatchError::Rejected(reason)),
+                    CommandOutcome::Failed { error } => Err(DispatchError::Unavailable(error)),
+                    CommandOutcome::Ok { .. } => Ok(()),
+                }
+            }
+        }
+    }
+
+    fn confined_folder(&self, session: &SessionId) -> Option<String> {
+        let ender = self.confined.as_ref()?;
+        ender
+            .runs
+            .folder_of(session)?
+            .into_os_string()
+            .into_string()
+            .ok()
+    }
+
+    /// The run has done its one thing: its token stops now; its CLI is ended after [`GRACE`]
+    /// (gracefully, else killed), on a thread of its own, and its folder goes with it.
+    fn finish_session(&self, session: &SessionId) -> Result<(), DispatchError> {
+        let Some(ender) = &self.confined else {
+            return Ok(());
+        };
+        ender.runs.revoke(session);
+        ender.end_later(*session, GRACE, "its run is done");
+        Ok(())
+    }
 }
 
 /// A dispatch's folder, as the CLI starts in it: `~` (or `~/…`) in this user's home, then checked
@@ -174,6 +282,8 @@ pub struct AgentEnv {
     endpoint: OnceLock<(&'static str, String)>,
     /// One token file written at a time.
     writing: Mutex<()>,
+    /// Confined runs, whose CLIs get their session token's file instead of their agent's.
+    confined: Option<Arc<ConfinedRuns>>,
 }
 
 impl fmt::Debug for AgentEnv {
@@ -196,7 +306,15 @@ impl AgentEnv {
             dir,
             endpoint: OnceLock::new(),
             writing: Mutex::new(()),
+            confined: None,
         }
+    }
+
+    /// A confined run's CLI gets the file of its session token from `runs`, never its agent's.
+    #[must_use]
+    pub fn with_confined(mut self, runs: Arc<ConfinedRuns>) -> Self {
+        self.confined = Some(runs);
+        self
     }
 
     /// This daemon listens there now: `variable` (`PITCREW_SOCKET`, `PITCREW_PIPE` or
@@ -234,7 +352,7 @@ impl SessionEnv for AgentEnv {
             .work
             .upgrade()
             .ok_or_else(|| "the hub is stopping".to_owned())?;
-        let (agent, owner) = match HubAgents::new(work).agent_of(session) {
+        let (agent, owner) = match HubAgents::new(Arc::clone(&work)).agent_of(session) {
             SessionAgent::NoAgent => return Ok(Vec::new()),
             SessionAgent::Unknown => {
                 return Err(format!(
@@ -253,10 +371,25 @@ impl SessionEnv for AgentEnv {
                 owner: Some(owner),
             } => (agent, owner),
         };
-        let file = self.token_file(agent, owner).map_err(|e| {
-            tracing::error!(%agent, error = %format!("{e:#}"), "cannot write an agent's token file");
-            "the agent's token file cannot be written".to_owned()
-        })?;
+        // A confined run's CLI gets its session token, which can do only its run's one thing;
+        // and a board draft's session never gets its agent's token, even once its run is gone.
+        let confined = self
+            .confined
+            .as_ref()
+            .and_then(|runs| runs.token_file(&session));
+        let file = match confined {
+            Some(file) => file,
+            None if work.is_draft_session(&session).unwrap_or(true) => {
+                return Err(format!(
+                    "session {session} is a board draft's, and its run's token is gone, so its \
+                     CLI cannot be given one"
+                ));
+            }
+            None => self.token_file(agent, owner).map_err(|e| {
+                tracing::error!(%agent, error = %format!("{e:#}"), "cannot write an agent's token file");
+                "the agent's token file cannot be written".to_owned()
+            })?,
+        };
         let file = file
             .into_os_string()
             .into_string()
@@ -279,7 +412,7 @@ impl SessionEnv for AgentEnv {
 }
 
 /// Makes `dir` if it is not there, private to this user (0700 on Unix).
-fn private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
@@ -961,6 +1094,7 @@ mod tests {
                 account: None,
                 permission_mode: PermissionMode::Default,
                 session: Some(named),
+                confined: false,
             };
             assert!(matches!(
                 commands.run(CommandId::new(), &command(pending.id)),

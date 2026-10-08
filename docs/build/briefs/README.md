@@ -113,7 +113,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [M-workbench](M-workbench.md) | M · Agent console | `integrator/workbench` | Opus-class (Claude cloud) | **Merged** (PR #53) |
 | [0-remote-files](0-remote-files.md) | 0 · Composition root | `integrator/remote-files` | Codex (cloud) | Deferred: needs a hub-to-runner link (after team hubs); remote workspaces already serve their own files |
 | [K-updater](K-updater.md) | K · Desktop shell | `integrator/updater` | Codex (local, Windows) | **Merged** (PR #51) |
-| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Opus-class (Claude cloud) | In review (PR #54) |
+| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Opus-class (Claude cloud) | **Merged** (PR #54; follow-ups in #59) |
 | [0-create-dialogs](0-create-dialogs.md) | 0 · Composition root | `integrator/create-dialogs` | Codex (cloud) | **Merged** (PR #60) |
 | [0-start-sessions](0-start-sessions.md) | 0 · Composition root | `integrator/start-sessions` | Codex (cloud) | **Merged** (PR #62) |
 | [0-orchestrator-chat](0-orchestrator-chat.md) | 0 · Composition root | `integrator/orchestrator-chat` | Opus-class (Claude cloud) | In review (PR #59) |
@@ -121,7 +121,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-tasks-that-work](0-tasks-that-work.md) | 0 · Composition root | `integrator/tasks-that-work` | Codex (local) | In review (PR #66; fixes by the Claude orchestrator) |
 | [0-settings](0-settings.md) | 0 · Composition root | `integrator/settings` | Codex (local) | In review (PR #64) |
 | [0-files-everywhere](0-files-everywhere.md) | 0 · Composition root | `integrator/files-everywhere` | Codex (local) | In review (PR #63) |
-| [L-shell-polish](L-shell-polish.md) | L · Shell | `integrator/shell-polish` | Codex (local) | In review (PR #65; fixes by the Claude orchestrator) |
+| [L-shell-polish](L-shell-polish.md) | L · Shell | `integrator/shell-polish` | Codex (local) | **Merged** (PR #65) |
 | [0-resume-sessions](0-resume-sessions.md) | 0 · Composition root | `integrator/resume-sessions` | Opus-class (Claude cloud) | Ready |
 | [K-desktop-followups](K-desktop-followups.md) | K · Desktop shell | `integrator/desktop-followups` | Opus-class (Claude cloud) | After #63 and #64 |
 | [P-portable-windows](P-portable-windows.md) | P · Packaging | `integrator/portable-windows` | Opus-class (Claude cloud) | Ready |

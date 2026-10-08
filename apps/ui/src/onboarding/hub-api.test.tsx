@@ -516,7 +516,7 @@ describe('the real first run, with the scan', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await screen.findByRole('button', { name: 'Install hooks' });
     fireEvent.click(screen.getByRole('button', { name: 'Skip hooks' }));
-    await screen.findByLabelText('Let the back office accept low-risk actions automatically');
+    await screen.findByLabelText('Accept low-risk agent requests automatically');
     await waitFor(() => expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await screen.findByRole('heading', { level: 1, name: "You're set up" });

@@ -9,13 +9,15 @@
 //! - **append-only**: nothing is edited in place. Pages, recaps, the Inbox and search are
 //!   projections.
 
+use crate::board::{DraftCost, DraftedTask, ProposedTask};
 use crate::ids::{
-    AskId, DispatchId, EventId, MachineId, MemberId, SessionId, TaskId, WorkspaceId, WorkstreamId,
+    AskId, DispatchId, DraftId, EventId, MachineId, MemberId, SessionId, TaskId, WorkspaceId,
+    WorkstreamId,
 };
 use crate::model::{
-    Answer, Ask, Dispatch, DispatchOutcome, ExternalRef, Health, LinkBasis, Liveness, Machine,
-    Member, Mover, Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskPatch,
-    TaskStatus, Team, TimestampMs, Workstream, WorkstreamStatus,
+    Answer, Ask, Dispatch, DispatchOutcome, Engine, ExternalRef, Health, LinkBasis, Liveness,
+    Machine, Member, Mover, Persona, Project, Receipt, Session, SessionState, Subtask, Task,
+    TaskPatch, TaskStatus, Team, TimestampMs, Workstream, WorkstreamStatus,
 };
 use crate::writes::{WriteProposal, WriteResult};
 use serde::{Deserialize, Serialize};
@@ -406,5 +408,51 @@ pub enum EventBody {
         task: Option<TaskId>,
         /// What came of it.
         result: WriteResult,
+    },
+
+    // Board drafts (`crate::board`): written by the hub.
+    /// A person asked an agent to draft a workstream's board from its history; its CLI starts
+    /// in `session` with the versioned `prompt` and a summary of `cost`'s size. The summary
+    /// itself is not kept.
+    BoardDraftStarted {
+        /// The draft.
+        draft: DraftId,
+        /// The workstream it drafts.
+        workstream: WorkstreamId,
+        /// The agent drafting it.
+        agent: MemberId,
+        /// The CLI it runs in.
+        engine: Engine,
+        /// The session it runs in.
+        session: SessionId,
+        /// The prompt's name and version.
+        prompt: String,
+        /// What was sent, and the estimate the person confirmed.
+        cost: DraftCost,
+    },
+    /// The drafting agent proposed a board. Nothing is created until a person reviews it.
+    BoardProposed {
+        /// The draft.
+        draft: DraftId,
+        /// Its workstream.
+        workstream: WorkstreamId,
+        /// The proposed tasks.
+        tasks: Vec<ProposedTask>,
+        /// The agent's note.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        note: Option<String>,
+    },
+    /// A person reviewed a draft's proposal. The `task_created` events of the accepted tasks are
+    /// in the same append, before this one.
+    BoardDraftReviewed {
+        /// The draft.
+        draft: DraftId,
+        /// Its workstream.
+        workstream: WorkstreamId,
+        /// The proposed tasks accepted, and the tasks they became.
+        accepted: Vec<DraftedTask>,
+        /// The proposed tasks rejected.
+        rejected: Vec<u32>,
     },
 }

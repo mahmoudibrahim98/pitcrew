@@ -78,7 +78,7 @@ export interface Command {
 
 /** An item in the "+ New" menu. */
 export interface CreateEntry {
-  /** `task`, `agent`, `project` and `team` replace the shell's placeholders. */
+  /** Unique across features (`task`, `project`, `session`…): `setCreating(id)` opens its dialog. */
   id: string;
   label: string;
   /** Only show in the menu and palette when a project route is in context. */
@@ -87,7 +87,7 @@ export interface CreateEntry {
   title?: string;
   /** The dialog body. Wrap a heavy form in `React.lazy`; the shell adds the Suspense boundary. */
   dialog: ComponentType<{ close(): void }>;
-  /** Lower comes first. The shell's own items use 10 to 40. Default 100. */
+  /** Lower comes first. The Projects feature's items use 10 to 40. Default 100. */
   order?: number;
   /**
    * Shows the item disabled, with this as its reason. The item stays focusable (so the reason is

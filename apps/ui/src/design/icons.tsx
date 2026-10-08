@@ -146,3 +146,7 @@ export const SplitDownIcon = icon(
     <path d="M2 8h12" />
   </>,
 );
+
+export const MembersIcon = icon('Members', <><circle cx="6" cy="5" r="2" /><path d="M2 13v-1a4 4 0 0 1 8 0v1M11 3.5a2 2 0 0 1 0 4M12 9a3 3 0 0 1 2 3v1" /></>);
+export const CalendarIcon = icon('Calendar', <><rect x="2" y="3.5" width="12" height="10" rx="1.5" /><path d="M5 2v3M11 2v3M2 7h12M5 10h2M9 10h2" /></>);
+export const LinkIcon = icon('Link', <><path d="m6 10 4-4M6 6l2-2a3 3 0 0 1 4 4l-2 2M10 10l-2 2a3 3 0 0 1-4-4l2-2" /></>);

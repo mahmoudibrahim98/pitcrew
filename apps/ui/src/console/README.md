@@ -1,5 +1,16 @@
 # console (stream M)
 
+Workbench panes are never drawn narrower than 320 px (`PANE_MIN_WIDTH`). A row split narrower
+than its panes' minimums added up (`minimumWidth`, nested splits included) is drawn stacked, in
+equal parts of at least 160 px that scroll when needed, and without dividers: stacking only
+changes the view, so the saved split comes back as it was once it fits. Side by side, dragging a
+divider (or its keys) stops at each pane's minimum, so a drag never stacks a split. Tab strips
+show no scrollbar: a vertical wheel scrolls them sideways, and the tab on screen is kept in view.
+Below 960 px of console width (`COMPACT_BELOW`) the filter column is folded away; it can be
+opened there, without changing the remembered choice, which applies again once the console is
+wider. Side columns clamp to leave 320 px for the workbench; Details stacks underneath when it
+cannot fit alongside. Unavailable hand-off, fork and review actions stay hidden.
+
 The Agent console. See `docs/build/streams/M.md`. `index.ts` registers it with the shell (`feature`)
 and exports its components. The app imports `index.ts` at start, so it stays small: the page and
 every component are lazy chunks (render the components inside a `<Suspense>`).

@@ -113,7 +113,7 @@ export function WhereItStands({ target, title = 'Where it stands' }: { target: B
               checked={draft.pinned}
               onChange={(e) => setDraft({ ...draft, pinned: e.target.checked })}
             />
-            Pin it (the back office may then only propose changes)
+            Pin it (automatic updates may then only suggest changes)
           </label>
           <div className="flex gap-2">
             <Button type="submit" variant="primary" disabled={save.isPending}>
@@ -134,7 +134,7 @@ export function WhereItStands({ target, title = 'Where it stands' }: { target: B
             )}
             <Receipts receipts={brief.receipts} names={names} />
             <p className="text-xs text-ink-2">
-              {brief.source === 'person' ? 'Written by a person' : 'From the back office'} · updated{' '}
+              {brief.source === 'person' ? 'Written by a person' : 'Written automatically from recent work'} · updated{' '}
               {formatWhen(brief.updated)}
             </p>
           </div>
@@ -154,7 +154,7 @@ export function WhereItStands({ target, title = 'Where it stands' }: { target: B
 
       {brief !== undefined && proposal !== undefined && draft === null && (
         <div role="group" aria-label="Proposed update" className="mt-3 rounded-sm border border-dashed border-line-2 bg-sunken p-3">
-          <p className="mb-1 text-xs font-medium text-ink-2">The back office proposes an update · {formatWhen(proposal.at)}</p>
+          <p className="mb-1 text-xs font-medium text-ink-2">An automatic update is suggested · {formatWhen(proposal.at)}</p>
           <p className="mb-2 text-sm">{proposal.text}</p>
           {proposal.next !== undefined && (
             <p className="mb-2 text-sm">
