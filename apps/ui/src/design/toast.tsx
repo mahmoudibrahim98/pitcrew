@@ -101,8 +101,14 @@ export function Toaster() {
   const messages = useToasts((state) => state.messages);
   const host = useHosts((state) => state.hosts.at(-1));
   const list = useRef<HTMLUListElement>(null);
-  const [hovered, setHovered] = useState(false);
-  const [focused, setFocused] = useState(false);
+  // Pointer and focus on the list, where it was then: moving into or out of a drawer starts afresh
+  // (the old list never sees the pointer leave).
+  const [over, setOver] = useState<{ host: HTMLElement | undefined; hovered: boolean; focused: boolean }>({
+    host: undefined,
+    hovered: false,
+    focused: false,
+  });
+  const paused = over.host === host && (over.hovered || over.focused);
   const any = messages.length > 0;
   // F8 moves focus to the notifications.
   useEffect(() => {
@@ -123,16 +129,16 @@ export function Toaster() {
       aria-live="polite"
       data-toaster=""
       // Timers wait while someone points at or focuses a notification.
-      onPointerEnter={() => setHovered(true)}
-      onPointerLeave={() => setHovered(false)}
-      onFocus={() => setFocused(true)}
+      onPointerEnter={() => setOver((was) => ({ ...(was.host === host ? was : { focused: false }), host, hovered: true }))}
+      onPointerLeave={() => setOver((was) => ({ ...was, host, hovered: false }))}
+      onFocus={() => setOver((was) => ({ ...(was.host === host ? was : { hovered: false }), host, focused: true }))}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) setFocused(false);
+        if (!event.currentTarget.contains(event.relatedTarget)) setOver((was) => ({ ...was, host, focused: false }));
       }}
       className="pointer-events-auto fixed right-4 bottom-4 z-[100] flex max-w-[calc(100vw-2rem)] flex-col gap-2 outline-none"
     >
       {messages.map((message) => (
-        <ToastItem key={message.id} message={message} paused={hovered || focused} />
+        <ToastItem key={message.id} message={message} paused={paused} />
       ))}
     </ul>
   );

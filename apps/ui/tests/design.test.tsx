@@ -283,6 +283,25 @@ describe('Toaster', () => {
     expect(screen.getByText('After the drawer').closest('[data-toaster]')?.parentElement).toBe(document.body.firstElementChild);
   });
 
+  it('waits while a notification is pointed at, then goes', () => {
+    vi.useFakeTimers();
+    try {
+      render(<Toaster />);
+      act(() => {
+        toast('Synthetic timed notice');
+      });
+      const list = screen.getByRole('list', { name: 'Notifications' });
+      fireEvent.pointerEnter(list);
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(screen.getByText('Synthetic timed notice')).toBeTruthy();
+      fireEvent.pointerLeave(list);
+      act(() => vi.advanceTimersByTime(6_000));
+      expect(screen.queryByText('Synthetic timed notice')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('replaces a notification with the same key, and dismisses one by its key', () => {
     render(<Toaster />);
     act(() => {
