@@ -1,11 +1,16 @@
 // Writes THIRD-PARTY-NOTICES.txt for what PitCrew's programs contain: every crate the shipped
-// binaries link (cargo metadata, normal dependencies, for one target) and every JavaScript package
-// the app's window bundles (apps/ui's production dependencies), each with its licence and the
-// licence files its package carries. Packages that share a text are listed under it once.
+// binaries link (cargo metadata, normal dependencies, for one target), the Rust standard library
+// (the toolchain's own COPYRIGHT-library.html), every JavaScript package the app's window bundles
+// (apps/ui's production dependencies) and the build tools whose code lands in that bundle
+// (Tailwind's preflight, Vite's and Rolldown's runtime helpers), each with its licence and the
+// licence files its package carries. A package that carries none of a text its licence needs
+// gets it from packaging/notices-extra/<name>/ (upstream's text, checked in); a package whose
+// licence needs a notice and has no text fails the run. Packages that share a text are listed
+// under it once.
 //
 //   node packaging/notices.mjs --target TRIPLE --out FILE [--title TEXT]
 //
-// Needs cargo (crate sources are fetched by `cargo metadata` if missing) and apps/ui's
+// Needs cargo and rustc (crate sources are fetched by `cargo metadata` if missing) and apps/ui's
 // node_modules (`pnpm install`). Paths never reach the output. packaging/notices.test.mjs tests
 // it on synthetic packages. See packaging/README.md, "The portable Windows zip".
 import { execFileSync } from 'node:child_process';
@@ -23,13 +28,74 @@ export const RUST = [
 ];
 /** The app whose production dependencies the desktop bundles. */
 export const UI = 'apps/ui';
+/**
+ * Build tools whose own code the UI's bundle carries, each resolved from the app or from another
+ * of them: Tailwind's preflight CSS, Vite's and Rolldown's runtime helpers.
+ */
+export const BUNDLED_TOOLS = [
+  { name: 'tailwindcss' },
+  { name: 'vite' },
+  { name: 'rolldown', from: 'vite' },
+];
+/** Upstream texts for packages that carry none, by package name. */
+export const EXTRA = join(ROOT, 'packaging', 'notices-extra');
 
 const LICENCE_FILE = /^(licen[cs]e|copying|copyright|notice|unlicense|third[-_]party)([-_. ].*)?$/i;
 const MAX_TEXT = 512 * 1024;
 
+/** Licences whose terms ask for no notice with a compiled or bundled copy. */
+const NO_NOTICE = new Set(['0BSD', 'BSL-1.0', 'CC0-1.0', 'CC-PDDC', 'MIT-0', 'Unlicense', 'WTFPL', 'Zlib']);
+/** Exceptions that waive the notice for compiled forms. */
+const NO_NOTICE_EXCEPTIONS = new Set(['LLVM-exception']);
+
 /** A licence file's text: UTF-8, no BOM, LF line ends, no trailing blank lines. */
 export function cleanText(text) {
   return text.replace(/^﻿/, '').replace(/\r\n?/g, '\n').replace(/\s+$/, '') + '\n';
+}
+
+/**
+ * Whether a package under `expression` (SPDX, or npm's `A/B` and free text) must ship a notice
+ * with a binary: with OR, only if every choice must; with AND, if any part must. Anything not
+ * known to waive it must.
+ */
+export function needsNotice(expression) {
+  const tokens = String(expression).replace(/\//g, ' OR ').match(/\(|\)|[^\s()]+/g) ?? [];
+  let at = 0;
+  const peek = () => tokens[at];
+  const or = () => {
+    let needs = and();
+    while (peek() === 'OR') {
+      at++;
+      needs = and() && needs;
+    }
+    return needs;
+  };
+  const and = () => {
+    let needs = atom();
+    while (peek() === 'AND') {
+      at++;
+      needs = atom() || needs;
+    }
+    return needs;
+  };
+  const atom = () => {
+    if (peek() === '(') {
+      at++;
+      const needs = or();
+      if (peek() === ')') at++;
+      return needs;
+    }
+    // An identifier, maybe `+`, maybe `WITH exception`; free text is one unknown licence.
+    let id = tokens[at++] ?? '';
+    while (peek() !== undefined && !['OR', 'AND', 'WITH', '(', ')'].includes(peek())) id += ` ${tokens[at++]}`;
+    let exception = '';
+    if (peek() === 'WITH') {
+      at++;
+      exception = tokens[at++] ?? '';
+    }
+    return !(NO_NOTICE.has(id.replace(/\+$/, '')) || NO_NOTICE_EXCEPTIONS.has(exception));
+  };
+  return tokens.length === 0 ? true : or();
 }
 
 /** The licence files in a package's folder (and a REUSE-style LICENSES/), as texts. */
@@ -57,12 +123,21 @@ export function licenceTexts(dir, extra = []) {
   return texts;
 }
 
+/** The checked-in upstream texts for package `name`, if any (`extraDir/<name>/*`). */
+export function extraTexts(name, extraDir = EXTRA) {
+  const dir = join(extraDir, name);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .sort()
+    .map((file) => ({ name: `notices-extra/${name}/${file}`, text: cleanText(readFileSync(join(dir, file), 'utf8')) }));
+}
+
 /**
  * The third-party crates `roots` (package names of the workspace in `metadata`, `cargo metadata
  * --format-version 1` output) link: their normal dependencies, transitively. Path packages are
  * the repository's own and are left out.
  */
-export function rustPackages(metadata, roots) {
+export function rustPackages(metadata, roots, extraDir = EXTRA) {
   const byId = new Map(metadata.packages.map((p) => [p.id, p]));
   const nodes = new Map(metadata.resolve.nodes.map((n) => [n.id, n]));
   const members = new Set(metadata.workspace_members);
@@ -90,8 +165,45 @@ export function rustPackages(metadata, roots) {
       version: p.version,
       license: p.license ?? (p.license_file ? `see ${p.license_file}` : 'not stated'),
       repository: p.repository ?? p.homepage ?? `https://crates.io/crates/${p.name}`,
-      texts: licenceTexts(dirname(p.manifest_path), p.license_file ? [p.license_file] : []),
+      texts: [
+        ...licenceTexts(dirname(p.manifest_path), p.license_file ? [p.license_file] : []),
+        ...extraTexts(p.name, extraDir),
+      ],
     }));
+}
+
+/** `COPYRIGHT-library.html` as plain text: the tags gone, the entities decoded, blank lines one. */
+export function htmlToText(html) {
+  const entities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+  return cleanText(
+    html
+      .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, '')
+      .replace(/<br\s*\/?>|<\/(p|div|h[1-6]|li|tr|pre|ul|ol|details|summary|dd|dt)>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z]+);/gi, (whole, code) => {
+        if (code[0] === '#') {
+          const point = code[1] === 'x' || code[1] === 'X' ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
+          return Number.isFinite(point) ? String.fromCodePoint(point) : whole;
+        }
+        return entities[code.toLowerCase()] ?? whole;
+      })
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n'),
+  );
+}
+
+/** The Rust standard library that rustc links into every program, with the toolchain's notices. */
+export function rustStd(sysroot, versionLine) {
+  const file = join(sysroot, 'share', 'doc', 'rust', 'COPYRIGHT-library.html');
+  if (!existsSync(file)) throw new Error(`the Rust toolchain's ${file} is missing`);
+  return {
+    kind: 'rust',
+    name: 'Rust standard library',
+    version: versionLine.split(/\s+/)[1] ?? 'unknown',
+    license: 'MIT OR Apache-2.0, and the notices in its text',
+    repository: 'https://github.com/rust-lang/rust',
+    texts: [{ name: 'COPYRIGHT-library.html', text: htmlToText(readFileSync(file, 'utf8')) }],
+  };
 }
 
 function readJson(path) {
@@ -123,16 +235,30 @@ function npmRepository(pkg) {
     .replace(/\.git$/, '');
 }
 
+function npmEntry(at, extraDir) {
+  const pkg = readJson(join(at, 'package.json'));
+  return {
+    kind: 'npm',
+    name: pkg.name,
+    version: pkg.version,
+    license: npmLicense(pkg),
+    repository: npmRepository(pkg),
+    texts: [...licenceTexts(at), ...extraTexts(pkg.name, extraDir)],
+  };
+}
+
 /**
  * The third-party packages the app at `appDir` bundles: its `dependencies` and theirs,
  * transitively. Optional dependencies (native add-ons for Node, such as pdfjs-dist's canvas) are
  * not bundled for the window and are left out, as are packages outside any node_modules (the
- * workspace's own, whose dependencies are followed).
+ * workspace's own, whose dependencies are followed). Then `tools`, each package alone (not its
+ * dependencies), resolved from the app or from the tool it names in `from`.
  */
-export function npmPackages(appDir) {
+export function npmPackages(appDir, tools = [], extraDir = EXTRA) {
   const found = new Map();
   const seen = new Set();
-  const queue = [{ dir: realpathSync(appDir), names: Object.keys(readJson(join(appDir, 'package.json')).dependencies ?? {}) }];
+  const app = realpathSync(appDir);
+  const queue = [{ dir: app, names: Object.keys(readJson(join(appDir, 'package.json')).dependencies ?? {}) }];
   while (queue.length > 0) {
     const { dir, names } = queue.pop();
     for (const name of names) {
@@ -140,22 +266,27 @@ export function npmPackages(appDir) {
       if (at === null) throw new Error(`${name} is not installed (run pnpm install)`);
       if (seen.has(at)) continue;
       seen.add(at);
-      const pkg = readJson(join(at, 'package.json'));
-      queue.push({ dir: at, names: Object.keys(pkg.dependencies ?? {}) });
+      queue.push({ dir: at, names: Object.keys(readJson(join(at, 'package.json')).dependencies ?? {}) });
       if (!at.split(sep).includes('node_modules')) continue;
-      const key = `${pkg.name}@${pkg.version}`;
-      if (found.has(key)) continue;
-      found.set(key, {
-        kind: 'npm',
-        name: pkg.name,
-        version: pkg.version,
-        license: npmLicense(pkg),
-        repository: npmRepository(pkg),
-        texts: licenceTexts(at),
-      });
+      const entry = npmEntry(at, extraDir);
+      found.set(`${entry.name}@${entry.version}`, entry);
     }
   }
+  const toolDirs = new Map();
+  for (const { name, from } of tools) {
+    const base = from === undefined ? app : toolDirs.get(from);
+    const at = base === undefined ? null : resolvePackage(base, name);
+    if (at === null) throw new Error(`${name} is not installed (run pnpm install)`);
+    toolDirs.set(name, at);
+    const entry = npmEntry(at, extraDir);
+    found.set(`${entry.name}@${entry.version}`, entry);
+  }
   return [...found.values()];
+}
+
+/** The packages whose licence needs a notice but that carry no text, as `name version`. */
+export function missingTexts(packages) {
+  return packages.filter((p) => p.texts.length === 0 && needsNotice(p.license)).map((p) => `${p.name} ${p.version} (${p.license})`);
 }
 
 /** `words`, joined by ", " and wrapped at 78 columns, the lines after the first indented. */
@@ -209,7 +340,7 @@ export function render(title, rust, npm) {
     for (const p of list) {
       const ns = refs.get(p);
       out.push(`  ${p.name} ${p.version}`, `    licence: ${p.license}`, `    source: ${p.repository}`);
-      out.push(ns.length > 0 ? `    texts: ${ns.join(', ')}` : '    texts: none in the package; see its source');
+      out.push(ns.length > 0 ? `    texts: ${ns.join(', ')}` : '    texts: none needed for a compiled copy');
     }
     out.push('');
   }
@@ -219,13 +350,12 @@ export function render(title, rust, npm) {
   return out.join('\n').replace(/\n*$/, '\n');
 }
 
+function run(command, args) {
+  return execFileSync(command, args, { cwd: ROOT, maxBuffer: 512 * 1024 * 1024, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
+}
+
 function cargoMetadata(manifest, target) {
-  const out = execFileSync(
-    'cargo',
-    ['metadata', '--format-version', '1', '--locked', '--filter-platform', target, '--manifest-path', join(ROOT, manifest)],
-    { cwd: ROOT, maxBuffer: 512 * 1024 * 1024, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] },
-  );
-  return JSON.parse(out);
+  return JSON.parse(run('cargo', ['metadata', '--format-version', '1', '--locked', '--filter-platform', target, '--manifest-path', join(ROOT, manifest)]));
 }
 
 function main(argv) {
@@ -239,11 +369,20 @@ function main(argv) {
     else throw new Error(`unknown option ${flag}`);
   }
   if (!args.target || !args.out) throw new Error('usage: node packaging/notices.mjs --target TRIPLE --out FILE [--title TEXT]');
-  const rust = dedupe(RUST.flatMap(({ manifest, packages }) => rustPackages(cargoMetadata(manifest, args.target), packages)));
-  const npm = dedupe(npmPackages(join(ROOT, UI)));
+  const crates = RUST.flatMap(({ manifest, packages }) => rustPackages(cargoMetadata(manifest, args.target), packages));
+  const std = rustStd(run('rustc', ['--print', 'sysroot']).trim(), run('rustc', ['--version']).trim());
+  const rust = dedupe([...crates, std]);
+  const npm = dedupe(npmPackages(join(ROOT, UI), BUNDLED_TOOLS));
+  const missing = missingTexts([...rust, ...npm]);
+  if (missing.length > 0) {
+    throw new Error(
+      `no licence text for ${missing.join(', ')}: their licences need one. Add upstream's text under ` +
+        'packaging/notices-extra/<name>/ (see packaging/README.md, "Third-party notices").',
+    );
+  }
   writeFileSync(args.out, render(args.title, rust, npm));
-  const missing = [...rust, ...npm].filter((p) => p.texts.length === 0).length;
-  console.log(`${args.out}: ${rust.length} crates and ${npm.length} JavaScript packages; ${missing} carry no licence file`);
+  const waived = [...rust, ...npm].filter((p) => p.texts.length === 0).length;
+  console.log(`${args.out}: ${rust.length} Rust packages and ${npm.length} JavaScript packages; ${waived} need no text`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
