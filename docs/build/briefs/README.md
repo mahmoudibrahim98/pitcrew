@@ -122,9 +122,9 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-settings](0-settings.md) | 0 · Composition root | `integrator/settings` | Codex (local) | In review (PR #64) |
 | [0-files-everywhere](0-files-everywhere.md) | 0 · Composition root | `integrator/files-everywhere` | Codex (local) | In review (PR #63) |
 | [L-shell-polish](L-shell-polish.md) | L · Shell | `integrator/shell-polish` | Codex (local) | **Merged** (PR #65) |
-| [0-resume-sessions](0-resume-sessions.md) | 0 · Composition root | `integrator/resume-sessions` | Opus-class (Claude cloud) | Ready |
+| [0-resume-sessions](0-resume-sessions.md) | 0 · Composition root | `integrator/resume-sessions` | Opus-class (Claude cloud) | In progress |
 | [K-desktop-followups](K-desktop-followups.md) | K · Desktop shell | `integrator/desktop-followups` | Opus-class (Claude cloud) | After #63 and #64 |
-| [P-portable-windows](P-portable-windows.md) | P · Packaging | `integrator/portable-windows` | Opus-class (Claude cloud) | Ready |
+| [P-portable-windows](P-portable-windows.md) | P · Packaging | `integrator/portable-windows` | Opus-class (Claude cloud) | **Merged** (PR #68) |
 | [L-home-inbox](L-home-inbox.md) | L · Shell | `integrator/home-inbox` | Opus-class (Claude cloud) | After 0-tasks-that-work (#66) |
 | [N-projects-boards](N-projects-boards.md) | N · Projects layout | `integrator/projects-boards` | Opus-class (Claude cloud) | After 0-tasks-that-work (#66) and 0-trusted-data (#67) |
 | [0-team-hubs](0-team-hubs.md) | 0 · Contracts | `integrator/team-hubs` | Opus-class (Claude cloud) | Last (after the route-heavy briefs) |
