@@ -101,7 +101,8 @@ export type HostRole = (typeof HOST_ROLES)[number];
 export const CAPABILITIES = ['tmux', 'pty', 'slurm', 'watch', 'scan'] as const;
 export type Capability = (typeof CAPABILITIES)[number];
 
-export const TOKEN_SCOPES = ['device', 'agent'] as const;
+/** The mock's token kinds: a session token (`pcs_…`) also names its session (`Caller.session`). */
+export const TOKEN_SCOPES = ['device', 'agent', 'session'] as const;
 export type TokenScope = (typeof TOKEN_SCOPES)[number];
 
 export const ERROR_CODES = [
@@ -281,6 +282,8 @@ export interface Session {
   started: TimestampMs;
   last_activity: TimestampMs;
   terminal?: TerminalId;
+  /** The session that started this one, for a sub-agent's. The mock's sessions have none. */
+  parent?: SessionId;
 }
 
 export interface Dispatch {
@@ -433,7 +436,90 @@ export type EventBody =
   | { type: 'write_proposed'; data: { write: WriteProposal } }
   | { type: 'write_started'; data: { ask: AskId; task?: TaskId; attempt: number } }
   | { type: 'write_retry_requested'; data: { ask: AskId; task?: TaskId; by: MemberId } }
-  | { type: 'write_finished'; data: { ask: AskId; task?: TaskId; result: WriteResult } };
+  | { type: 'write_finished'; data: { ask: AskId; task?: TaskId; result: WriteResult } }
+  | {
+      type: 'board_draft_started';
+      data: {
+        draft: string;
+        workstream: WorkstreamId;
+        agent: MemberId;
+        engine: Engine;
+        session: SessionId;
+        prompt: string;
+        cost: DraftCost;
+      };
+    }
+  | {
+      type: 'board_proposed';
+      data: { draft: string; workstream: WorkstreamId; tasks: ProposedTask[]; note?: string };
+    }
+  | {
+      type: 'board_draft_reviewed';
+      data: { draft: string; workstream: WorkstreamId; accepted: DraftedTask[]; rejected: number[] };
+    };
+
+// ─── Board drafts (board.rs) ─────────────────────────────────────────────────────────────────────
+
+export interface UsageEstimate {
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface DraftCost {
+  sessions: number;
+  sessions_left_out: number;
+  tasks: number;
+  summary_bytes: number;
+  prompt_bytes: number;
+  redacted: number;
+  estimate: UsageEstimate;
+}
+
+export interface DraftPreview {
+  workstream: WorkstreamId;
+  prompt: string;
+  cost: DraftCost;
+  summary: string;
+  digest: string;
+}
+
+export const DRAFT_STATES = ['running', 'proposed', 'reviewed', 'ended'] as const;
+export type DraftState = (typeof DRAFT_STATES)[number];
+
+export interface ProposedTask {
+  title: string;
+  status: TaskStatus;
+  description?: string;
+  evidence: SessionId[];
+}
+
+export interface BoardProposal {
+  tasks: ProposedTask[];
+  note?: string;
+}
+
+export interface DraftedTask {
+  item: number;
+  task: TaskId;
+}
+
+export interface BoardDraft {
+  id: string;
+  workstream: WorkstreamId;
+  agent: MemberId;
+  engine: Engine;
+  session: SessionId;
+  by: MemberId;
+  prompt: string;
+  cost: DraftCost;
+  started: TimestampMs;
+  state: DraftState;
+  proposal?: BoardProposal;
+  proposed?: TimestampMs;
+  reviewed?: TimestampMs;
+  accepted: DraftedTask[];
+  rejected: number[];
+}
 
 // ─── API (api.rs) ───────────────────────────────────────────────────────────────────────────────
 

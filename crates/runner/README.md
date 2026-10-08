@@ -194,6 +194,29 @@ before the dispatch's CLI starts.
   and anonymous terminals without a hub session retain the usual refresh behavior; no missing terminal is followed by its
   old target. Imported transcripts never acquire this exit evidence.
 
+## Confined runs
+
+A `StartSession` with `confined` (a run the hub starts on its own behalf: a board draft's, the
+Orchestrator's later) starts its CLI in that CLI's **confined, read-mostly shape**, whatever the
+person's own settings for the CLI say (`start_spec`). The hub has prepared `cwd`, a fresh private
+folder holding the run's `prompt.md` and the CLI's settings files, and `brief` is one plain line
+telling the CLI to read `prompt.md`. Its permission mode must be `default` and it never resumes,
+or the start is refused:
+
+- **Claude Code**: `--permission-mode=default --setting-sources=project --strict-mcp-config`.
+  Only the folder's `.claude/settings.json` is read (no user or local settings, so no user hooks,
+  allow rules or bypass default), and no MCP server is started.
+- **Codex**: `--sandbox=read-only --ask-for-approval=on-request --config=web_search=disabled`. Its
+  commands can read but neither write nor reach the network (Unix sockets and loopback included:
+  checked with Codex 0.160 on Linux), unless the person approves one in its terminal. Codex 0.160
+  rejects `untrusted` (as a flag and as `approval_policy`), so `on-request` is the strictest it
+  accepts.
+- **OpenCode**: no flag; the folder's `opencode.json` is its confinement. Refused on Windows: its
+  commands run in `cmd.exe`, which cannot pass the proposal on standard input, and its edits are
+  denied.
+
+Every argument of a confined launch passes a Windows `.cmd` shim (no `" % ! ^ & | < > ( )`).
+
 ## File discovery and cursors
 
 The daemon opts its Claude and Codex homes into `RunnerConfig::cache_file_discovery`. For these

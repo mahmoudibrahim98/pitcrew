@@ -15,6 +15,7 @@ import { keys, useApi, useGatewayWorkspace, useRemoteGateway, useSetUp, useWorks
 import { paths, useWorkspaceId } from '../shell/index.ts';
 import { OnboardingApiProvider } from './api-context.tsx';
 import type { OnboardingApi } from './api.ts';
+import { DraftStepProvider } from './draft-board.tsx';
 import { createHubOnboardingApi } from './hub-api.ts';
 import { WizardProvider, type WizardDefaults } from './wizard-context.tsx';
 import { WizardShell } from './wizard-shell.tsx';
@@ -93,9 +94,11 @@ function HubFirstRun() {
   if (info.setup_needed !== true && !sent) return <GoHome />;
   return (
     <OnboardingApiProvider api={api}>
-      <WizardProvider defaults={defaults}>
-        <WizardShell />
-      </WizardProvider>
+      <DraftStepProvider>
+        <WizardProvider defaults={defaults}>
+          <WizardShell />
+        </WizardProvider>
+      </DraftStepProvider>
     </OnboardingApiProvider>
   );
 }

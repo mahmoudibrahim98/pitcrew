@@ -144,6 +144,33 @@ where
     router.layer(middleware::from_fn(require_device))
 }
 
+/// Middleware that refuses session tokens (`TokenScope::Session`): `403 forbidden`, before the
+/// route sees the request. A session token may call only the routes mounted for it (in
+/// `pitcrew-api`, `RouterParts::session`); every other route that agents may call has this.
+///
+/// Use `layer`, not `route_layer`: `route_layer` skips the fallbacks of nested routers.
+pub async fn refuse_session(request: Request, next: Next) -> Response {
+    match request.extensions().get::<Caller>() {
+        Some(caller) if caller.scope.session().is_some() => ErrorResponse::forbidden(format!(
+            "{} {} is refused: this token may only answer for the session it was made for.",
+            request.method(),
+            request.uri().path()
+        ))
+        .into_response(),
+        Some(_) => next.run(request).await,
+        None => missing_caller().into_response(),
+    }
+}
+
+/// Closes every route already in `router` to session tokens (see [`refuse_session`]), including
+/// the fallbacks of routers nested in it.
+pub fn no_session<S>(router: Router<S>) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    router.layer(middleware::from_fn(refuse_session))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +232,35 @@ mod tests {
         let (status, body) = call(app(), Some(agent), "/any").await;
         assert_eq!(status, 200);
         assert_eq!(body, serde_json::to_value(agent).unwrap());
+    }
+
+    #[tokio::test]
+    async fn session_tokens_pass_only_where_they_are_not_refused() {
+        let session = Caller {
+            member: MemberId::new(),
+            scope: TokenScope::Session(pitcrew_protocol::ids::SessionId::new()),
+            on_behalf_of: Some(MemberId::new()),
+        };
+        let open = Router::new().route(
+            "/session",
+            get(|Authenticated(c): Authenticated| async move { Json(c) }),
+        );
+        let closed = no_session(Router::new().route(
+            "/agent",
+            get(|Authenticated(c): Authenticated| async move { Json(c) }),
+        ));
+        let app = app().merge(open).merge(closed);
+        for path in ["/layer", "/extractor", "/agent"] {
+            let (status, body) = call(app.clone(), Some(session), path).await;
+            assert_eq!(status, 403, "{path}");
+            assert_eq!(body["code"], "forbidden");
+        }
+        let (status, body) = call(app.clone(), Some(session), "/session").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, serde_json::to_value(session).unwrap());
+        // An agent's own token still reaches the routes closed to session tokens.
+        let agent = caller(TokenScope::Agent);
+        assert_eq!(call(app, Some(agent), "/agent").await.0, 200);
     }
 
     #[tokio::test]

@@ -90,6 +90,8 @@ pub struct WorkService {
     /// [`WorkService::follow_sessions`]): their task moved then, and is not moved again.
     working: Mutex<HashSet<DispatchId>>,
     pub(crate) import: Mutex<crate::import::ImportState>,
+    /// Each workstream's latest board-draft preview, for its start (see `crate::board`).
+    pub(crate) previews: Mutex<crate::board::Previews>,
 }
 
 impl std::fmt::Debug for WorkService {
@@ -120,6 +122,7 @@ impl WorkService {
             setup_listener: None,
             working: Mutex::new(HashSet::new()),
             import: Mutex::default(),
+            previews: Mutex::default(),
         }
     }
 
@@ -285,7 +288,7 @@ impl WorkService {
     /// owner. A person acts for nobody, whatever the caller says.
     pub(crate) fn by(&self, caller: &Caller, body: EventBody) -> Event {
         let on_behalf_of = match caller.scope {
-            TokenScope::Agent => caller.on_behalf_of,
+            TokenScope::Agent | TokenScope::Session(_) => caller.on_behalf_of,
             TokenScope::Device => None,
         };
         self.event(caller.member, on_behalf_of, body)

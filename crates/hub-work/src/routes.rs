@@ -48,8 +48,8 @@ use std::sync::Arc;
 /// The largest request body accepted, as the contract says: 1 MiB.
 pub const MAX_BODY: usize = 1024 * 1024;
 
-type Reply<T> = Result<Json<T>, WorkError>;
-type Created<T> = Result<(StatusCode, Json<T>), WorkError>;
+pub(crate) type Reply<T> = Result<Json<T>, WorkError>;
+pub(crate) type Created<T> = Result<(StatusCode, Json<T>), WorkError>;
 
 /// Routes that agents may call too. See the [module docs](self).
 pub fn agent_routes<S>() -> Router<S>
@@ -118,7 +118,7 @@ where
 // ─── Extractors ──────────────────────────────────────────────────────────────────────────────────
 
 /// The service, from the request's extensions.
-struct Work(Arc<WorkService>);
+pub(crate) struct Work(pub(crate) Arc<WorkService>);
 
 impl<S: Send + Sync> FromRequestParts<S> for Work {
     type Rejection = WorkError;
@@ -144,7 +144,7 @@ fn caller(parts: &Parts) -> Result<Caller, WorkError> {
 }
 
 /// The caller, of either scope.
-struct Who(Caller);
+pub(crate) struct Who(pub(crate) Caller);
 
 impl<S: Send + Sync> FromRequestParts<S> for Who {
     type Rejection = WorkError;
@@ -155,7 +155,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Who {
 }
 
 /// The caller, who must be a person (a device token).
-struct Person(Caller);
+pub(crate) struct Person(pub(crate) Caller);
 
 impl<S: Send + Sync> FromRequestParts<S> for Person {
     type Rejection = WorkError;
@@ -175,7 +175,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Person {
 }
 
 /// Path parameters. A segment that does not decode names nothing, so it is a `404`.
-struct Segments<T>(T);
+pub(crate) struct Segments<T>(pub(crate) T);
 
 impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Segments<T> {
     type Rejection = WorkError;
@@ -189,7 +189,7 @@ impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Segment
 }
 
 /// The query string as pairs, so a key may repeat (`status=todo&status=review`).
-struct Params(Vec<(String, String)>);
+pub(crate) struct Params(Vec<(String, String)>);
 
 impl<S: Send + Sync> FromRequestParts<S> for Params {
     type Rejection = WorkError;
@@ -204,7 +204,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Params {
 
 impl Params {
     /// The first non-empty value of `key`, parsed. An empty value counts as absent.
-    fn one<T: FromStr>(&self, key: &str) -> Result<Option<T>, WorkError> {
+    pub(crate) fn one<T: FromStr>(&self, key: &str) -> Result<Option<T>, WorkError> {
         self.values(key)
             .next()
             .map(|v| {
@@ -240,13 +240,13 @@ async fn json_value(body: RawBody) -> Result<serde_json::Value, WorkError> {
     serde_json::from_slice(&bytes).map_err(|e| WorkError::invalid(format!("Malformed body: {e}.")))
 }
 
-fn decode<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, WorkError> {
+pub(crate) fn decode<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, WorkError> {
     T::deserialize(value).map_err(|e| WorkError::invalid(format!("Malformed body: {e}.")))
 }
 
 /// A JSON object body (see [`json_value`]); unknown fields are ignored. Anything but an object is
 /// `400`: serde would otherwise read an array as a struct's fields by position.
-async fn json<T: DeserializeOwned>(body: RawBody) -> Result<T, WorkError> {
+pub(crate) async fn json<T: DeserializeOwned>(body: RawBody) -> Result<T, WorkError> {
     let value = json_value(body).await?;
     if !value.is_object() {
         return Err(WorkError::invalid("The body must be a JSON object."));
@@ -276,7 +276,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
 }
 
 /// Runs `f` on the blocking pool, where the service's SQLite work belongs.
-async fn blocking<T, F>(work: Arc<WorkService>, f: F) -> Result<T, WorkError>
+pub(crate) async fn blocking<T, F>(work: Arc<WorkService>, f: F) -> Result<T, WorkError>
 where
     T: Send + 'static,
     F: FnOnce(&WorkService) -> Result<T, WorkError> + Send + 'static,
@@ -290,7 +290,7 @@ fn task_ref(id: &str) -> Result<TaskRef, WorkError> {
     TaskRef::parse(id).ok_or_else(|| WorkError::not_found(format!("No task {id}.")))
 }
 
-fn path_id<T: FromStr>(id: &str, what: &str) -> Result<T, WorkError> {
+pub(crate) fn path_id<T: FromStr>(id: &str, what: &str) -> Result<T, WorkError> {
     id.parse()
         .map_err(|_| WorkError::not_found(format!("No {what} {id}.")))
 }
@@ -302,7 +302,7 @@ async fn may_write(w: &Arc<WorkService>, caller: Caller, task: &TaskRef) -> Resu
 }
 
 /// Checks that what the path names exists (`404`, from `find`), before the body is read.
-async fn exists<T, F>(w: &Arc<WorkService>, find: F) -> Result<(), WorkError>
+pub(crate) async fn exists<T, F>(w: &Arc<WorkService>, find: F) -> Result<(), WorkError>
 where
     T: Send + 'static,
     F: FnOnce(&WorkService) -> Result<T, WorkError> + Send + 'static,

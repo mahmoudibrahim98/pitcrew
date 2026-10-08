@@ -127,6 +127,28 @@ describe('recapScopeForEvents', () => {
     }
   });
 
+  it('is not activity for the board drafts’ events', () => {
+    const drafts: EventBody[] = [
+      {
+        type: 'board_draft_started',
+        data: {
+          draft: 'D1',
+          workstream: 'W1',
+          agent: 'M2',
+          engine: 'claude',
+          session: 'S1',
+          prompt: 'draft-board/v1',
+          cost: {} as never,
+        },
+      },
+      { type: 'board_proposed', data: { draft: 'D1', workstream: 'W1', tasks: [] } },
+      { type: 'board_draft_reviewed', data: { draft: 'D1', workstream: 'W1', accepted: [], rejected: [0] } },
+    ];
+    for (const body of drafts) {
+      expect(recapScopeForEvents([event(body)], EMPTY_CACHE)).toBeUndefined();
+    }
+  });
+
   it('invalidates every recap key for member_added (it may rename someone a line names)', () => {
     const member = { id: 'M2', kind: 'agent', handle: '@new', name: 'New' } as const;
     expect(recapScopeForEvents([event({ type: 'member_added', data: { member } })], EMPTY_CACHE)).toBe('everything');

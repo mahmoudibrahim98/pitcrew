@@ -19,6 +19,18 @@ The other 77 same-named types match structurally, including all event discrimina
 omission versus clearing with null, receipt tags, optional brief proposal, session parent,
 recap fact discriminants and UTF-8 span ranges. No UI declaration or wire format changed.
 
+**Board drafts** (2026-10, brief 0-draft-board): `EventBody` gained `board_draft_started`,
+`board_proposed` and `board_draft_reviewed`, and `BoardDraft`, `DraftPreview`, `DraftReviewed` and
+their parts are new. The UI's `data/types.ts` lists the three events (their payloads' board parts
+from these bindings) and `data/invalidation.ts` refreshes the drafts' queries on them; the projects
+views declare the board types they use in `apps/ui/src/projects/board-drafts.ts`, the same shapes
+as the generated ones. Since #54's review, `board-drafts.ts` re-exports the generated board types
+(`BoardDraft`, `BoardProposal`, `DraftCost`, `DraftPreview`, `DraftState`, `DraftedTask`,
+`ProposedTask`, `StartDraft`, `UsageEstimate`) instead of declaring them; only `DraftReviewed` is
+composed (the generated `BoardDraft` and the UI's `Task`). `TokenScope` gained
+`{ "session": SessionId }`, and `RunnerCommand`'s `start_session` an optional `confined`; neither
+is a UI type.
+
 ## Different names and missing declarations
 
 | Rust type | UI counterpart | Contract position |

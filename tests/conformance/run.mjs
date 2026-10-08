@@ -111,13 +111,18 @@ try {
     console.log('# skipped: conformance link creation refused by the OS');
   }
   env.PITCREW_FILES_ROOT = filesRoot;
+  // Board drafts' session tokens, as their CLIs get them: the suite proposes as a draft's CLI
+  // would. The mock writes each here; on the daemon the stand-in CLI copies the one it is given.
+  const sessionTokens = join(temporary, 'session-tokens');
+  await mkdir(sessionTokens, { mode: 0o700 });
+  env.PITCREW_CONFORMANCE_SESSION_TOKENS = sessionTokens;
   // Both targets read GitHub and Jira from this copy of the mock hub's recorded fixtures, again at
   // each sync: integrations.test.mjs adds a file that sorts first to change what upstream says.
   const fixtures = join(temporary, 'fixtures');
   await cp(join(root, 'apps', 'mock-hub', 'fixtures'), fixtures, { recursive: true });
   env.PITCREW_CONFORMANCE_FIXTURES = fixtures;
   if (target === 'mock') {
-    mock = await startServer({ port: 0, integrationFixtures: fixtures });
+    mock = await startServer({ port: 0, integrationFixtures: fixtures, sessionTokenDir: sessionTokens });
     env.PITCREW_CONFORMANCE_URL = mock.url;
     env.PITCREW_CONFORMANCE_PERSON = 'dev-device-token';
     env.PITCREW_CONFORMANCE_AGENT = 'dev-agent-token';
@@ -149,11 +154,14 @@ try {
     // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle. They
     // answer `--version` at once (a Claude Code new enough for onboarding.test.mjs's hooks), and
     // for machine-setup.test.mjs their status commands too (not signed in); a sign-in's "login"
-    // waits like a session.
+    // waits like a session. Started for a board draft (in its private folder, `scratch/<session>`),
+    // a stand-in hands its session token to the suite, which proposes as the CLI would.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
     const standIn =
-      `#!/bin/sh\ncase "$1 $2" in\n` +
+      `#!/bin/sh\ncase "$PWD" in */scratch/*) [ -n "\${PITCREW_TOKEN_FILE:-}" ] && ` +
+      `cp "$PITCREW_TOKEN_FILE" '${sessionTokens}/'"$(basename "$PWD")".token ;; esac\n` +
+      `case "$1 $2" in\n` +
       `  "--version ") echo 2.1.139; exit 0 ;;\n` +
       `  "auth status"|"login status") echo "Not logged in" >&2; exit 1 ;;\n` +
       `  "auth list") echo "0 credentials"; exit 0 ;;\n` +
@@ -230,9 +238,10 @@ try {
   // One phase per file (or group) that changes the hub for every view, in this order:
   // onboarding.test.mjs first, then the main suite, then import.test.mjs, which commits session
   // inclusion (and restores it), then integrations.test.mjs, which syncs, appending events that
-  // the main suite's exact-revision checks must not see, and writes.test.mjs last, on its own: it
-  // connects the same repository integrations.test.mjs does. Every phase runs; the first failure
-  // decides the exit code.
+  // the main suite's exact-revision checks must not see, then writes.test.mjs on its own (it
+  // connects the same repository integrations.test.mjs does), and board.test.mjs last: board
+  // drafts start an agent's CLI (a stand-in on the daemon) and create tasks. Every phase runs; the
+  // first failure decides the exit code.
   for (const files of [
     ['tests/conformance/onboarding.test.mjs'],
     [
@@ -244,6 +253,7 @@ try {
     ['tests/conformance/import.test.mjs'],
     ['tests/conformance/integrations.test.mjs'],
     ['tests/conformance/writes.test.mjs'],
+    ['tests/conformance/board.test.mjs'],
   ]) {
     suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,

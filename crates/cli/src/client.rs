@@ -58,6 +58,12 @@ impl Client {
         })
     }
 
+    /// Whether the token is a person's device token (`pcd_…`), which the agent verbs never use.
+    #[must_use]
+    pub fn holds_device_token(&self) -> bool {
+        self.token.starts_with("pcd_")
+    }
+
     /// Checks that the daemon speaks our protocol (`GET /v1/host/info`, without the token).
     ///
     /// # Errors

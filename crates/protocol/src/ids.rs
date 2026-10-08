@@ -140,6 +140,10 @@ ulid_id!(
     /// A connection to GitHub or Jira (api-v1.md, "Integrations").
     IntegrationId, "int"
 );
+ulid_id!(
+    /// A board draft: one agent drafting a workstream's board from its history.
+    DraftId, "drf"
+);
 
 /// A short project key used in task keys, such as `CMP` in `CMP-104`.
 ///

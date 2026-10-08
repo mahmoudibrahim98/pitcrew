@@ -276,6 +276,18 @@ export function describeEvent(event: Event, names: Names): string {
       if (r.outcome === 'failed') return `could not write upstream${about}: ${r.message}`;
       return `did not write upstream${about}: ${r.reason}`;
     }
+    case 'board_draft_started':
+      return `asked ${names.member(body.data.agent)} to draft the board of ${names.workstream(body.data.workstream)}`;
+    case 'board_proposed': {
+      const n = body.data.tasks.length;
+      return `proposed a board of ${n} task${n === 1 ? '' : 's'} for ${names.workstream(body.data.workstream)}`;
+    }
+    case 'board_draft_reviewed': {
+      const n = body.data.accepted.length;
+      return `reviewed the drafted board of ${names.workstream(body.data.workstream)}: ${n} task${
+        n === 1 ? '' : 's'
+      } accepted`;
+    }
   }
 }
 
