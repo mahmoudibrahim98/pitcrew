@@ -1,0 +1,2 @@
+This file marks a portable copy of PitCrew. Keep it next to pitcrew-desktop.exe:
+a portable copy never installs updates, and shows where to download the newest portable zip.

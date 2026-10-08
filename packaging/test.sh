@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Tests for the packaging scripts that need no Rust toolchain: sha256sums.sh, verify.sh, sign.sh,
-# and the desktop's staging (desktop/build.sh --stage-only) and installer checks
-# (desktop/check.sh, on a stand-in .deb where dpkg-deb is). Runs anywhere bash and sha256sum (or
-# shasum) do, including Git Bash. Everything is synthetic: stand-in scripts, never real binaries.
+# the desktop's staging (desktop/build.sh --stage-only) and installer checks (desktop/check.sh,
+# on a stand-in .deb where dpkg-deb is), the portable zip (portable/build.sh, where zip or 7z is)
+# and the third-party notices (notices.test.mjs). Runs anywhere bash and sha256sum (or shasum)
+# do, including Git Bash. Everything is synthetic: stand-in scripts, never real binaries.
 #
 #   bash packaging/test.sh
 set -uo pipefail
@@ -322,6 +323,56 @@ STUB
     bash "$here/desktop/check.sh" --manifest "$manifest" "$rpm_file"
 fi
 
+# --- portable/build.sh: the portable Windows zip, from stand-ins (no cargo, no Windows)
+win="$tmp/win"
+mkdir -p "$win"
+for bin in pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass; do
+  printf 'stand-in %s\n' "$bin" >"$win/$bin-x86_64-pc-windows-msvc.exe"
+done
+printf 'stand-in desktop\n' >"$tmp/pitcrew-desktop.exe"
+printf 'synthetic notices\n' >"$tmp/notices.txt"
+portable_out="$tmp/portable"
+portable() {
+  bash "$here/portable/build.sh" --dist "$win" --out "$portable_out" \
+    --desktop "$tmp/pitcrew-desktop.exe" --notices "$tmp/notices.txt" "$@"
+}
+portable_files="LICENSE NOTICE README-portable.txt SHA256SUMS THIRD-PARTY-NOTICES.txt pitcrew-askpass.exe pitcrew-desktop.exe pitcrew-ptyd.exe pitcrew.exe pitcrewd.exe portable.txt"
+folder="$portable_out/pitcrew-windows-x64-portable"
+if command -v zip >/dev/null 2>&1 || command -v 7z >/dev/null 2>&1; then
+  check "the portable zip builds from stand-ins" 0 portable
+  output_has "and names its size" "pitcrew-windows-x64-portable.zip: PitCrew "
+  check "the folder holds exactly the zip's files" 0 \
+    test "$(cd "$folder" && echo *)" = "$portable_files"
+  check "its SHA256SUMS covers every file" 0 bash "$here/verify.sh" "$folder"
+  check "the programs are the inputs, renamed" 0 cmp -s "$folder/pitcrew-ptyd.exe" "$win/pitcrew-ptyd-x86_64-pc-windows-msvc.exe"
+  check "and the desktop" 0 cmp -s "$folder/pitcrew-desktop.exe" "$tmp/pitcrew-desktop.exe"
+  check "the notices are the given ones" 0 cmp -s "$folder/THIRD-PARTY-NOTICES.txt" "$tmp/notices.txt"
+  check "the portable marker is there" 0 test -s "$folder/portable.txt"
+  check "README-portable.txt names the version" 0 \
+    grep -qF "PitCrew $(sed -nE 's/^  "version": "([^"]+)".*/\1/p' "$root/apps/desktop/src-tauri/tauri.conf.json"), portable" "$folder/README-portable.txt"
+  check "and has no placeholder left" 1 grep -q '@[A-Z]*@' "$folder/README-portable.txt"
+  # shellcheck disable=SC2016 # sh's own "$1"
+  check "its lines end in CRLF, once" 0 \
+    sh -c 'test "$(grep -c "$(printf "\r")\$" "$1")" = "$(wc -l <"$1" | tr -d " ")" && ! grep -q "$(printf "\r\r")" "$1"' _ "$folder/README-portable.txt"
+  if command -v unzip >/dev/null 2>&1; then
+    # shellcheck disable=SC2016
+    check "the zip holds the files at its root" 0 \
+      sh -c 'test "$(unzip -Z1 "$1" | sort | tr "\n" " ")" = "$2 "' _ "$portable_out/pitcrew-windows-x64-portable.zip" "$portable_files"
+    # shellcheck disable=SC2016
+    check "and they unzip to the same bytes" 0 \
+      sh -c 'mkdir "$1/unzipped" && cd "$1/unzipped" && unzip -q "$2" && bash "$3" .' _ "$tmp" "$portable_out/pitcrew-windows-x64-portable.zip" "$here/verify.sh"
+  fi
+  check "built again, it starts afresh" 0 portable
+  check "with the same files" 0 test "$(cd "$folder" && echo *)" = "$portable_files"
+  rm "$win/pitcrew-askpass-x86_64-pc-windows-msvc.exe"
+  check "a missing program fails" 1 portable
+  output_has "and is named" "pitcrew-askpass-x86_64-pc-windows-msvc.exe"
+  check "an unknown option is a usage error" 2 portable --zig
+else
+  echo "(portable/build.sh not tested here: it needs zip or 7z)"
+fi
+
+check "the notices script passes its tests" 0 node --test "$here/notices.test.mjs"
 node --test "$here/updater.test.mjs"
 
 echo "packaging tests: $passed passed, $failed failed"
