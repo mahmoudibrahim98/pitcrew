@@ -576,11 +576,19 @@ fn signing_in_runs_the_clis_own_login_in_a_terminal() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(refused.status, 403, "{}", refused.body);
-    // Nor to another person: only the one who started it reads its screen (a device code).
-    let theirs = Ws::connect(daemon.port, &path, &second)
+    // Nor to another person: only the one who started it reads its screen (a device code),
+    // however its id is written in the path (the check reads the id the route reads).
+    let ulid = terminal.strip_prefix("ses_").unwrap_or(&terminal);
+    for form in common::id_forms(ulid) {
+        let theirs = Ws::connect(
+            daemon.port,
+            &format!("/v1/sessions/{form}/terminal"),
+            &second,
+        )
         .map(|_| ())
         .unwrap_err();
-    assert_eq!(theirs.status, 403, "{}", theirs.body);
+        assert_eq!(theirs.status, 403, "as {form}: {}", theirs.body);
+    }
     assert_eq!(
         daemon.get(&sign_in, Some(&second)).status,
         403,

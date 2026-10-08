@@ -324,10 +324,14 @@ async fn a_question_starts_a_reading_session_and_its_answer_streams_from_its_tra
     }
     assert!(!CONFINED_BRIEF.chars().any(|c| "\"%!^&|<>()".contains(c)));
     assert_eq!(
-        work.orchestrator_asker(&session),
+        work.orchestrator_asker(&session).expect("asker"),
         Some(SAM.parse().expect("sam"))
     );
-    assert!(!work.is_orchestrator_session(&SES1.parse().expect("session")));
+    assert!(
+        !work
+            .is_orchestrator_session(&SES1.parse().expect("session"))
+            .expect("is")
+    );
 
     // Nothing in the transcript yet: still answering.
     assert_eq!(work.follow_orchestrator().expect("follow"), 1);
@@ -695,7 +699,7 @@ async fn cancel_stops_the_answer_and_clear_forgets_and_ends() {
     assert_eq!(now["engine"], OTHER, "the engine stays remembered");
     // Still known as theirs: its transcript stays theirs alone, and it gets no agent's token.
     assert_eq!(
-        work.orchestrator_asker(&session),
+        work.orchestrator_asker(&session).expect("asker"),
         Some(SAM.parse().expect("sam"))
     );
     let file = std::fs::read_to_string(tmp.path().join("orchestrator.json")).expect("file");
@@ -882,7 +886,7 @@ async fn conversations_survive_a_restart_in_a_private_file() {
             .with_orchestrator_file(tmp.path().join("orchestrator.json"))
             .expect("the file"),
     );
-    assert!(work.is_orchestrator_session(&session));
+    assert!(work.is_orchestrator_session(&session).expect("is"));
     runner.write(
         session,
         vec![
@@ -1065,4 +1069,181 @@ async fn a_reader_reads_and_changes_nothing() {
     assert_eq!(refused.code(), pitcrew_protocol::api::ErrorCode::Forbidden);
     // An agent may not make the reads marked **read**.
     expect(&common::get(&app, agent(WRITER), "/v1/sessions").await, 403);
+}
+
+/// A session the runner states for a sub-agent of an Orchestrator session (its parent) is its
+/// asker's too; and an Orchestrator session whose id the hub no longer keeps (past the cap, or in
+/// a file moved aside) is still known by its own facts: titled Orchestrator, in the folder the
+/// runner link names for its confined run, its agent's owner's.
+#[tokio::test]
+async fn sub_agents_and_forgotten_sessions_stay_their_askers() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let runner = Arc::new(Runner::default());
+    let clock = Arc::new(AtomicI64::new(1_790_900_000_000));
+    let work = service(tmp.path(), &runner, &clock);
+    let res = ask(&work, json!({"text": "Who worked today?"})).await;
+    expect(&res, 202);
+    let session = session_of(&res.1);
+    let stored = work.session(&session).expect("stored");
+    let sam: pitcrew_protocol::ids::MemberId = SAM.parse().expect("sam");
+
+    // Its sub-agents, as the runner states them: sessions of their own, titled by their prompt.
+    let stated = |parent: SessionId, title: &str, cwd: &str| {
+        let mut s = stored.clone();
+        s.id = SessionId::new();
+        s.native_id = format!("synthetic-{}", s.id.0);
+        s.title = Some(title.to_owned());
+        s.cwd = cwd.to_owned();
+        s.parent = Some(parent);
+        work.store()
+            .append(&[Event::now(
+                work.workspace(),
+                sam,
+                EventBody::SessionDiscovered { session: s.clone() },
+            )])
+            .expect("append");
+        s.id
+    };
+    let sub = stated(session, "Synthetic sub-agent prompt", &stored.cwd);
+    let deeper = stated(sub, "Synthetic deeper prompt", "/w");
+    for id in [session, sub, deeper] {
+        assert_eq!(work.orchestrator_asker(&id).expect("asker"), Some(sam));
+    }
+    let unrelated: SessionId = SES1.parse().expect("session");
+    assert_eq!(work.orchestrator_asker(&unrelated).expect("asker"), None);
+
+    // The same hub with its ids forgotten (a new file): still known, by its facts.
+    let demo = demo();
+    let now = Arc::clone(&clock);
+    let forgot = Arc::new(
+        WorkService::new(open(&tmp.path().join("hub.db")), demo.workspace.clone())
+            .with_hub_machine(LAPTOP.parse().expect("machine"))
+            .with_dispatcher(Arc::clone(&runner) as Arc<dyn Dispatcher>)
+            .with_clock(Arc::new(move || now.load(Ordering::SeqCst)))
+            .with_orchestrator_file(tmp.path().join("forgotten.json"))
+            .expect("the file"),
+    );
+    for id in [session, sub, deeper] {
+        assert_eq!(forgot.orchestrator_asker(&id).expect("asker"), Some(sam));
+        assert!(forgot.is_orchestrator_session(&id).expect("is"));
+    }
+    // Titled Orchestrator but elsewhere, or in its folder but titled otherwise: not one.
+    let mut elsewhere = stored.clone();
+    elsewhere.id = SessionId::new();
+    elsewhere.cwd = "/home/sam/work".into();
+    let mut retitled = stored.clone();
+    retitled.id = SessionId::new();
+    retitled.cwd = format!("/cache/scratch/{}", retitled.id.0);
+    retitled.title = Some("Synthetic other title".into());
+    forgot
+        .store()
+        .append(&[
+            Event::now(
+                forgot.workspace(),
+                sam,
+                EventBody::SessionDiscovered {
+                    session: elsewhere.clone(),
+                },
+            ),
+            Event::now(
+                forgot.workspace(),
+                sam,
+                EventBody::SessionDiscovered {
+                    session: retitled.clone(),
+                },
+            ),
+        ])
+        .expect("append");
+    for id in [elsewhere.id, retitled.id, unrelated] {
+        assert_eq!(forgot.orchestrator_asker(&id).expect("asker"), None);
+    }
+}
+
+/// The same suggestion twice in an answer is one suggestion: the panel follows each by what it
+/// is, so two would act together.
+#[tokio::test]
+async fn a_suggestion_made_twice_is_one() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let runner = Arc::new(Runner::default());
+    let clock = Arc::new(AtomicI64::new(1_790_900_000_000));
+    let work = service(tmp.path(), &runner, &clock);
+    let res = ask(&work, json!({"text": "What next?"})).await;
+    expect(&res, 202);
+    let session = session_of(&res.1);
+    runner.write(
+        session,
+        vec![
+            Item::Prompt("p".into()),
+            Item::Said(format!(
+                "Two things.\n\n\
+                 Suggestion: move PAP-1 to review\n\
+                 Suggestion: open wst_{SUBMISSION}\n\
+                 Suggestion: **move PAP-1 to review**\n\
+                 Suggestion: move tsk_01JB000000000000000TSK0001 to review\n\
+                 Suggestion: open wst_{SUBMISSION}\n\
+                 Suggestion: move PAP-1 to done"
+            )),
+            Item::End,
+        ],
+    );
+    work.follow_orchestrator().expect("follow");
+    let turn = state(&work).await["conversations"][0]["turns"][0].clone();
+    assert_eq!(turn["state"], "answered");
+    assert_eq!(
+        turn["suggestions"],
+        json!([
+            {"kind": "move_task", "task": "01JB000000000000000TSK0001", "key": "PAP-1",
+             "to": "review", "label": "Move PAP-1 to review"},
+            {"kind": "open", "target": {"kind": "workstream", "id": SUBMISSION, "project": PAPER},
+             "label": "Open Submission"},
+            {"kind": "move_task", "task": "01JB000000000000000TSK0001", "key": "PAP-1",
+             "to": "done", "label": "Move PAP-1 to done"},
+        ])
+    );
+    assert_eq!(
+        turn["answer"], "Two things.",
+        "a duplicate is not put back as text"
+    );
+}
+
+/// A question the hub cannot save changes nothing: no turn is left answering (so the next
+/// question is not refused), no session is stored or started; once the file can be written
+/// again, asking works.
+#[tokio::test]
+async fn a_question_that_cannot_be_saved_changes_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let runner = Arc::new(Runner::default());
+    let clock = Arc::new(AtomicI64::new(1_790_900_000_000));
+    let folder = tmp.path().join("kept");
+    std::fs::create_dir_all(&folder).expect("folder");
+    let demo = demo();
+    let now = Arc::clone(&clock);
+    let work = Arc::new(
+        WorkService::new(open(&tmp.path().join("hub.db")), demo.workspace.clone())
+            .with_hub_machine(LAPTOP.parse().expect("machine"))
+            .with_dispatcher(Arc::clone(&runner) as Arc<dyn Dispatcher>)
+            .with_clock(Arc::new(move || now.load(Ordering::SeqCst)))
+            .with_orchestrator_file(folder.join("orchestrator.json"))
+            .expect("the file"),
+    );
+    work.seed(&demo).expect("seed");
+    // Its folder is gone: the file cannot be written.
+    std::fs::remove_dir_all(&folder).expect("remove");
+    let rev = work.store().latest_rev().expect("rev");
+    let failed = ask(&work, json!({"text": "Saved?"})).await;
+    expect(&failed, 500);
+    assert_eq!(state(&work).await["conversations"], json!([]));
+    assert_eq!(
+        work.store().latest_rev().expect("rev"),
+        rev,
+        "no session stored"
+    );
+    assert!(runner.starts().is_empty(), "nothing started");
+
+    std::fs::create_dir_all(&folder).expect("folder");
+    let res = ask(&work, json!({"text": "Saved now?"})).await;
+    expect(&res, 202);
+    let view = state(&work).await;
+    assert_eq!(view["conversations"].as_array().expect("c").len(), 1);
+    assert_eq!(runner.starts().len(), 1);
 }

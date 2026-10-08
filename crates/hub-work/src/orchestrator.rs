@@ -16,14 +16,15 @@
 //!    - a follow-up whose session still lives is typed into it (`SendText`, after
 //!      [`clean_question`] made it one line and [`typed`] made it never a CLI command); one whose
 //!      session ended starts a new session, whose prompt carries the conversation so far;
-//!    - a new session is stored first (`session_discovered`: titled [`SESSION_TITLE`], the agent
-//!      named, linked to nothing, its `cwd` the folder [`Dispatcher::confined_folder`] names), and
-//!      its id is kept for good in the person's `sessions` (never cleared: what the hub knows of
-//!      its Orchestrator sessions, see [`WorkService::orchestrator_asker`]); then the
-//!      [`Dispatcher`] starts it as a **confined run** ([`confinement`]): a fresh private folder
-//!      with the prompt (`pitcrew_office::orchestrator::prompt`) in its `prompt.md`, the CLI's
-//!      confined launch shape, and a **reader token** minted for that session alone (never its
-//!      agent's token), revoked when the session ends;
+//!    - the question is saved first, with a new session's id kept for good in the person's
+//!      `sessions` (never cleared: what the hub knows of its Orchestrator sessions, see
+//!      [`WorkService::orchestrator_asker`]), so a question the file cannot keep changes nothing;
+//!      then a new session is stored (`session_discovered`: titled [`SESSION_TITLE`], the agent
+//!      named, linked to nothing, its `cwd` the folder [`Dispatcher::confined_folder`] names);
+//!      then the [`Dispatcher`] starts it as a **confined run** ([`confinement`]): a fresh
+//!      private folder with the prompt (`pitcrew_office::orchestrator::prompt`) in its
+//!      `prompt.md`, the CLI's confined launch shape, and a **reader token** minted for that
+//!      session alone (never its agent's token), revoked when the session ends;
 //!    - starting a new conversation finishes the caller's other Orchestrator session (one at a
 //!      time): its token stops at once, and its CLI is ended.
 //!
@@ -99,8 +100,11 @@ pub const READ_VERBS: [&str; 9] = [
 ];
 /// The longest an Orchestrator session runs; a follow-up after it starts a new session.
 pub const SESSION_MAX_RUNTIME: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-/// The most Orchestrator session ids kept per person, newest kept.
-const MAX_SESSIONS_KEPT: usize = 2000;
+/// The most Orchestrator session ids kept per person, newest kept. An older one is still known by
+/// its own facts ([`WorkService::orchestrator_asker`]).
+pub const MAX_SESSIONS_KEPT: usize = 2000;
+/// The most parents followed to find a sub-agent's Orchestrator session.
+pub const MAX_PARENTS: usize = 8;
 /// The file's format.
 const FILE_VERSION: u32 = 1;
 /// Items read per transcript page.
@@ -362,11 +366,41 @@ impl WorkService {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The person whose Orchestrator session `session` is, if it is one (the hub keeps every one
-    /// it started, cleared or not). Its transcript and terminal are theirs alone, and its CLI never
-    /// gets its agent's token.
-    #[must_use]
-    pub fn orchestrator_asker(&self, session: &SessionId) -> Option<MemberId> {
+    /// The person whose Orchestrator session `session` is, if it is one. Its transcript and
+    /// terminal are theirs alone, and its CLI never gets its agent's token. Known by, in turn:
+    /// - the ids the hub keeps of every Orchestrator session it started for each person, cleared
+    ///   or not (the newest [`MAX_SESSIONS_KEPT`] per person);
+    /// - else the session's own facts, for one whose id is no longer kept (past the cap, or in a
+    ///   file moved aside as unreadable): titled [`SESSION_TITLE`] and run in the very folder the
+    ///   runner link names for that session's confined run, it is its agent's owner's;
+    /// - else its parent's, so a sub-agent of an Orchestrator session (which the runner states as
+    ///   a session of its own) is its asker's too (at most [`MAX_PARENTS`] up).
+    ///
+    /// # Errors
+    ///
+    /// Database errors: the caller cannot tell, so it refuses.
+    pub fn orchestrator_asker(&self, session: &SessionId) -> Result<Option<MemberId>> {
+        let mut at = *session;
+        for _ in 0..=MAX_PARENTS {
+            if let Some(asker) = self.kept_asker(&at) {
+                return Ok(Some(asker));
+            }
+            let Some(found) = self.read(|c| query::session(c, &at))? else {
+                return Ok(None);
+            };
+            if let Some(asker) = self.asker_by_facts(&found)? {
+                return Ok(Some(asker));
+            }
+            match found.parent {
+                Some(parent) if parent != at => at = parent,
+                _ => return Ok(None),
+            }
+        }
+        Ok(None)
+    }
+
+    /// The asker of `session` among the ids the hub keeps.
+    fn kept_asker(&self, session: &SessionId) -> Option<MemberId> {
         self.conversations()
             .people
             .iter()
@@ -380,10 +414,36 @@ impl WorkService {
             .map(|p| p.member)
     }
 
+    /// The asker of `session` by its own facts (see [`Self::orchestrator_asker`]): its agent's
+    /// owner, when it is titled as one and runs in its confined run's folder.
+    fn asker_by_facts(&self, session: &Session) -> Result<Option<MemberId>> {
+        if session.title.as_deref() != Some(SESSION_TITLE) || session.cwd.is_empty() {
+            return Ok(None);
+        }
+        let Some(dispatcher) = self.dispatcher() else {
+            return Ok(None);
+        };
+        let folder = guarded(|| Ok(dispatcher.confined_folder(&session.id)))
+            .ok()
+            .flatten();
+        if folder.as_deref() != Some(session.cwd.as_str()) {
+            return Ok(None);
+        }
+        let Some(agent) = session.agent else {
+            return Ok(None);
+        };
+        Ok(self
+            .read(|c| query::member(c, &agent))?
+            .and_then(|m| m.owner))
+    }
+
     /// Whether `session` is an Orchestrator session (see [`Self::orchestrator_asker`]).
-    #[must_use]
-    pub fn is_orchestrator_session(&self, session: &SessionId) -> bool {
-        self.orchestrator_asker(session).is_some()
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn is_orchestrator_session(&self, session: &SessionId) -> Result<bool> {
+        Ok(self.orchestrator_asker(session)?.is_some())
     }
 
     /// Ends every Orchestrator session still running, in the log and through the dispatcher:
@@ -507,6 +567,8 @@ impl WorkService {
         let (conversation, index, step, ending) = {
             let _guard = self.lock();
             let mut state = self.conversations();
+            // What is restored if the question cannot be kept: nothing changes until it is saved.
+            let before = state.people.clone();
             let person = state.person(caller.member).cloned();
             let existing = match follow_up {
                 Some(id) => Some(
@@ -588,7 +650,7 @@ impl WorkService {
                 session: None,
                 turns: Vec::new(),
             });
-            let (step, turn) = match live {
+            let (step, turn, discovered) = match live {
                 Some(session) => {
                     let after = stored.turns.last().map_or(0, StoredTurn::next_after);
                     let typed = typed(&text);
@@ -605,6 +667,7 @@ impl WorkService {
                             after,
                             prompt_at: None,
                         },
+                        None,
                     )
                 }
                 None => {
@@ -688,8 +751,7 @@ impl WorkService {
                     };
                     stored.session = Some(session.id);
                     remember_session(state.person_mut(caller.member), session.id);
-                    self.append(&[self.by(caller, EventBody::SessionDiscovered { session })])?;
-                    (Step::Start(Box::new(request)), turn)
+                    (Step::Start(Box::new(request)), turn, Some(session))
                 }
             };
             stored.turns.push(turn);
@@ -705,7 +767,23 @@ impl WorkService {
             }
             let over = person.conversations.len().saturating_sub(MAX_CONVERSATIONS);
             person.conversations.drain(..over);
-            state.save()?;
+            // Saved first: a question the file cannot keep changes nothing, here or in the log
+            // (no turn stuck answering, no session stored). A new session's id is on disk before
+            // the session is, so it is never an agent's to give a token.
+            if let Err(e) = state.save() {
+                state.people = before;
+                return Err(e);
+            }
+            if let Some(session) = discovered
+                && let Err(e) =
+                    self.append(&[self.by(caller, EventBody::SessionDiscovered { session })])
+            {
+                state.people = before;
+                if let Err(saved) = state.save() {
+                    tracing::warn!(error = %saved, "cannot save the Orchestrator's conversations again");
+                }
+                return Err(e);
+            }
             (id, index, step, ending)
         };
 
@@ -1133,8 +1211,8 @@ fn view(conn: &Connection, stored: &Stored) -> Result<Conversation> {
 }
 
 /// The references and suggestions of `found` that name what the hub knows (sessions only as the
-/// import choice shows them), at most [`MAX_REFERENCES`]; and the answer's text, with any
-/// suggestion line that names nothing known put back.
+/// import choice shows them), at most [`MAX_REFERENCES`], each suggestion once ([`same_suggestion`]);
+/// and the answer's text, with any suggestion line that names nothing known put back.
 fn resolve(
     conn: &Connection,
     choice: &pitcrew_protocol::import::ImportChoice,
@@ -1180,6 +1258,8 @@ fn resolve(
             }
         };
         match made {
+            // The same suggestion twice is one button (the panel follows each by what it is).
+            Some(suggestion) if suggestions.iter().any(|s| same_suggestion(s, &suggestion)) => {}
             Some(suggestion) => suggestions.push(suggestion),
             None => {
                 let line = match suggested {
@@ -1194,6 +1274,25 @@ fn resolve(
         }
     }
     Ok((references, suggestions, text))
+}
+
+/// Whether two suggestions do the same thing: a move of the same task to the same status, or an
+/// open of the same target, whatever their labels (the panel's `suggestionKey`).
+fn same_suggestion(a: &AnswerSuggestion, b: &AnswerSuggestion) -> bool {
+    match (a, b) {
+        (
+            AnswerSuggestion::MoveTask { task, to, .. },
+            AnswerSuggestion::MoveTask {
+                task: other,
+                to: other_to,
+                ..
+            },
+        ) => task == other && to == other_to,
+        (AnswerSuggestion::Open { target, .. }, AnswerSuggestion::Open { target: other, .. }) => {
+            target == other
+        }
+        _ => false,
+    }
 }
 
 /// What `cited` names, and a short label for it, if the hub knows it.

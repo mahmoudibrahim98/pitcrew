@@ -84,6 +84,8 @@ rustix = { version = "=1.1.5", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# `oneshot`, to drive a route and its layers in unit tests (as pitcrew-api's and hub-work's tests do).
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true

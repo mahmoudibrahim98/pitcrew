@@ -551,6 +551,22 @@ impl Reply {
     }
 }
 
+/// The forms a session's id (`ulid`, bare) takes in a request's path: as shown and bare, and
+/// percent-encoded (its `_`, a character of its ULID), which the routes decode.
+pub fn id_forms(ulid: &str) -> Vec<String> {
+    let bytes = ulid.as_bytes();
+    let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+    vec![
+        format!("ses_{ulid}"),
+        ulid.to_owned(),
+        format!("ses%5F{ulid}"),
+        format!("ses%5f{ulid}"),
+        format!("ses_%{first:02X}{}", &ulid[1..]),
+        format!("%{first:02X}{}", &ulid[1..]),
+        format!("ses_{}%{last:02x}", &ulid[..ulid.len() - 1]),
+    ]
+}
+
 /// One HTTP/1.1 request on a fresh connection.
 pub fn request(
     port: u16,

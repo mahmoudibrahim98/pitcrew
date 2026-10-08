@@ -585,32 +585,39 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
     assert_eq!(pap1["status"], "in_progress", "the reader changed nothing");
 
     // The session's transcript and terminal are the asker's alone.
-    let transcript = format!("/v1/sessions/{session}/transcript");
-    ok(
-        &daemon.get(&transcript, Some(&device)),
-        200,
-        "the asker reads it",
-    );
+    for form in common::id_forms(&session) {
+        ok(
+            &daemon.get(&format!("/v1/sessions/{form}/transcript"), Some(&device)),
+            200,
+            "the asker reads it",
+        );
+    }
+    // However its id is written in the path (`ses%5F…`, an encoded character of its ULID): the
+    // check reads the id the route reads.
     let asker_only = |daemon: &Daemon| {
-        assert_eq!(
-            daemon.get(&transcript, Some(&second)).status,
-            403,
-            "another person's transcript read"
-        );
-        let socket = request(
-            daemon.port,
-            "GET",
-            &format!("/v1/sessions/{session}/terminal"),
-            Some(&second),
-            None,
-            &[
-                ("Upgrade", "websocket"),
-                ("Connection", "Upgrade"),
-                ("Sec-WebSocket-Version", "13"),
-                ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
-            ],
-        );
-        assert_eq!(socket.status, 403, "another person's terminal");
+        for form in common::id_forms(&session) {
+            assert_eq!(
+                daemon
+                    .get(&format!("/v1/sessions/{form}/transcript"), Some(&second))
+                    .status,
+                403,
+                "another person's transcript read, as {form}"
+            );
+            let socket = request(
+                daemon.port,
+                "GET",
+                &format!("/v1/sessions/{form}/terminal"),
+                Some(&second),
+                None,
+                &[
+                    ("Upgrade", "websocket"),
+                    ("Connection", "Upgrade"),
+                    ("Sec-WebSocket-Version", "13"),
+                    ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+                ],
+            );
+            assert_eq!(socket.status, 403, "another person's terminal, as {form}");
+        }
     };
     asker_only(&daemon);
     assert_eq!(

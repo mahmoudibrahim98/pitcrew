@@ -431,7 +431,7 @@ impl SessionEnv for AgentEnv {
                      CLI cannot be given one"
                 ));
             }
-            None if work.is_orchestrator_session(&session) => {
+            None if work.is_orchestrator_session(&session).unwrap_or(true) => {
                 return Err(format!(
                     "session {session} is an Orchestrator session, and its run's token is gone, \
                      so its CLI cannot be given one"
