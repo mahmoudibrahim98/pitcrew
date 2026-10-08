@@ -15,6 +15,7 @@ import {
   Fragment,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type DragEvent,
@@ -53,6 +54,9 @@ import {
   setView,
   shiftTab,
   splitGroup,
+  splitFits,
+  minimumWidth,
+  PANE_MIN_WIDTH,
   stepTab,
   type DropSide,
   type Group,
@@ -204,6 +208,19 @@ export interface WorkbenchProps {
 
 export function Workbench({ api, empty }: WorkbenchProps) {
   const { layout, ws } = api;
+  const box = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const element = box.current;
+    if (element === null) return;
+    const measure = () => setWidth(element.clientWidth);
+    measure();
+    if (typeof ResizeObserver !== 'function') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const stackDetails = width > 0 && width < PANE_MIN_WIDTH + layout.details.width;
   const groups = groupsOf(layout);
   const numbers = new Map(groups.map((g, i) => [g.id, i + 1]));
   const current = currentTab(layout);
@@ -227,12 +244,14 @@ export function Workbench({ api, empty }: WorkbenchProps) {
   };
 
   return (
-    <div data-workbench="" onKeyDown={onKeyDown} className="flex min-h-0 min-w-0 flex-1">
+    <div ref={box} data-workbench="" onKeyDown={onKeyDown} className={cx('flex min-h-0 min-w-0 flex-1', stackDetails && 'flex-col')}>
       {/* The panes are the landmarks ("Pane 1"…); this is only their frame. */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <NodeView api={api} node={layout.root} numbers={numbers} count={groups.length} empty={empty} />
       </div>
-      {layout.details.open && (
+      {layout.details.open && (stackDetails ? <aside aria-label="Details" className="max-h-[40%] shrink-0 overflow-auto border-t border-line bg-sidebar">
+        <Details ws={ws} tab={current?.tab} onOpenFile={api.openFile} onOpenBeside={api.openBeside} />
+      </aside> : (
         <ResizablePanel
           as="aside"
           side="right"
@@ -245,7 +264,7 @@ export function Workbench({ api, empty }: WorkbenchProps) {
         >
           <Details ws={ws} tab={current?.tab} onOpenFile={api.openFile} onOpenBeside={api.openBeside} />
         </ResizablePanel>
-      )}
+      ))}
     </div>
   );
 }
@@ -263,16 +282,44 @@ function NodeView({ node, ...props }: NodeProps & { node: LayoutNode }) {
 
 function SplitView({ split, ...props }: NodeProps & { split: Split }) {
   const box = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const element = box.current;
+    if (element === null) return;
+    const measure = () => setWidth(element.clientWidth);
+    measure();
+    if (typeof ResizeObserver !== 'function') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  // Too narrow for its panes side by side, a row split is drawn stacked, in equal parts and
+  // without dividers to drag: the saved split is untouched, and comes back once it fits.
+  const stacked = !splitFits(split, width);
+  const row = split.direction === 'row' && !stacked;
   return (
     <div
       ref={box}
       data-split={split.id}
-      className={cx('flex min-h-0 min-w-0 flex-1', split.direction === 'row' ? 'flex-row' : 'flex-col')}
+      data-stacked={stacked || undefined}
+      className={cx('flex min-h-0 min-w-0 flex-1 overflow-auto', row ? 'flex-row' : 'flex-col')}
     >
       {split.children.map((child, i) => (
         <Fragment key={child.id}>
-          {i > 0 && <Splitter api={props.api} split={split} index={i - 1} box={box} />}
-          <div className="flex min-h-0 min-w-0" style={{ flex: `${split.sizes[i] ?? 1} 1 0px` }}>
+          {i > 0 &&
+            (stacked ? (
+              <div aria-hidden className="h-px shrink-0 bg-line" />
+            ) : (
+              <Splitter api={props.api} split={split} index={i - 1} box={box} />
+            ))}
+          <div
+            className="flex min-h-0 min-w-0"
+            style={
+              stacked
+                ? { flex: '1 1 0px', minHeight: 160 }
+                : { flex: `${split.sizes[i] ?? 1} 1 0px`, minWidth: row ? minimumWidth(child) : undefined }
+            }
+          >
             <NodeView node={child} {...props} />
           </div>
         </Fragment>
@@ -287,7 +334,9 @@ function Splitter({ api, split, index, box }: { api: WorkbenchApi; split: Split;
   const last = useRef<number | null>(null);
   const row = split.direction === 'row';
   const position = Math.round(split.sizes.slice(0, index + 1).reduce((a, b) => a + b, 0) * 100);
-  const resize = (delta: number) => api.change((l) => resizeSplit(l, split.id, index, delta), { follow: false });
+  // A row keeps each side at its minimum width, measured from the split as drawn.
+  const resize = (delta: number) =>
+    api.change((l) => resizeSplit(l, split.id, index, delta, row ? (box.current?.clientWidth ?? 0) : 0), { follow: false });
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     const deltas: Record<string, number> = row
       ? { ArrowLeft: -STEP, ArrowRight: STEP, Home: -1, End: 1 }
@@ -505,6 +554,38 @@ function FileLabel({ path, preview }: { path: string; preview: boolean }) {
   return <span className={cx('min-w-0 truncate', preview && 'italic')}>{path.split('/').pop() || path}</span>;
 }
 
+/**
+ * The tab strip has no scrollbar (index.css), so a vertical wheel scrolls it sideways while it
+ * overflows, and the tab on screen is kept in view. A sideways wheel or trackpad already works.
+ */
+function useSideScroll(strip: RefObject<HTMLDivElement | null>, active: string | null): void {
+  useEffect(() => {
+    const element = strip.current;
+    if (element === null) return;
+    const onWheel = (event: WheelEvent) => {
+      if (event.ctrlKey || Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return;
+      if (element.scrollWidth <= element.clientWidth) return;
+      // Lines and pages (deltaMode 1 and 2), as well as pixels.
+      const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? element.clientWidth : 1;
+      event.preventDefault();
+      element.scrollLeft += event.deltaY * unit;
+    };
+    // Not passive: the page must not scroll as well.
+    element.addEventListener('wheel', onWheel, { passive: false });
+    return () => element.removeEventListener('wheel', onWheel);
+  }, [strip]);
+  // Only the strip scrolls: scrollIntoView would also move the panes around it.
+  useEffect(() => {
+    const element = strip.current;
+    const tab = element?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
+    if (active === null || element === null || tab === null || tab === undefined) return;
+    const box = element.getBoundingClientRect();
+    const at = tab.getBoundingClientRect();
+    if (at.left < box.left) element.scrollBy({ left: at.left - box.left });
+    else if (at.right > box.right) element.scrollBy({ left: at.right - box.right });
+  }, [strip, active]);
+}
+
 const MENU_ITEM =
   'flex cursor-default items-center justify-between gap-6 rounded-sm px-2 py-1.5 text-sm outline-none select-none data-disabled:text-ink-2 data-disabled:opacity-60 data-highlighted:bg-hover';
 
@@ -524,6 +605,7 @@ function TabStrip({
   panelId: string;
 }) {
   const strip = useRef<HTMLDivElement>(null);
+  useSideScroll(strip, group.active);
   const hint = useId();
   const [insertAt, setInsertAt] = useState<number | null>(null);
   const { ws } = api;

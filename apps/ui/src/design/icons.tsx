@@ -147,6 +147,10 @@ export const SplitDownIcon = icon(
   </>,
 );
 
+export const MembersIcon = icon('Members', <><circle cx="6" cy="5" r="2" /><path d="M2 13v-1a4 4 0 0 1 8 0v1M11 3.5a2 2 0 0 1 0 4M12 9a3 3 0 0 1 2 3v1" /></>);
+export const CalendarIcon = icon('Calendar', <><rect x="2" y="3.5" width="12" height="10" rx="1.5" /><path d="M5 2v3M11 2v3M2 7h12M5 10h2M9 10h2" /></>);
+export const LinkIcon = icon('Link', <><path d="m6 10 4-4M6 6l2-2a3 3 0 0 1 4 4l-2 2M10 10l-2 2a3 3 0 0 1-4-4l2-2" /></>);
+
 /** A priority: a flag on a pole. */
 export const FlagIcon = icon(
   'Flag',
@@ -162,15 +166,6 @@ export const UserIcon = icon(
   <>
     <circle cx="8" cy="5.5" r="2.5" />
     <path d="M3 13.5c.6-2.4 2.6-3.8 5-3.8s4.4 1.4 5 3.8" />
-  </>,
-);
-
-/** A date: a calendar page. */
-export const CalendarIcon = icon(
-  'Calendar',
-  <>
-    <rect x="2.5" y="3.5" width="11" height="10" rx="1.5" />
-    <path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" />
   </>,
 );
 

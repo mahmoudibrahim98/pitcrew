@@ -19,6 +19,7 @@ import { useGatewayNavigation } from './gateway-navigate.ts';
 import { lazy, Suspense } from 'react';
 import { isDesktop } from '../data/transport.ts';
 import { Notice } from './notice.tsx';
+import { LoadingSplash } from './loading.tsx';
 import { NotFoundPage, RootNotFound } from './pages/not-found.tsx';
 import { OpenLayout, OpenWorkspace } from './pages/open.tsx';
 import { GatewayPrompts } from './prompts.tsx';
@@ -37,7 +38,7 @@ function Root() {
       <GatewayPrompts />
     </>
   );
-  return isDesktop() ? <Suspense fallback={null}><DesktopUpdates>{content}</DesktopUpdates></Suspense> : content;
+  return isDesktop() ? <Suspense fallback={<LoadingSplash />}><DesktopUpdates>{content}</DesktopUpdates></Suspense> : content;
 }
 
 function createShellRoot() {
@@ -93,6 +94,7 @@ export function createAppRouter(features: readonly Feature[], options: { history
     routeTree: root.addChildren(children),
     ...(options.history === undefined ? {} : { history: options.history }),
     defaultPreload: 'intent',
+    defaultPendingComponent: LoadingSplash,
     Wrap: ({ children: app }) => <RegistryContext value={registry}>{app}</RegistryContext>,
   });
 }

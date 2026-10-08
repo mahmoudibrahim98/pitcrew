@@ -4,7 +4,7 @@
 import { DropdownMenu } from 'radix-ui';
 import { useState } from 'react';
 import { ApiError, useMachines, useMembers, useSession, type Task, type Workstream } from '../data/index.ts';
-import { Button, StatusPill } from '../design/index.ts';
+import { Button, EngineLogo, StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useEndSession, useTaskById, useWorkstreamById } from './data.ts';
 import { LinkSessionDialog } from './link-session.tsx';
@@ -67,6 +67,7 @@ export function SessionHeader(props: SessionHeaderProps) {
   return (
     <header className={cx('flex flex-col gap-1.5 border-b border-line px-4 py-3', props.className)}>
       <div className="flex min-w-0 items-center gap-2">
+        <EngineLogo engine={s.engine} />
         <h2 className="min-w-0 truncate text-lg font-semibold">{sessionTitle(s)}</h2>
         <StatusPill tone={state.tone}>{state.label}</StatusPill>
         <DropdownMenu.Root modal={false}>
@@ -177,10 +178,10 @@ export function SessionHeader(props: SessionHeaderProps) {
 }
 
 function PlaceholderItem({ label, onSelect }: { label: string; onSelect: (() => void) | undefined }) {
+  if (onSelect === undefined) return null;
   return (
     <DropdownMenu.Item className={itemClass} disabled={onSelect === undefined} onSelect={() => onSelect?.()}>
       {label}
-      {onSelect === undefined && <span className="text-xs text-ink-2">Soon</span>}
     </DropdownMenu.Item>
   );
 }

@@ -10,6 +10,10 @@ disabled while it runs, and a failed action stays with a retry instruction. Whil
 is open its `ToastHost` shows the notifications inside it, so they stay reachable with Tab (F8
 focuses them) and clicking one never closes the drawer.
 
+`EngineLogo` draws a neutral glyph per engine (a ringed dot for Claude Code, a hexagon for Codex,
+a triangle for OpenCode), inline and in the text colour. They are not the vendors' marks: those
+are trademarks whose terms restrict their use, and this repository is public.
+
 Components built on `@pitcrew/tokens` and Radix primitives. Import from `index.ts`. Every one is
 keyboard operable, works light and dark (Tailwind classes resolve to the `--pc-*` tokens), and
 honours reduced motion through the tokens' durations. See `docs/build/streams/L.md`.

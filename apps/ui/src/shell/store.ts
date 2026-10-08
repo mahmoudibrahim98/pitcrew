@@ -9,6 +9,7 @@ export interface WorkspacePrefs {
   layout: LayoutId;
   /** The last page seen in each layout, as a path with its search. */
   last: Partial<Record<LayoutId, string>>;
+  recent?: string[];
 }
 
 export const ORCHESTRATOR_WIDTH = { min: 280, max: 640, initial: 360 } as const;
@@ -28,6 +29,7 @@ interface Transient {
   paletteOpen: boolean;
   /** The "+ New" dialog on screen, by entry id. */
   creating: string | null;
+  linkingSession: string | null;
   /** What had focus before that dialog opened, to give focus back to. */
   creatingFrom: Element | null;
   /** What that dialog starts with, from where it was opened. */
@@ -50,6 +52,7 @@ interface Actions {
    * `defaults` are what the dialog starts with.
    */
   setCreating(id: string | null, from?: Element | null, defaults?: CreateDefaults): void;
+  setLinkingSession(id: string | null): void;
   setNotice(notice: string | null): void;
 }
 
@@ -64,6 +67,7 @@ export const initialShellState: Persisted & Transient = {
   orchestratorWidth: ORCHESTRATOR_WIDTH.initial,
   paletteOpen: false,
   creating: null,
+  linkingSession: null,
   creatingFrom: null,
   creatingDefaults: null,
   notice: null,
@@ -84,7 +88,7 @@ export const useShell = create<ShellState>()(
           const current = prefs(s, ws);
           if (current.layout === layout && current.last[layout] === path) return s;
           return {
-            workspaces: { ...s.workspaces, [ws]: { layout, last: { ...current.last, [layout]: path } } },
+            workspaces: { ...s.workspaces, [ws]: { layout, last: { ...current.last, [layout]: path }, recent: [path, ...(current.recent ?? []).filter((p) => p !== path)].slice(0, 12) } },
           };
         }),
       setLastWorkspace: (lastWorkspace) =>
@@ -101,6 +105,7 @@ export const useShell = create<ShellState>()(
           creatingFrom: creating === null ? s.creatingFrom : from,
           creatingDefaults: creating === null ? null : (defaults ?? null),
         })),
+      setLinkingSession: (linkingSession) => set({ linkingSession }),
       setNotice: (notice) => set({ notice }),
     }),
     {

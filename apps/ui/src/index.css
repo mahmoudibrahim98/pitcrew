@@ -143,8 +143,19 @@
     font-size: var(--pc-text-md);
     -webkit-font-smoothing: antialiased;
   }
+  /* Keep the first paint on-theme while JavaScript and lazy routes load. */
+  #root:empty::before {
+    content: 'PitCrew · Opening your workspace…';
+    display: grid;
+    min-height: 100dvh;
+    place-items: center;
+    font-size: var(--pc-text-lg);
+  }
   :focus-visible {
     outline: 2px solid var(--pc-accent);
     outline-offset: 2px;
   }
 }
+
+[data-workbench] [role='tablist'] { scrollbar-width: none; }
+[data-workbench] [role='tablist']::-webkit-scrollbar { display: none; }

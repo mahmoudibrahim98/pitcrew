@@ -63,9 +63,7 @@ describe('SessionHeader against the mock hub', () => {
     fireEvent.keyDown(screen.getByRole('button', { name: 'Session actions' }), { key: 'Enter' });
     const menu = await screen.findByRole('menu');
     for (const name of ['Hand off', 'Fork', 'Review']) {
-      expect(within(menu).getByRole('menuitem', { name: new RegExp(`^${name}`) }).getAttribute('aria-disabled')).toBe(
-        'true',
-      );
+      expect(within(menu).queryByRole('menuitem', { name: new RegExp(`^${name}`) })).toBeNull();
     }
     fireEvent.click(within(menu).getByRole('menuitem', { name: 'End session…' }));
     const confirm = await screen.findByRole('alertdialog', { name: 'End this session?' });
