@@ -1194,8 +1194,10 @@ preview's prompt in memory for 10 minutes, for its start.
   task, its title, its counts (turns, tool runs and failures, file edits), up to 5 files it edited
   and up to 3 recap lines (the one-line summaries of its newest blocks of work). Files are named
   relative to the session's folder, else to one of the workstream's folders or its project's
-  root; any other absolute path keeps only its end (`…/<file>`, or its last two parts when it has
-  five or more, or `…`), and a path too long is cut at its start. Only sessions the
+  root; any other absolute path keeps only its file name (`…/<file>`, or `…` without one: no
+  folder of it, which may be a user's name), and a path too long is cut at its start. In titles,
+  recap lines and the proposal's texts only a Windows path or a path ending in a file name is cut
+  so (a URL's path such as `/api/users` stays). Only sessions the
   session routes would list (the import choice applies), without sub-agents and without drafts'
   own sessions. **Never** a transcript, a prompt, a tool's output or a secret.
 - **Bounds**: 40 sessions, 60 tasks (at most 4 KiB of them), titles of 120 characters, recap lines
@@ -1225,24 +1227,28 @@ that is running or waiting for review (one at a time); `503` when no session can
 attached, the hub's own machine not live, or no scratch folder for confined runs). The engine
 defaults to the agent's persona's, else `claude`; the person's UI offers only the CLIs found on
 the hub's machine (`GET /v1/machines/{id}/session-options`). A start with the latest preview's
-digest sends exactly that preview's prompt.
+digest sends exactly that preview's prompt; a start refused before the draft is stored (`400`,
+`403`, `409`, `503`) leaves that preview kept for the next.
 - **The CLI runs confined** (a confined run; the daemon's `crates/daemon/src/confined.rs`), whatever
   the agent's persona's permission mode and the person's own settings for that CLI:
-  - on the hub's own machine, in a **fresh private folder** `scratch/<session>` in PitCrew's cache
-    folder (0700, an owner-only ACL on Windows), never the workstream's folder nor the state
-    directory, removed when its session ends;
+  - on the hub's own machine, in a **fresh private folder** `scratch/<state key>/<session>` in
+    PitCrew's cache folder (the state key: 16 hexadecimal digits of the SHA-256 of the hub's state
+    directory, so each hub's runs are its own; 0700, an owner-only ACL on Windows), never the
+    workstream's folder nor the state directory, removed when its session ends;
   - with its prompt in `prompt.md` there (0600) and one plain line on its command line
     (`Read the file prompt.md in this folder and follow its instructions.`);
   - in its CLI's confined shape: Claude Code `--permission-mode=default --setting-sources=project
     --strict-mcp-config` with a project `.claude/settings.json` that pre-approves only `pitcrew
-    board submit` and writing `proposal.json`, and denies web fetch and search and the state
-    directory; Codex `--sandbox=read-only --ask-for-approval=on-request
+    board submit` and writing `proposal.json`, and denies web fetch and search, the state
+    directory, and sub-agents (`Task`, `Agent`); Codex `--sandbox=read-only --ask-for-approval=on-request
     --config=web_search=disabled` (its sandbox blocks the network, so the person approves the
     submit in its terminal); OpenCode with a deny-all `opencode.json` but reading its folder and
     `pitcrew board submit …` (refused on Windows);
   - with a **session token** (see "Transport and auth") for the draft's session, never the
     agent's token;
-  - for at most **30 minutes**: then its CLI is ended, and the draft with it (`ended`).
+  - for at most **30 minutes**: then its CLI is ended, and the draft with it (`ended`); and its
+    CLI is ended too once its session has ended otherwise (the hub gave up on a CLI that never
+    reported, a person ended it).
 - The hub stores the session first (`session_discovered`: state `starting`, the agent named,
   linked to the workstream with `link_basis: manual`, its `cwd` the private folder), then
   `board_draft_started` (the draft, its workstream, agent, engine, session, the prompt's version
@@ -1320,10 +1326,14 @@ conversations.
 **An Orchestrator session's transcript and terminal are its asker's alone**: `GET
 /v1/sessions/{id}/transcript` and `GET /v1/sessions/{id}/terminal` for one are `403` for anyone
 but the person who asked (another person's device token included; a reader's and an agent's are
-refused there already), before and after they clear. The hub remembers every Orchestrator session
-it started for a person, cleared or not, for this. The session itself (`GET /v1/sessions/{id}`,
-its state and its activity in `GET /v1/events`, the tools it ran included) is listed as any
-session is.
+refused there already), before and after they clear, however the path writes its id (`ses_…`,
+the bare ULID, or percent-encoded: the check reads the id the route reads). So is a session
+whose parent is one (a sub-agent's, as the runner states it), up to 8 parents. The hub remembers
+every Orchestrator session it started for a person, cleared or not (the newest 2000 per person),
+for this; one it no longer remembers (past those, or in a file moved aside) is still known by
+its own facts: titled `Orchestrator` and run in the very folder the hub names for its confined
+run, it is its agent's owner's. The session itself (`GET /v1/sessions/{id}`, its state and its
+activity in `GET /v1/events`, the tools it ran included) is listed as any session is.
 
 **`Orchestrator`**: `{ "engines": EngineStatus[], "engine"?: Engine, "limits": OrchestratorLimits,
 "conversations": Conversation[] }`.
@@ -1364,12 +1374,15 @@ is finished first (one at a time per person: its token stops at once, its CLI is
 runner's `SendText`); if it has ended, a new session starts, whose prompt carries the
 conversation's last questions and answers (at most 6 KiB, cut and marked as data).
 
-A new session is stored first (`session_discovered`: title `Orchestrator`, state `starting`, the
-agent named, linked to nothing, its `cwd` its private folder), then its CLI starts **confined**
+The question is saved first (with a new session's id), so one the hub cannot keep changes
+nothing (`500`, no turn left answering). A new session is then stored (`session_discovered`:
+title `Orchestrator`, state `starting`, the agent named, linked to nothing, its `cwd` its private
+folder), then its CLI starts **confined**
 (the daemon's `crates/daemon/src/confined.rs`, as for a board draft), whatever the agent's
 persona's permission mode and the person's own settings for that CLI:
-- on the hub's own machine, in a **fresh private folder** `scratch/<session>` in PitCrew's cache
-  folder (0700, an owner-only ACL on Windows), never the state directory, made new for this
+- on the hub's own machine, in a **fresh private folder** `scratch/<state key>/<session>` in
+  PitCrew's cache folder (0700, an owner-only ACL on Windows), never the state directory, made new
+  for this
   session (a follow-up typed into a live session stays in its folder; a new session gets a new
   one) and removed when the session ends, so nothing an answer could write there (a
   `CLAUDE.md`, an `AGENTS.md`, a settings file) reaches a later session;
@@ -1379,9 +1392,9 @@ persona's permission mode and the person's own settings for that CLI:
   this folder and follow its instructions.`), which passes a Windows `.cmd` shim;
 - in its CLI's confined shape: Claude Code `--permission-mode=default --setting-sources=project
   --strict-mcp-config` with a project `.claude/settings.json` that pre-approves only `pitcrew`'s
-  read verbs (never `board submit`), denies every file edit, web fetch and search, reading or
-  changing the state directory, and reading the agent CLIs' own folders and common credential
-  stores (`~/.ssh`, `~/.claude`, `~/.codex`, …); a read elsewhere outside its folder asks the
+  read verbs (never `board submit`), denies every file edit, web fetch and search, sub-agents
+  (`Task`, `Agent`), reading or changing the state directory, and reading the agent CLIs' own
+  folders and common credential stores (`~/.ssh`, `~/.claude`, `~/.codex`, …); a read elsewhere outside its folder asks the
   person in its terminal (Claude Code's denials win over its allowances, so it cannot be told to
   deny every read but its folder's). OpenCode with a deny-all `opencode.json` but reading its
   folder (`external_directory` denied) and `pitcrew <read verb>`;
@@ -1426,11 +1439,14 @@ it (a session's title, a task's key and title, a workstream's or project's name)
 `ReferenceTarget` one of `{ "kind": "session", "id" }`, `{ "kind": "task", "id", "key" }`,
 `{ "kind": "workstream", "id", "project" }`, `{ "kind": "project", "id" }` and
 `{ "kind": "recap", "project", "workstream"?, "date"? }`. Unknown ones, sessions the import choice
-hides, and anything else stay text.
+hides, and anything else stay text. The panel labels each link in the hub's words (a task by its
+key, anything else by its `label`), never the answer's: a Markdown link's own text stays text
+before it, so `[PAP-7](PAP-9)` cannot read as PAP-7 and open PAP-9.
 
 **Suggestions** are the answer's lines `Suggestion: move <task> to <status>` and
 `Suggestion: open <reference>` (a list item's `- ` allowed before them), checked as references
-are; each one that holds (at most 10) is taken out of `answer` and becomes an `AnswerSuggestion`:
+are; each one that holds (at most 10, and each once: a move of the same task to the same status,
+or an open of the same target, is one) is taken out of `answer` and becomes an `AnswerSuggestion`:
 `{ "kind": "move_task", "task", "key", "to": TaskStatus, "label" }` or `{ "kind": "open",
 "target": ReferenceTarget, "label" }`. Other lines stay text. **A suggestion does nothing by
 itself**: the panel shows it, and only the person's click acts, as the person, through the usual

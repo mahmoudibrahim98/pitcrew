@@ -131,9 +131,11 @@ activity, so the office never feeds on itself.
   and password; long random-looking words (32+ characters, mixed case and digits, or
   hexadecimal); e-mail addresses; home folders (`/home/<name>`, `/Users/<name>`,
   `C:\Users\<name>`, also as `\\?\C:\Users\<name>` and WSL's `/mnt/c/Users/<name>`, and `/root`
-  become `~`); and any other absolute path, cut to its end (`path_tail`: its last two parts after
-  `…/` when it has five or more, its file name when it has one, else `…`), so a user name in
-  `/scratch/<group>/<user>` does not go. Each segment of a path or branch is checked too; `path`
-  is `line` for a path, cut at its start. The rules are broad on purpose: a false positive costs a
+  become `~`); and any other absolute path of a file, cut to its file name (`path_tail`:
+  `…/<file>` when it has one, else `…`; never a folder of it), so a user name in
+  `/scratch/<group>/<user>/…` does not go. `path` (a file's path) cuts every absolute path so;
+  `line` (a title, a note) only a Windows path or one ending in a file name, so a URL's path such
+  as `/api/users` stays. Each segment of a path or branch is checked too; `path` is cut at its
+  start. The rules are broad on purpose: a false positive costs a
   word of context, a false negative a secret. Each replacement is counted, and the person sees the
   count before anything is sent.

@@ -670,18 +670,24 @@ its folder it may write, its longest running time, and its token: `RunToken`). `
 for every such run and every CLI, whatever the agent's persona or the person's own settings for
 that CLI say; a later confined run only names its own `Confinement`:
 
-- **A fresh private folder** (`ConfinedRuns`): `scratch/<session>` in PitCrew's cache folder
-  (`~/.cache/pitcrew` on Linux, `~/Library/Caches/PitCrew` on macOS, `%LOCALAPPDATA%\PitCrew\cache`
-  on Windows; `XDG_CACHE_HOME` is honoured), never the state directory (refused if the two would
-  nest) nor the person's repository. The scratch folder is 0700 (repaired if it is open; an
+- **A fresh private folder** (`ConfinedRuns`): `scratch/<state key>/<session>` in PitCrew's
+  cache folder (`~/.cache/pitcrew` on Linux, `~/Library/Caches/PitCrew` on macOS,
+  `%LOCALAPPDATA%\PitCrew\cache` on Windows; `XDG_CACHE_HOME` is honoured), never the state
+  directory (refused if the two would nest) nor the person's repository. The state key
+  (`confined::state_key`: 16 hexadecimal digits of the SHA-256 of the state directory's canonical
+  path) gives each daemon its own folder there, so a second daemon of the same user never removes
+  the first's runs. The scratch folder and the daemon's folder are 0700 (repaired if open; an
   owner-only ACL on Windows); each run's folder is made new for its start (an old one of that name
   is removed), owner-only, holding only `prompt.md` (the prompt, 0600) and the CLI's settings
   (Claude Code's `.claude/settings.json` from `claude_settings`, which also denies reading the
-  agent CLIs' folders and common credential stores, `SECRET_READS`, and every file edit for a run
-  that writes none; OpenCode's `opencode.json` from `opencode_settings`; Codex reads none from an
-  untrusted folder). At each start, whatever in the
-  scratch folder is not a running run's folder is removed (the CLIs read their folders' parents,
-  so an injected `CLAUDE.md` there would reach later runs); when the daemon starts, all of it is.
+  agent CLIs' folders and common credential stores, `SECRET_READS`, sub-agents, `SUB_AGENT_TOOLS`,
+  and every file edit for a run that writes none; OpenCode's `opencode.json` from
+  `opencode_settings`; Codex reads none from an untrusted folder). At each start, whatever in the
+  daemon's folder is not a running run's folder is removed, and so is whatever in the scratch
+  folder is not a daemon's folder (the CLIs read their folders' parents, so an injected
+  `CLAUDE.md` there would reach later runs); when the daemon starts, all of its folder is, with
+  the token files a crashed daemon left in `sessions/`. One run per session: a second start of a
+  running one is refused.
   `Dispatcher::confined_folder` names the folder before the session is stored, so its `cwd` is
   right from the start.
 - **Its launch**: the runner's `StartSession` with `confined` and `CONFINED_BRIEF`, one plain line
@@ -700,9 +706,11 @@ that CLI say; a later confined run only names its own `Confinement`:
   token only to routes mounted with `RouterParts::session`, each of which checks the token is for
   its own session's resource; a reader token only `GET`s the **agent** and **read** routes.
 - **Its end** (`Ender`): `Dispatcher::finish_session` (a draft's proposal is in) revokes the token
-  at once and ends the CLI after `GRACE` (3 s; gracefully, else killed); a watch per run removes
-  its folder and token once its session has ended (looked at every 5 s), and ends it after its
-  `max_runtime` (30 minutes for a draft, 60 for an Orchestrator session). At the daemon's start,
+  at once and ends the CLI after `GRACE` (3 s; gracefully, else killed); a watch per run ends it
+  (its CLI too, then its folder and token) once its session has ended (looked at every 5 s: the
+  hub may give up on a CLI that never reported, whose terminal would otherwise stay; a failed
+  look is not an end), and after its `max_runtime` (30 minutes for a draft, 60 for an
+  Orchestrator session). At the daemon's start,
   drafts and Orchestrator sessions left running are ended (`WorkService::end_running_drafts`,
   `end_orchestrator_sessions`), and their CLIs too once the runner is attached.
 
@@ -726,7 +734,9 @@ Orchestrator") run as sessions of an agent CLI on this machine, through the same
   conversation, a clear and the session's end finish the run (token, CLI, folder).
 - **Asker only:** `orchestrator::asker_only`, a route layer on `GET /v1/sessions/{id}/transcript`
   and `GET /v1/sessions/{id}/terminal`, answers `403` to anyone but the person who asked an
-  Orchestrator session (`WorkService::orchestrator_asker`, cleared or not).
+  Orchestrator session, or a sub-agent's session under one (`WorkService::orchestrator_asker`,
+  cleared or not). It reads the session id as the route does (`Path<String>`, percent-decoded:
+  `route_session`), never from the raw path, as the sign-in terminals' `only_its_starter` does.
 - **Installed:** `Dispatcher::installed` says whether the CLI is on this daemon's `PATH`
   (`PATHEXT` on Windows), which `GET /v1/orchestrator` shows per engine.
 - **Following answers:** a loop (`orchestrator::follow`, every second, on the blocking pool)

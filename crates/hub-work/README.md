@@ -457,9 +457,13 @@ api-v1.md, "Orchestrator"; brief `0-orchestrator-chat`); the module's comment ha
   `writes`, `SESSION_MAX_RUNTIME` 60 minutes, `RunToken::Reader`): a fresh private folder the
   `Dispatcher` names (`confined_folder`, its `cwd`), the prompt `orchestrator/v1`
   (`pitcrew_office::orchestrator::prompt`) in its `prompt.md`, and a **reader token** minted for
-  that session alone. Its id is kept for good in the person's `sessions`
-  (`orchestrator_asker`, `is_orchestrator_session`): its transcript and terminal are the asker's
-  alone, and the daemon never gives it its agent's token.
+  that session alone. The question is saved first (a save that fails changes nothing), with the
+  new session's id kept for good in the person's `sessions` (`orchestrator_asker`,
+  `is_orchestrator_session`; the newest 2000 per person): its transcript and terminal are the
+  asker's alone, and the daemon never gives it its agent's token. A session whose id is no longer
+  kept is still known by its facts (titled `Orchestrator`, in the folder `confined_folder` names
+  for it: its agent's owner's), and a session whose parent is one (a sub-agent's) is its asker's
+  too.
 - **One answer at a time** per person, 20 questions a conversation, 20 conversations kept. A
   follow-up types into the live session (one line, never a CLI command); one whose session ended
   starts a new session with the conversation so far as data in its prompt. A new conversation
@@ -792,7 +796,8 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   cancel, and clear, which finishes the session and keeps it its asker's; who may ask and what
   refuses a question (Codex is not offered); conversations survive a restart in a private file,
   and sessions left running end; an unreadable file is moved aside; a reader reads and changes
-  nothing.
+  nothing; sub-agents and forgotten sessions stay their askers'; a suggestion made twice is one; a
+  question that cannot be saved changes nothing.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other
   routes and commands. `tests/task_shape.rs`: the `Task` shape pin.
 
