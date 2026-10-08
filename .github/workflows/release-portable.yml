@@ -1,0 +1,123 @@
+# Owned by stream P. The portable Windows build: pitcrew-windows-x64-portable.zip, to unzip into a
+# folder and run PitCrew from there, with no installer (docs/build/briefs/P-portable-windows.md).
+#
+# On demand, on every push to main, and on pull requests that touch packaging, the desktop shell
+# or this workflow: builds pitcrewd, pitcrew, pitcrew-ptyd and pitcrew-askpass as release.yml's
+# Windows build does, but with the C runtime linked in (no Visual C++ Redistributable to install),
+# then the desktop app, the third-party notices, README-portable.txt, portable.txt and SHA256SUMS
+# (packaging/portable/build.sh); unzips it into a fresh folder and smoke-tests it there
+# (packaging/portable/smoke.ps1); and uploads the zip itself as the run's artifact for 30 days.
+# Nothing is signed, attested or published as a release. See packaging/README.md, "The portable
+# Windows zip".
+#
+# As in release.yml: actions pinned by commit SHA, no default permissions and only reading the
+# repository in each job, no caches (setup-node's package-manager cache is off), the Rust channel
+# from rust-toolchain.toml, tools pinned by version, and no expression inside a script.
+name: Portable Windows zip
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "apps/desktop/**"
+      - ".github/workflows/release-portable.yml"
+
+permissions: {}
+
+concurrency:
+  group: portable-${{ github.event.pull_request.number || github.ref }}
+  # A pull request's newer push replaces its run; every push to main keeps its own zip.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # The packaging scripts' own tests (stand-ins only), the portable zip's and the notices' among
+  # them; release.yml runs these only for a release.
+  tests:
+    name: Packaging scripts' tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: The packaging scripts pass their tests
+        run: bash packaging/test.sh
+
+  zip:
+    name: Portable Windows zip
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rustup is on every hosted runner; the channel comes from rust-toolchain.toml.
+      - name: Rust
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then echo "::error::no channel in rust-toolchain.toml"; exit 1; fi
+          rustup toolchain install "$channel" --profile minimal
+          rustup target add --toolchain "$channel" "$TARGET"
+          rustc --version
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          # Build inputs must not come from a package cache populated by another workflow.
+          package-manager-cache: false
+
+      # The UI the app serves (apps/ui/dist), and the node_modules the notices read. pnpm comes
+      # from the root package.json, by corepack.
+      - name: The UI
+        shell: bash
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm --filter @pitcrew/ui build
+
+      # The C runtime linked into each program (as tauri-build already links it into the desktop),
+      # so the zip runs where the Visual C++ Redistributable is not installed.
+      - name: pitcrewd, pitcrew, pitcrew-ptyd and pitcrew-askpass
+        shell: bash
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+        run: bash packaging/build-release.sh --out dist "$TARGET"
+
+      - name: The desktop app, the notices and the zip
+        shell: bash
+        run: bash packaging/portable/build.sh --dist dist --out dist/portable
+
+      # Unzipped into a fresh folder outside the checkout: the files and their checksums, no
+      # Visual C++ runtime needed, the programs' versions, the desktop's --check-layout (no
+      # window), pitcrewd answering GET /v1/host/info with pitcrew-ptyd found, nothing written
+      # next to the programs. Adds the file list, size and SHA-256 to the job's summary.
+      - name: Smoke test
+        shell: pwsh
+        run: ./packaging/portable/smoke.ps1 -Zip dist/portable/pitcrew-windows-x64-portable.zip
+
+      # The zip itself, not zipped again: the artifact is pitcrew-windows-x64-portable.zip.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: dist/portable/pitcrew-windows-x64-portable.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
