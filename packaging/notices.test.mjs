@@ -198,5 +198,13 @@ test("the standard library's notices come from the toolchain, as text", (t) => {
   assert.equal(std.version, '1.97.0');
   assert.equal(std.texts[0].text, 'Copyright notices\nA & B <C>\n\nMIT\n\n\u00a9 x\u2014y\n');
   assert.equal(htmlToText('<p>a</p>'), 'a\n');
+  // A removal never leaves another match behind: nested and broken-up scripts and tags are gone.
+  const hostile = '<scr<script>x</script>ipt>alert(1)</script><st<style>p{}</style>yle>q{}</style>' +
+    '<<b>img src=x>ok<</b>/p> <scr<b>ipt>y</scr</b>ipt>';
+  const cleaned = htmlToText(hostile);
+  assert.equal(cleaned, 'ok y\n');
+  assert.doesNotMatch(cleaned, /<|>/);
+  // Text that only looks like a tag once decoded stays text: the result is never HTML.
+  assert.equal(htmlToText('<p>&lt;script&gt; a &lt; b</p>'), '<script> a < b\n');
   assert.throws(() => rustStd(join(dir, 'nowhere'), 'rustc 1.0.0'), /COPYRIGHT-library\.html is missing/);
 });

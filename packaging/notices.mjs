@@ -172,14 +172,26 @@ export function rustPackages(metadata, roots, extraDir = EXTRA) {
     }));
 }
 
-/** `COPYRIGHT-library.html` as plain text: the tags gone, the entities decoded, blank lines one. */
+/**
+ * `COPYRIGHT-library.html` as plain text: the scripts, styles and tags gone, the entities decoded,
+ * blank lines one. Each removal repeats until nothing changes, so removing one match cannot leave
+ * another behind (`<scr<script></script>ipt>`). The result is only ever written to a text file.
+ */
 export function htmlToText(html) {
   const entities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+  let text = html;
+  let previous;
+  do {
+    previous = text;
+    text = text.replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, '');
+  } while (text !== previous);
+  text = text.replace(/<br\s*\/?>|<\/(p|div|h[1-6]|li|tr|pre|ul|ol|details|summary|dd|dt)>/gi, '\n');
+  do {
+    previous = text;
+    text = text.replace(/<[^<>]*>/g, '');
+  } while (text !== previous);
   return cleanText(
-    html
-      .replace(/<(script|style)\b[\s\S]*?<\/\1>/gi, '')
-      .replace(/<br\s*\/?>|<\/(p|div|h[1-6]|li|tr|pre|ul|ol|details|summary|dd|dt)>/gi, '\n')
-      .replace(/<[^>]+>/g, '')
+    text
       .replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z]+);/gi, (whole, code) => {
         if (code[0] === '#') {
           const point = code[1] === 'x' || code[1] === 'X' ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);
