@@ -114,6 +114,19 @@ export function CreateStep() {
                   ))}
                 </select>
               </div>
+              <p className="mt-2 break-all font-mono text-xs text-ink-2">{state.scanResult?.suggestedProjects.find((p) => p.id === project.suggestionId)?.path}</p>
+              <label className="mt-2 flex items-center gap-2 text-xs text-ink-2">
+                Merge suggestion into
+                <select aria-label={`Merge ${project.name} into project`} value="" disabled={busy || !project.checked} className="min-w-0 rounded-sm border border-line-2 bg-card p-1 text-ink" onChange={(event) => {
+                  const target = event.target.value;
+                  if (target === '') return;
+                  patch({ createProjects: state.createProjects.map((p) => p.suggestionId === project.suggestionId ? { ...p, checked: false } : p), createWorkstreams: state.createWorkstreams.map((w) => w.projectId === project.suggestionId ? { ...w, projectId: target } : w) });
+                }}>
+                  <option value="">Keep separate</option>
+                  {checkedProjects.filter((p) => p.suggestionId !== project.suggestionId).map((p) => <option key={p.suggestionId} value={p.suggestionId}>{p.name}</option>)}
+                </select>
+              </label>
+              <p className="mt-1 text-xs text-ink-2">Merging uses the target project's root and keeps each workstream's original folder or branch.</p>
               {workstreams.length > 0 && (
                 <ul className="mt-2 flex flex-col gap-1.5 pl-6">
                   {workstreams.map((ws) => (
@@ -133,7 +146,7 @@ export function CreateStep() {
                         onChange={(e) => updateWorkstream(ws.suggestionId, { name: e.target.value })}
                         className="h-6 flex-1 rounded-sm border border-line-2 bg-card px-2 text-xs text-ink outline-none focus-visible:border-accent disabled:opacity-50"
                       />
-                      <span className="text-xs text-ink-2">{ws.sessionCount} sessions</span>
+                      <span className="text-xs text-ink-2">{ws.sessionCount} {ws.sessionCount === 1 ? 'session' : 'sessions'}</span>
                       <select
                         aria-label={`Move ${ws.name} to project`}
                         value={ws.projectId}

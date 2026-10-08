@@ -177,6 +177,33 @@ describe('the workbench', () => {
     expect(active().closest('[data-group]')).toBe(pane(2));
   }, 20_000);
 
+  it('scrolls a tab strip sideways with the wheel, since it shows no scrollbar', async () => {
+    renderConsole(paths.session(WS, ID.ses1));
+    await eventually(() => expect(picture()).toEqual([['Draft method section(preview)*']]), { timeout: 8_000 });
+    const strip = screen.getByRole('tablist', { name: 'Tabs in pane 1' });
+    // happy-dom has no layout: a strip 200 px wide holding 600 px of tabs.
+    Object.defineProperty(strip, 'clientWidth', { configurable: true, value: 200 });
+    Object.defineProperty(strip, 'scrollWidth', { configurable: true, value: 600 });
+    const wheel = ({ ctrlKey = false, ...init }: WheelEventInit) => {
+      const event = new WheelEvent('wheel', { bubbles: true, cancelable: true, ...init });
+      // happy-dom's WheelEvent is not a MouseEvent: it has no modifier keys of its own.
+      Object.defineProperty(event, 'ctrlKey', { value: ctrlKey });
+      strip.dispatchEvent(event);
+      return event;
+    };
+    expect(wheel({ deltaY: 120 }).defaultPrevented).toBe(true);
+    expect(strip.scrollLeft).toBe(120);
+    // A wheel that counts lines.
+    expect(wheel({ deltaY: 2, deltaMode: 1 }).defaultPrevented).toBe(true);
+    expect(strip.scrollLeft).toBe(152);
+    // Sideways already scrolls it; Ctrl is the browser's zoom.
+    expect(wheel({ deltaX: 40, deltaY: 10 }).defaultPrevented).toBe(false);
+    expect(wheel({ deltaY: 40, ctrlKey: true }).defaultPrevented).toBe(false);
+    // A strip whose tabs fit leaves the wheel to the page.
+    Object.defineProperty(strip, 'scrollWidth', { configurable: true, value: 200 });
+    expect(wheel({ deltaY: 120 }).defaultPrevented).toBe(false);
+  }, 20_000);
+
   it('keeps the layout per workspace across a reload, and starts afresh from a corrupt one', async () => {
     const first = renderConsole(paths.session(WS, ID.ses1));
     await eventually(() => expect(picture()).toEqual([['Draft method section(preview)*']]), { timeout: 8_000 });
@@ -269,10 +296,7 @@ describe('the workbench', () => {
     await eventually(() => expect(value('Model')).toBe("The CLI's default (Writer)"));
     expect(value('Account')).toBe('Not reported');
     expect(value('State')).toBe('Working');
-    // Hand off is shown, and says why it does nothing yet.
-    const handOff = within(details).getByRole('button', { name: 'Hand off' });
-    expect(handOff.getAttribute('aria-disabled')).toBe('true');
-    expect(document.getElementById(handOff.getAttribute('aria-describedby') ?? '')?.textContent).toMatch(/not available yet/);
+    expect(within(details).queryByRole('button', { name: 'Hand off' })).toBeNull();
 
     const tree = await within(details).findByRole('navigation', { name: 'Folder tree' });
     fireEvent.click(await within(tree).findByRole('button', { name: '▸ src' }));

@@ -59,7 +59,25 @@ test('script-src falls back to default-src; exact hashes and nonces remain local
 test('external module entrypoint and quoted attributes are not inline executable markup', () => {
   assert.deepEqual(checkHtml('<!doctype html><title>Example &lt;script&gt;</title><script type="module" src="/assets/app.js"></script>'), []);
   assert.deepEqual(checkHtml('<!-- <script>bad()</script> --><p title="onclick=not-an-attribute >">Text</p>'), []);
-  assert.deepEqual(checkHtml('<textarea><img onerror="not markup here"></textarea><style>/* onclick */</style>'), []);
+  assert.deepEqual(checkHtml('<textarea><img onerror="not markup here"></textarea>'), []);
+  // A <style> is refused for itself (below), but its text is still not read as markup.
+  assert.deepEqual(checkHtml('<style>/* <img onclick="x"> */</style>'), ['inline <style> in built UI']);
+});
+
+// Tauri adds a nonce to every <style> in the page, which switches off 'unsafe-inline' for the
+// styles the app sets at run time; style="" is never covered by a nonce at all.
+for (const html of ['<style>html { background: #fff }</style>', '<STYLE media="(prefers-color-scheme: dark)"></STYLE>', '<head><style></style></head>']) {
+  test(`rejects inline <style>: ${html}`, () => assert.ok(checkHtml(html).includes('inline <style> in built UI')));
+}
+for (const html of ['<div style="display:grid">', "<p STYLE='color: red'>", '<span style>', '<div class="x" style=display:grid>']) {
+  test(`rejects style attributes: ${html}`, () => assert.ok(checkHtml(html).some((error) => error.startsWith('style attribute'))));
+}
+test('style-like names and text are not inline styles', () => {
+  assert.deepEqual(checkHtml('<div class="style" data-style="x" title="style=&quot;a&quot;">style=""</div><link rel="stylesheet" href="/splash.css">'), []);
+});
+test("the UI's entry page has no inline script, style or handler", () => {
+  const html = readFileSync(new URL('../../../apps/ui/index.html', import.meta.url), 'utf8');
+  assert.deepEqual(checkHtml(html), []);
 });
 
 for (const html of ['<script>bad()</script>', '<SCRIPT type="module">bad()</SCRIPT>', '<script src="">bad()</script>', '<script type="application/json">{}</script>']) {

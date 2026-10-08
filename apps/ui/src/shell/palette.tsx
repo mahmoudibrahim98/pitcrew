@@ -38,6 +38,7 @@ interface Item {
   hint: string;
   keys?: readonly string[];
   fields: readonly string[];
+  href?: string;
   run(): void;
 }
 
@@ -53,11 +54,15 @@ const ICONS = {
 const ROW_HEIGHT = 36;
 const PAGE = 8;
 
-/** Everything the palette finds. A "+ New" dialog it opens gives focus back to `opener`. */
-function useItems(opener: Element | null): Item[] {
+/**
+ * Everything the palette finds. A "+ New" dialog it opens gives focus back to `opener`; an action
+ * on the open task hands its control to `focusAfterClose`, which the palette focuses as it closes.
+ */
+function useItems(opener: Element | null, focusAfterClose: (control: HTMLElement) => void): Item[] {
   const router = useRouter();
   const ws = useWorkspaceId();
   const layout = useLayout();
+  const params: { task?: string; session?: string } = useParams({ strict: false });
   const registry = useRegistry();
   const { project }: { project?: string } = useParams({ strict: false });
   const setCreating = useShell((s) => s.setCreating);
@@ -74,8 +79,22 @@ function useItems(opener: Element | null): Item[] {
     create: (id) => setCreating(id, opener),
   };
   const projectName = new Map(projects.map((p) => [p.id, p.name]));
+  const actionItems: Item[] = [];
+  if (params.task !== undefined) {
+    for (const [label, field] of [['Move open task…', 'Status'], ['Assign open task…', 'Assignee'], ['Dispatch open task…', 'Dispatch to']] as const) {
+      const main = document.getElementById('main');
+      const control = main?.querySelector<HTMLSelectElement>(`select[aria-label="${field}"]`) ??
+        [...(main?.querySelectorAll('label') ?? [])].filter((node) => node.textContent?.trim() === field).map((node) => document.getElementById(node.htmlFor)).find((node) => node instanceof HTMLSelectElement);
+      if (!(control instanceof HTMLSelectElement) || control.disabled) continue;
+      actionItems.push({ id: `action:${field}`, kind: 'command', label, hint: 'Open task', fields: [label], run: () => focusAfterClose(control) });
+    }
+  }
+  if (params.session !== undefined && sessions.some((session) => session.id === params.session)) {
+    actionItems.push({ id: 'action:link', kind: 'command', label: 'Link open session…', hint: 'Open session', fields: ['link open session task workstream'], run: () => useShell.getState().setLinkingSession(params.session ?? null) });
+  }
 
   return [
+    ...actionItems,
     ...registry.commands
       .filter((c) => inLayout(c.layout, layout))
       .map<Item>((c) => ({
@@ -103,6 +122,7 @@ function useItems(opener: Element | null): Item[] {
       label: p.name,
       code: p.key,
       hint: 'Project',
+      href: paths.project(ws, p.id),
       fields: [p.name, p.key],
       run: () => go(paths.project(ws, p.id)),
     })),
@@ -111,6 +131,7 @@ function useItems(opener: Element | null): Item[] {
       kind: 'workstream',
       label: w.name,
       hint: projectName.get(w.project) ?? 'Workstream',
+      href: paths.workstream(ws, w.project, w.id),
       fields: [w.name, projectName.get(w.project) ?? ''],
       run: () => go(paths.workstream(ws, w.project, w.id)),
     })),
@@ -120,6 +141,7 @@ function useItems(opener: Element | null): Item[] {
       label: t.title,
       code: t.key,
       hint: 'Task',
+      href: paths.task(ws, t.key),
       fields: [t.key, t.title],
       run: () => go(paths.task(ws, t.key)),
     })),
@@ -129,22 +151,37 @@ function useItems(opener: Element | null): Item[] {
       label: s.title ?? s.status_line ?? s.cwd,
       code: s.engine,
       hint: `Session · ${s.state}`,
+      href: paths.session(ws, s.id),
       fields: [s.title ?? '', s.status_line ?? '', s.engine, s.branch ?? '', s.cwd],
       run: () => go(paths.session(ws, s.id)),
     })),
   ];
 }
 
-function Results({ close, opener }: { close(): void; opener: Element | null }) {
+function Results({
+  close,
+  opener,
+  focusAfterClose,
+}: {
+  close(): void;
+  opener: Element | null;
+  focusAfterClose(control: HTMLElement): void;
+}) {
   // TanStack Virtual keeps state in a mutable object the compiler cannot see change.
   'use no memo';
-  const items = useItems(opener);
+  const items = useItems(opener, focusAfterClose);
+  const ws = useWorkspaceId();
+  const recent = useShell((s) => s.workspaces[ws]?.recent);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
   const listId = useId();
 
-  const results = query.trim() === '' ? items : rank(query, items, (item) => item.fields);
+  const recentItems = (recent ?? []).flatMap((href) => {
+    const item = items.find((entry) => entry.href === href.split('?')[0]);
+    return item === undefined ? [] : [{ ...item, hint: `Recent · ${item.hint}` }];
+  });
+  const results = query.trim() === '' ? [...recentItems, ...items.filter((item) => !recentItems.some((entry) => entry.id === item.id))] : rank(query, items, (item) => item.fields);
   const current = Math.min(active, Math.max(results.length - 1, 0));
   // eslint-disable-next-line react-hooks/incompatible-library -- opted out of memoisation above
   const virtualizer = useVirtualizer({
@@ -168,6 +205,7 @@ function Results({ close, opener }: { close(): void; opener: Element | null }) {
     virtualizer.scrollToIndex(next);
   }
 
+  // Home and End stay with the text field, moving its caret (the ARIA combobox pattern).
   function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     const moves: Record<string, number> = {
       ArrowDown: current + 1,
@@ -275,6 +313,9 @@ export function Palette() {
   // to the page when a result navigated.
   const [opener] = useState(() => document.activeElement);
   const hrefAtRun = useRef<string | null>(null);
+  // A control on the page that a result asked for ("Move open task…"). Focused here, as the
+  // dialog closes: focusing it any earlier, Radix would hand focus back to the opener after it.
+  const focusAfterClose = useRef<HTMLElement | null>(null);
   return (
     <Dialog open onOpenChange={setOpen}>
       <DialogContent
@@ -283,8 +324,14 @@ export function Palette() {
         className="top-[10vh] w-[min(640px,calc(100vw-32px))]"
         onCloseAutoFocus={(event) => {
           event.preventDefault();
+          const control = focusAfterClose.current;
+          if (control !== null && control.isConnected) {
+            control.scrollIntoView({ block: 'nearest' });
+            control.focus();
+            return;
+          }
           // A "New …" result opened its dialog, which holds focus now.
-          if (useShell.getState().creating !== null) return;
+          if (useShell.getState().creating !== null || useShell.getState().linkingSession !== null) return;
           const navigated = hrefAtRun.current !== null && hrefAtRun.current !== window.location.href;
           const target = navigated ? document.getElementById('main') : opener;
           if (target instanceof HTMLElement && target.isConnected) target.focus();
@@ -292,6 +339,9 @@ export function Palette() {
       >
         <Results
           opener={opener}
+          focusAfterClose={(control) => {
+            focusAfterClose.current = control;
+          }}
           close={() => {
             hrefAtRun.current = window.location.href;
             setOpen(false);

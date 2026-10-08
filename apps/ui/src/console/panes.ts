@@ -11,6 +11,11 @@ export const PANE_WIDTH = {
 
 /** Below this width (of the console, not the window) one pane shows at a time. */
 export const NARROW_BELOW = 720;
+/**
+ * Below this width (of the console) the filters start folded away, whatever was remembered; they
+ * can still be opened, for as long as the console stays this narrow.
+ */
+export const COMPACT_BELOW = 960;
 
 interface Panes {
   filtersOpen: boolean;

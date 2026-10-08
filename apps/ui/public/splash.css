@@ -1,0 +1,13 @@
+/*
+ * The first paint, before the app's own stylesheet and script arrive (index.html). A linked file,
+ * never an inline <style> or style="": Tauri adds a nonce to every inline <style> in the page, and
+ * a nonce in style-src switches off 'unsafe-inline' for the styles the app sets at run time.
+ *
+ * In a layer of its own, declared before the app's layers, so it has the lowest priority: once the
+ * app's stylesheet loads, its theme (which may differ from the system's) wins over these colours.
+ */
+@layer splash {
+  html { background: #fff; color: #18181b; }
+  @media (prefers-color-scheme: dark) { html { background: #18181b; color: #fafafa; } }
+  .splash { display: grid; min-height: 100dvh; place-items: center; font: 15px system-ui, sans-serif; }
+}

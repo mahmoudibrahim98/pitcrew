@@ -9,6 +9,7 @@ export interface WorkspacePrefs {
   layout: LayoutId;
   /** The last page seen in each layout, as a path with its search. */
   last: Partial<Record<LayoutId, string>>;
+  recent?: string[];
 }
 
 export const ORCHESTRATOR_WIDTH = { min: 280, max: 640, initial: 360 } as const;
@@ -28,6 +29,7 @@ interface Transient {
   paletteOpen: boolean;
   /** The "+ New" dialog on screen, by entry id. */
   creating: string | null;
+  linkingSession: string | null;
   /** What had focus before that dialog opened, to give focus back to. */
   creatingFrom: Element | null;
   /** A brief message with nowhere better to show (an unknown-workspace deep link, say). */
@@ -45,6 +47,7 @@ interface Actions {
   setPaletteOpen(open: boolean): void;
   /** Opens a "+ New" dialog, or closes it with null. `from` gets focus back when it closes. */
   setCreating(id: string | null, from?: Element | null): void;
+  setLinkingSession(id: string | null): void;
   setNotice(notice: string | null): void;
 }
 
@@ -59,6 +62,7 @@ export const initialShellState: Persisted & Transient = {
   orchestratorWidth: ORCHESTRATOR_WIDTH.initial,
   paletteOpen: false,
   creating: null,
+  linkingSession: null,
   creatingFrom: null,
   notice: null,
 };
@@ -78,7 +82,7 @@ export const useShell = create<ShellState>()(
           const current = prefs(s, ws);
           if (current.layout === layout && current.last[layout] === path) return s;
           return {
-            workspaces: { ...s.workspaces, [ws]: { layout, last: { ...current.last, [layout]: path } } },
+            workspaces: { ...s.workspaces, [ws]: { layout, last: { ...current.last, [layout]: path }, recent: [path, ...(current.recent ?? []).filter((p) => p !== path)].slice(0, 12) } },
           };
         }),
       setLastWorkspace: (lastWorkspace) =>
@@ -91,6 +95,7 @@ export const useShell = create<ShellState>()(
       setCreating: (creating, from = null) =>
         // Closing keeps `creatingFrom`: the dialog reads it as it hands focus back.
         set((s) => ({ creating, creatingFrom: creating === null ? s.creatingFrom : from })),
+      setLinkingSession: (linkingSession) => set({ linkingSession }),
       setNotice: (notice) => set({ notice }),
     }),
     {
