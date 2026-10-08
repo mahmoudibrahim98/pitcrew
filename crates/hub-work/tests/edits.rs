@@ -83,6 +83,70 @@ impl Hub {
 // ─── POST /v1/projects ───────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn archive_and_restore_keep_the_task_and_emit_only_changes() {
+    let hub = hub();
+    let before = get(&hub.app, person(SAM), "/v1/tasks/PAP-1").await;
+    let revision = rev(&hub.work);
+    let archived = hub.patch("PAP-1", json!({ "archived": true })).await;
+    expect(&archived, 200);
+    assert_eq!(archived.1["archived"], true);
+    assert_eq!(archived.1["subtasks"], before.1["subtasks"]);
+    assert_eq!(
+        last_body(&hub.work),
+        json!({ "type": "task_updated", "data": {
+        "task": PAP1, "patch": { "archived": true }
+    } })
+    );
+    assert_eq!(rev(&hub.work), revision + 1);
+    expect(&hub.patch("PAP-1", json!({ "archived": true })).await, 200);
+    assert_eq!(rev(&hub.work), revision + 1, "archiving twice is a no-op");
+    let refused = call(
+        &hub.app,
+        Some(agent(WRITER)),
+        "PATCH",
+        "/v1/tasks/PAP-1",
+        Some(json!({ "archived": false })),
+    )
+    .await;
+    expect(&refused, 403);
+    let invalid = hub.patch("PAP-1", json!({ "archived": "yes" })).await;
+    expect(&invalid, 400);
+    assert_eq!(rev(&hub.work), revision + 1, "refusals append nothing");
+    let restored = hub.patch("PAP-1", json!({ "archived": false })).await;
+    expect(&restored, 200);
+    assert_eq!(restored.1, before.1);
+    assert_eq!(rev(&hub.work), revision + 2);
+}
+
+#[tokio::test]
+async fn dispatch_reads_resolve_tasks_for_people_only() {
+    let hub = hub();
+    let keyed = get(&hub.app, person(SAM), "/v1/tasks/PAP-1/dispatches").await;
+    expect(&keyed, 200);
+    let by_id = get(
+        &hub.app,
+        person(SAM),
+        &format!("/v1/tasks/{PAP1}/dispatches"),
+    )
+    .await;
+    expect(&by_id, 200);
+    assert_eq!(by_id.1, keyed.1);
+    assert!(
+        keyed
+            .1
+            .as_array()
+            .expect("dispatch list")
+            .iter()
+            .all(|run| run["task"] == PAP1)
+    );
+    let missing = get(&hub.app, person(SAM), "/v1/tasks/PAP-99999/dispatches").await;
+    expect(&missing, 404);
+    // Agents read neither the runs nor, through them, the sessions the import choice hides.
+    let refused = get(&hub.app, agent(WRITER), "/v1/tasks/PAP-1/dispatches").await;
+    expect(&refused, 403);
+}
+
+#[tokio::test]
 async fn a_project_is_created_with_the_defaults() {
     let hub = hub();
     let res = hub

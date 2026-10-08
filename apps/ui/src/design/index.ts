@@ -22,4 +22,6 @@ export { ResizablePanel } from './resizable-panel.tsx';
 export { StatusPill, type Tone } from './status-pill.tsx';
 export { applyTheme, ThemeToggle, useApplyTheme, useTheme, type ThemeChoice } from './theme.tsx';
 export { Tooltip, TooltipProvider } from './tooltip.tsx';
+export { toast, dismissToast, clearToasts, Toaster, ToastHost, type ToastMessage } from './toast.tsx';
+export { SideDrawer, SideDrawerTitle, SideDrawerClose } from './side-drawer.tsx';
 export { Tree, TreeItem } from './tree.tsx';

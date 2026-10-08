@@ -97,6 +97,7 @@ where
         .route("/v1/tasks/{id}", patch(patch_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
+        .route("/v1/tasks/{id}/dispatches", get(list_task_dispatches))
         .route("/v1/safety", get(get_safety).put(put_safety))
         .route("/v1/import", get(get_import).put(put_import))
         .route("/v1/import/dry-run", post(dry_run_import))
@@ -435,6 +436,35 @@ async fn list_tasks(
 async fn get_task(Work(w): Work, Who(_): Who, Segments(id): Segments<String>) -> Reply<Task> {
     let task = task_ref(&id)?;
     Ok(Json(blocking(w, move |w| w.task(&task)).await?))
+}
+
+/// A task's runs, oldest first. A run whose session the import choice excludes is left out with
+/// its session, as `GET /v1/sessions` leaves the session out.
+async fn list_task_dispatches(
+    Work(w): Work,
+    Person(_): Person,
+    Segments(id): Segments<String>,
+) -> Reply<Vec<Dispatch>> {
+    let task = task_ref(&id)?;
+    Ok(Json(
+        blocking(w, move |w| {
+            let task = w.task(&task)?;
+            let mut runs = Vec::new();
+            for run in w.dispatches()? {
+                if run.task != task.id {
+                    continue;
+                }
+                if let Some(session) = &run.session
+                    && !w.session_included(session)?
+                {
+                    continue;
+                }
+                runs.push(run);
+            }
+            Ok(runs)
+        })
+        .await?,
+    ))
 }
 
 async fn create_task(

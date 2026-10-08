@@ -1,5 +1,10 @@
 # data (stream L)
 
+Task archival is `patchTask(id, { archived: true | false })`, carried by `task_updated`.
+Task lists retain archived documents for resolving dependencies; work views filter them.
+`dispatch_finished` refreshes dispatches and sessions, and `session_ended` refreshes dispatches
+too, so task run status and failure summaries follow the recorded end without polling.
+
 The API client, the `/v1/stream` connection, and how events keep the TanStack Query cache fresh.
 See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 `docs/build/contracts/desktop-gateway.md`. Import from `src/data/index.ts`.

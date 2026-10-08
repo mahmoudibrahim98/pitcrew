@@ -235,8 +235,13 @@ export function describeEvent(event: Event, names: Names): string {
       return `created ${body.data.task.key} “${body.data.task.title}”`;
     case 'task_moved':
       return `moved ${names.task(body.data.task)} from ${TASK_STATUS[body.data.from].label} to ${TASK_STATUS[body.data.to].label}`;
-    case 'task_updated':
-      return `edited ${names.task(body.data.task)}`;
+    case 'task_updated': {
+      // Archiving and restoring are edits on the wire; say which.
+      const { archived, ...rest } = body.data.patch;
+      const what = archived === true ? 'archived' : archived === false ? 'restored' : undefined;
+      if (what === undefined) return `edited ${names.task(body.data.task)}`;
+      return `${Object.keys(rest).length > 0 ? 'edited and ' : ''}${what} ${names.task(body.data.task)}`;
+    }
     case 'task_assigned':
       return body.data.assignee === undefined
         ? `unassigned ${names.task(body.data.task)}`

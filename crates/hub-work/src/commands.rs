@@ -182,6 +182,7 @@ pub(crate) fn plan_task(c: &Connection, new: NewTask, taken: Option<u32>) -> Res
         due: new.due,
         blocked_by: Vec::new(),
         source: None,
+        archived: false,
         accept_auto: false,
         subtasks: Vec::new(),
     })

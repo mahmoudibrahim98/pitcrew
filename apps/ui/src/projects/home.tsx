@@ -53,7 +53,7 @@ function WhereThingsStand() {
         {(projects.data ?? []).map((project) => {
           const brief = briefs.data?.find((b) => sameTarget(b.target, { kind: 'project', id: project.id }));
           const open = (tasks.data ?? []).filter(
-            (t) => t.project === project.id && t.status !== 'done' && t.status !== 'canceled',
+            (t) => t.project === project.id && t.archived !== true && t.status !== 'done' && t.status !== 'canceled',
           ).length;
           const atRisk = (workstreams.data ?? []).filter(
             (w) => w.project === project.id && w.health !== 'on_track' && w.status === 'active',

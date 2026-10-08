@@ -1,6 +1,7 @@
 // Generated from Rust values; checked with tsc --noEmit.
 export const task: import('../index.ts').Task = {
   "accept_auto": false,
+  "archived": false,
   "assignee": "01JB000000000000000MEM0002",
   "blocked_by": [],
   "description": "Draft §3 Method from notes/method-outline.md. Keep it under two pages.",

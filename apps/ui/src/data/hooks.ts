@@ -2,6 +2,7 @@
 // `useLiveQuery`, `useApi()` and `keys`, so they wait for the stream and its events reach them.
 
 import { useMutation } from '@tanstack/react-query';
+import { toast } from '../design/toast.tsx';
 import { keys } from './keys.ts';
 import { useApi, useLiveQuery } from './provider.tsx';
 import type { AskFilters, SessionFilters, TaskFilters, TaskStatus } from './types.ts';
@@ -99,5 +100,7 @@ export function useMoveTask() {
   const api = useApi();
   return useMutation({
     mutationFn: ({ task, to }: { task: string; to: TaskStatus }) => api.moveTask(task, to),
+    onSuccess: (task) => toast(`${task.key} moved`),
+    onError: (error) => toast(`${error.message} Choose an allowed status and try again.`, { error: true }),
   });
 }

@@ -321,6 +321,7 @@ impl SyncCommands<'_> {
             due: None,
             blocked_by: Vec::new(),
             source: Some(source),
+            archived: false,
             accept_auto: false,
             subtasks: Vec::new(),
         };

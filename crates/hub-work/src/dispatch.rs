@@ -5,8 +5,8 @@
 //!
 //! 1. Under the command lock, it checks the request (`404` unknown task; `400` unknown agent or
 //!    machine, a person named as the agent, or a brief longer than [`MAX_BRIEF`]; `403` an agent
-//!    the caller does not own: a person runs only their own agents; `409` a done or canceled
-//!    task, or an agent that already holds an active dispatch on the task, such as a second
+//!    the caller does not own: a person runs only their own agents; `409` a done, canceled or
+//!    archived task, or an agent that already holds an active dispatch on the task, such as a second
 //!    click; `503` no live machine to run on), then asks whether it can start there at all (`503`
 //!    without a dispatcher, or when [`Dispatcher::can_start`] says no: no runner attached, a
 //!    machine it cannot reach).
@@ -399,6 +399,12 @@ impl WorkService {
             let status = crate::codec::enum_text(&task.status).unwrap_or_default();
             return Err(WorkError::conflict(format!(
                 "{} is {status}; reopen it before dispatching.",
+                task.key
+            )));
+        }
+        if task.archived {
+            return Err(WorkError::conflict(format!(
+                "{} is archived; restore it before dispatching.",
                 task.key
             )));
         }

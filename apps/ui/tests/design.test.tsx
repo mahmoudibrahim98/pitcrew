@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import axe from 'axe-core';
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +8,8 @@ import { Avatar, avatarLabel, initials } from '../src/design/avatar.tsx';
 import { Popover } from '../src/design/popover.tsx';
 import { ResizablePanel } from '../src/design/resizable-panel.tsx';
 import { Tree, TreeItem } from '../src/design/tree.tsx';
+import { SideDrawer, SideDrawerTitle } from '../src/design/side-drawer.tsx';
+import { clearToasts, dismissToast, toast, Toaster } from '../src/design/toast.tsx';
 
 afterEach(cleanup);
 
@@ -224,5 +226,119 @@ describe('Popover', () => {
     await screen.findByRole('dialog');
     fireEvent.click(trigger);
     await vi.waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  });
+});
+
+describe('Toaster', () => {
+  // Notifications live in a shared store: none is left over for the next test.
+  afterEach(() => act(() => clearToasts()));
+
+  function DrawerWithToasts() {
+    const [open, setOpen] = useState(true);
+    return (
+      <>
+        <Toaster />
+        <p>{open ? 'Drawer open' : 'Drawer closed'}</p>
+        <SideDrawer open={open} onOpenChange={setOpen}>
+          <SideDrawerTitle>Synthetic drawer</SideDrawerTitle>
+          <button type="button">Inside</button>
+        </SideDrawer>
+      </>
+    );
+  }
+
+  it('shows notifications inside an open drawer, where clicking one keeps the drawer open', async () => {
+    render(<DrawerWithToasts />);
+    const drawer = await screen.findByRole('dialog', { name: 'Synthetic drawer' });
+    let id = 0;
+    act(() => {
+      id = toast('Synthetic notice');
+    });
+    // Inside the drawer's focus trap and outside what the modal hides from screen readers.
+    const notice = within(drawer).getByText('Synthetic notice');
+    expect(notice.getAttribute('role')).toBe('status');
+    const dismiss = within(drawer).getByRole('button', { name: 'Dismiss notification' });
+    fireEvent.pointerDown(dismiss);
+    fireEvent.click(dismiss);
+    expect(screen.queryByText('Synthetic notice')).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Synthetic drawer' })).toBe(drawer);
+    expect(screen.getByText('Drawer open')).toBeTruthy();
+    // F8 moves focus to the notifications, still inside the drawer.
+    act(() => {
+      id = toast('Another notice');
+    });
+    fireEvent.keyDown(document, { key: 'F8' });
+    expect(within(drawer).getByRole('list', { name: 'Notifications' })).toBe(document.activeElement);
+    act(() => dismissToast(id));
+  });
+
+  it('shows notifications in the frame once the drawer closes', async () => {
+    render(<DrawerWithToasts />);
+    await screen.findByRole('dialog');
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Inside' }), { key: 'Escape' });
+    await screen.findByText('Drawer closed');
+    act(() => {
+      toast('After the drawer');
+    });
+    expect(screen.getByText('After the drawer').closest('[data-toaster]')?.parentElement).toBe(document.body.firstElementChild);
+  });
+
+  it('waits while a notification is pointed at, then goes', () => {
+    vi.useFakeTimers();
+    try {
+      render(<Toaster />);
+      act(() => {
+        toast('Synthetic timed notice');
+      });
+      const list = screen.getByRole('list', { name: 'Notifications' });
+      fireEvent.pointerEnter(list);
+      act(() => vi.advanceTimersByTime(10_000));
+      expect(screen.getByText('Synthetic timed notice')).toBeTruthy();
+      fireEvent.pointerLeave(list);
+      act(() => vi.advanceTimersByTime(6_000));
+      expect(screen.queryByText('Synthetic timed notice')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('replaces a notification with the same key, and dismisses one by its key', () => {
+    render(<Toaster />);
+    act(() => {
+      toast('PAP-1 archived', { key: 'archive:1', action: { label: 'Undo', run: () => undefined } });
+      toast('PAP-1 archived again', { key: 'archive:1', action: { label: 'Undo', run: () => undefined } });
+    });
+    expect(screen.queryByText('PAP-1 archived')).toBeNull();
+    expect(screen.getAllByRole('button', { name: 'Undo' })).toHaveLength(1);
+    act(() => dismissToast('archive:1'));
+    expect(screen.queryByText('PAP-1 archived again')).toBeNull();
+  });
+
+  it('disables an action while it runs, runs it once, and keeps it for a retry when it fails', async () => {
+    render(<Toaster />);
+    let finish: (() => void) | undefined;
+    let fail: ((error: Error) => void) | undefined;
+    const run = vi.fn(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          finish = resolve;
+          fail = reject;
+        }),
+    );
+    act(() => {
+      toast('PAP-2 archived', { action: { label: 'Undo', run } });
+    });
+    const undo = screen.getByRole('button', { name: 'Undo' }) as HTMLButtonElement;
+    fireEvent.click(undo);
+    await vi.waitFor(() => expect(undo.disabled).toBe(true));
+    fireEvent.click(undo);
+    expect(run).toHaveBeenCalledTimes(1);
+    await act(async () => fail?.(new Error('The hub is unreachable.')));
+    await vi.waitFor(() => expect(undo.disabled).toBe(false));
+    expect(screen.getByRole('alert').textContent).toBe('The hub is unreachable. Try again.');
+    fireEvent.click(undo);
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2));
+    await act(async () => finish?.());
+    await vi.waitFor(() => expect(screen.queryByText('PAP-2 archived')).toBeNull());
   });
 });

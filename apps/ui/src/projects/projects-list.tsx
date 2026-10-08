@@ -24,7 +24,7 @@ export function ProjectsListPage() {
           {rows.map((project) => {
             const lead = members.get(project.lead);
             const open = (tasks.data ?? []).filter(
-              (t) => t.project === project.id && t.status !== 'done' && t.status !== 'canceled',
+              (t) => t.project === project.id && t.archived !== true && t.status !== 'done' && t.status !== 'canceled',
             ).length;
             return (
               <li key={project.id} className="flex flex-wrap items-center gap-2 px-4 py-3">

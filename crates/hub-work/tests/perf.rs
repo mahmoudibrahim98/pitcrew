@@ -57,6 +57,7 @@ fn fill(work: &WorkService) {
             due: None,
             blocked_by: previous.into_iter().collect(),
             source: None,
+            archived: false,
             accept_auto: false,
             subtasks: vec![
                 Subtask {

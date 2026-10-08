@@ -865,6 +865,7 @@ export function reviewDraft(hub: Hub, me: string, ref: string, body: unknown): {
       priority: 'none',
       labels: [DRAFTED_LABEL],
       blocked_by: [],
+      archived: false,
       accept_auto: false,
       subtasks: [],
     };

@@ -607,6 +607,7 @@ fn edits(work: &WorkService, rerun: TaskId) {
                 "01JB000000000000000TSK0001".parse().expect("task"),
             ]),
             accept_auto: Some(true),
+            archived: Some(true),
             ..TaskPatch::default()
         },
     )

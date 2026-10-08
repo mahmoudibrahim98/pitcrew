@@ -6,6 +6,7 @@ import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { keys, type Member, type Task, type TaskStatus } from '../../data/index.ts';
 import { Board, BoardView } from '../board.tsx';
+import { initialShellState, useShell } from '../../shell/store.ts';
 import { AGENT_TOKEN, demo, eventually, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
 const column = (name: string, scope: HTMLElement = document.body) => within(scope).getByRole('group', { name });
@@ -39,6 +40,7 @@ describe('Board', () => {
 
   afterEach(async () => {
     await stopHub(hub);
+    useShell.setState(initialShellState);
   });
 
   it('shows the demo tasks in their status columns', async () => {
@@ -237,16 +239,24 @@ describe('Board', () => {
     expect(within(submission).queryByText('PAP-4')).toBeNull();
   });
 
-  it('creates a task from a column', async () => {
+  it('creates from a column through the shell’s New task dialog, with one control per column', async () => {
     renderWithHub(<Board project={demo.paper} />, hub);
     await screen.findByText('Draft the method section');
-    fireEvent.click(screen.getByRole('button', { name: 'Add a task to Todo' }));
-    fireEvent.change(screen.getByRole('textbox', { name: 'New task in Todo' }), {
-      target: { value: 'Check the camera-ready template' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
-    await eventually(() => expect(cardsIn('Todo')).toContain('PAP-8'));
-    expect(screen.getByText('Check the camera-ready template')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /^New task in/ })).toBeNull();
+    const add = screen.getByRole('button', { name: 'Add a task to Todo' });
+    fireEvent.click(add);
+    // No second dialog of the board's own: the shell's "+ New" host opens, starting in this
+    // project and column, and gives focus back to the "+".
+    expect(screen.queryByRole('dialog')).toBeNull();
+    const shell = useShell.getState();
+    expect([shell.creating, shell.creatingFrom, shell.creatingDefaults]).toEqual(['task', add, { project: demo.paper, status: 'todo' }]);
+
+    fireEvent.click(screen.getByRole('radio', { name: 'By workstream' }));
+    const seeds = await screen.findByRole('region', { name: 'Seed runs' });
+    fireEvent.click(within(column('In progress', seeds)).getByRole('button', { name: 'Add a task to In progress' }));
+    expect(useShell.getState().creatingDefaults).toEqual({ project: demo.paper, status: 'in_progress', workstream: demo.seedRuns });
+    useShell.getState().setCreating(null);
+    expect(useShell.getState().creatingDefaults).toBeNull();
   });
 });
 

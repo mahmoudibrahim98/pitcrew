@@ -6,18 +6,32 @@ import { Button, DialogFooter } from '../design/index.ts';
 import { useCreateTask, useMembers, useProjects, useWorkstreams } from './data.ts';
 import { useProjectsNav } from './nav.tsx';
 import { ErrorNote, Field, inputClass } from './ui.tsx';
+import type { Priority, TaskStatus } from '../data/index.ts';
+import type { CreateDefaults } from '../shell/index.ts';
+import { PRIORITY, TASK_STATUS, STATUS_ORDER } from './format.ts';
 
-export function NewTaskDialog({ close }: { close(): void }) {
+const isStatus = (value: string | undefined): value is TaskStatus => STATUS_ORDER.some((status) => status === value);
+
+/**
+ * The "+ New" → Task dialog. `defaults` come from where it was opened (a board column gives its
+ * project, workstream and `status`); without them the route's project and workstream are used.
+ */
+export function NewTaskDialog({ close, defaults = {} }: { close(): void; defaults?: CreateDefaults | undefined }) {
   const titleId = useId();
   const projects = useProjects();
   const members = useMembers();
   const create = useCreateTask();
   const nav = useProjectsNav();
   const router = useRouter({ warn: false });
-  const context = router?.state.matches.map((match) => (match.params as { project?: string }).project).find((id) => id !== undefined);
-  const [project, setProject] = useState(context ?? '');
-  const [workstream, setWorkstream] = useState('');
+  const context = router?.state.matches.at(-1)?.params as { project?: string; workstream?: string } | undefined;
+  const fallback = window.location.pathname.match(/\/projects\/([^/]+)(?:\/workstreams\/([^/]+))?/);
+  const [project, setProject] = useState(defaults.project ?? context?.project ?? fallback?.[1] ?? '');
+  const [workstream, setWorkstream] = useState(defaults.workstream ?? context?.workstream ?? fallback?.[2] ?? '');
   const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [priority, setPriority] = useState<Priority>('none');
+  const [labels, setLabels] = useState('');
+  const [status, setStatus] = useState<TaskStatus>(isStatus(defaults.status) ? defaults.status : 'todo');
   const [assignee, setAssignee] = useState('');
   const [due, setDue] = useState('');
   const projectId = project !== '' ? project : (projects.data?.[0]?.id ?? '');
@@ -32,6 +46,8 @@ export function NewTaskDialog({ close }: { close(): void }) {
       {
         project: inProject,
         title: text,
+        description, priority, status,
+        labels: labels.split(/\r?\n/).map((label) => label.trim()).filter(Boolean),
         ...(workstream === '' ? {} : { workstream }),
         ...(assignee === '' ? {} : { assignee }),
         ...(due === '' ? {} : { due }),
@@ -94,6 +110,10 @@ export function NewTaskDialog({ close }: { close(): void }) {
           </select>
         )}
       </Field>
+      <Field label="Description">{(id) => <textarea id={id} rows={4} className={inputClass} value={description} onChange={(event) => setDescription(event.target.value)} />}</Field>
+      <Field label="Priority">{(id) => <select id={id} className={inputClass} value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{Object.entries(PRIORITY).map(([value, item]) => <option key={value} value={value}>{item.label}</option>)}</select>}</Field>
+      <Field label="Labels" hint="One label per line.">{(id) => <textarea id={id} rows={2} className={inputClass} value={labels} onChange={(event) => setLabels(event.target.value)} />}</Field>
+      <Field label="Status">{(id) => <select id={id} className={inputClass} value={status} onChange={(event) => setStatus(event.target.value as TaskStatus)}>{STATUS_ORDER.map((value) => <option key={value} value={value}>{TASK_STATUS[value].label}</option>)}</select>}</Field>
       <Field label="Assignee (optional)">
         {(id) => (
           <select id={id} value={assignee} onChange={(e) => setAssignee(e.target.value)} className={inputClass}>

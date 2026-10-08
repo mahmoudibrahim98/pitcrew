@@ -43,6 +43,23 @@ describe('Calendar and Timeline against the live hub', () => {
     expect(screen.getByRole('button', { name: /Saturday, 10 October 2026, 0 tasks/ })).toBeTruthy();
   });
 
+  it('opens tasks in the projects layout’s one drawer when there is one, so drawers never stack', async () => {
+    const opened: string[] = [];
+    const nav = { openTask: (id: string) => { opened.push(id); } };
+    const calendar = renderWithHub(<CalendarPage />, hub, { nav });
+    fireEvent.click(await screen.findByRole('button', { name: /Saturday, 10 October 2026, 1 tasks/ }));
+    fireEvent.click(within(screen.getByRole('region', { name: 'Selected day tasks' })).getByRole('button', { name: /PAP-1/ }));
+    expect(opened).toEqual([demo.pap1]);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    calendar.unmount();
+
+    renderWithHub(<Timeline project={demo.paper} />, hub, { nav });
+    const table = await screen.findByRole('table');
+    fireEvent.click(await within(table).findByRole('button', { name: /PAP-1/ }));
+    expect(opened).toEqual([demo.pap1, demo.pap1]);
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
   it('shows undated tasks apart and refreshes the date, workstream and status through the stream', async () => {
     renderWithHub(<Timeline project={demo.paper} />, hub);
     await screen.findByRole('rowheader', { name: 'Submission' });

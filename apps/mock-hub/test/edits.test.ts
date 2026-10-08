@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { RunningServer } from '../src/server.ts';
-import type { ApiError, Brief, Event, Project, Task, Workstream } from '../src/types.ts';
+import type { ApiError, Brief, Dispatch, Event, Project, Task, Workstream } from '../src/types.ts';
 import { AGENT, DEVICE, ID, call, withServer } from './helpers.ts';
 
 interface Activity {
@@ -38,12 +38,56 @@ const UNKNOWN = {
   task: '01JB000000000000000TSK0099',
 };
 const LAPTOP = '01JB000000000000000MCH0001';
+const LOCAL_ROOT = process.platform === 'win32' ? 'C:/work' : '/work';
 /** @office, the back office's agent. */
 const OFFICE = '01JB000000000000000MEM0006';
 const JOB = { kind: 'job', scheduler: 'slurm', id: '4815170' } as const;
 const SEEDS = '01JB000000000000000WST0002';
 const PAP2 = '01JB000000000000000TSK0002';
 const PAP4 = ID.pap4;
+
+it('archives and restores a task with its original key, plan and history', () => withServer(async (server) => {
+  const original = await call<Task>(server, 'GET', '/v1/tasks/PAP-1', { token: DEVICE });
+  const before = await rev(server);
+  const archived = await call<Task>(server, 'PATCH', '/v1/tasks/PAP-1', { token: DEVICE, json: { archived: true } });
+  assert.equal(archived.status, 200);
+  assert.equal(archived.body.archived, true);
+  assert.deepEqual(archived.body.subtasks, original.body.subtasks);
+  assert.deepEqual((await lastEvent(server))?.body, { type: 'task_updated', data: { task: original.body.id, patch: { archived: true } } });
+  await call(server, 'PATCH', '/v1/tasks/PAP-1', { token: DEVICE, json: { archived: true } });
+  assert.equal(await rev(server), before + 1);
+  refused(await call(server, 'PATCH', '/v1/tasks/PAP-1', { token: AGENT, json: { archived: false } }), 403, 'person only');
+  refused(await call(server, 'PATCH', '/v1/tasks/PAP-1', { token: DEVICE, json: { archived: 'yes' } }), 400, 'boolean only');
+  const restored = await call<Task>(server, 'PATCH', '/v1/tasks/PAP-1', { token: DEVICE, json: { archived: false } });
+  assert.equal(restored.status, 200);
+  assert.deepEqual(restored.body, { ...original.body, archived: false });
+  assert.equal(await rev(server), before + 2);
+}));
+
+it('refuses dispatching an archived task until it is restored', () => withServer(async (server) => {
+  await call(server, 'PATCH', '/v1/tasks/PAP-5', { token: DEVICE, json: { archived: true } });
+  const before = await rev(server);
+  const res = await call(server, 'POST', '/v1/tasks/PAP-5/dispatch', { token: DEVICE, json: { agent: ID.runner } });
+  refused(res, 409, 'archived');
+  assert.match((res.body as ApiError).message, /archived/);
+  assert.equal(await rev(server), before, 'nothing appended');
+  await call(server, 'PATCH', '/v1/tasks/PAP-5', { token: DEVICE, json: { archived: false } });
+  assert.equal((await call(server, 'POST', '/v1/tasks/PAP-5/dispatch', { token: DEVICE, json: { agent: ID.runner } })).status, 202);
+}));
+
+it('reads a task’s runs for people only, leaving out runs whose session is excluded', () => withServer(async (server) => {
+  const dispatched = await call<Dispatch>(server, 'POST', '/v1/tasks/PAP-5/dispatch', { token: DEVICE, json: { agent: ID.runner } });
+  assert.equal(dispatched.status, 202);
+  const runs = () => call<Dispatch[]>(server, 'GET', '/v1/tasks/PAP-5/dispatches', { token: DEVICE });
+  const shown = await runs();
+  assert.equal(shown.status, 200);
+  assert.deepEqual(shown.body.map((run) => run.session), [dispatched.body.session]);
+  refused(await call(server, 'GET', '/v1/tasks/PAP-5/dispatches', { token: AGENT }), 403, 'person only');
+  assert.equal((await call(server, 'PUT', '/v1/import', { token: DEVICE, json: { mode: 'none' } })).status, 200);
+  assert.deepEqual((await runs()).body, []);
+  assert.equal((await call(server, 'PUT', '/v1/import', { token: DEVICE, json: { mode: 'all' } })).status, 200);
+  assert.deepEqual((await runs()).body, shown.body);
+}));
 
 describe('POST /v1/projects', () => {
   it('creates a project with the defaults', () =>
@@ -88,7 +132,7 @@ describe('POST /v1/projects', () => {
           status: 'planning',
           start: '2026-10-01',
           due: '2026-10-01',
-          root: { machine: LAPTOP, path: '/work/ablations', branch: 'main' },
+          root: { machine: LAPTOP, path: `${LOCAL_ROOT}/ablations`, branch: 'main' },
         },
       });
       assert.equal(res.status, 201);
@@ -96,7 +140,7 @@ describe('POST /v1/projects', () => {
       assert.deepEqual(res.body.members, [ID.writer, ID.runner, ID.sam]);
       assert.equal(res.body.status, 'planning');
       assert.deepEqual([res.body.start, res.body.due], ['2026-10-01', '2026-10-01']);
-      assert.deepEqual(res.body.root, { machine: LAPTOP, path: '/work/ablations', branch: 'main' });
+      assert.deepEqual(res.body.root, { machine: LAPTOP, path: `${LOCAL_ROOT}/ablations`, branch: 'main' });
     }));
 
   it('answers 409 when the key is already used', () =>
@@ -166,7 +210,7 @@ describe('POST /v1/workstreams', () => {
 
   it('keeps a given status and locations', () =>
     withServer(async (server) => {
-      const locations = [{ machine: LAPTOP, path: '/work/paper/figures' }];
+      const locations = [{ machine: LAPTOP, path: `${LOCAL_ROOT}/paper/figures` }];
       const res = await call<Workstream>(server, 'POST', '/v1/workstreams', {
         token: DEVICE,
         json: { project: `prj_${ID.tooling}`, name: 'Packaging', status: 'idea', locations },

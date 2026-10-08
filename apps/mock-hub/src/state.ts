@@ -214,7 +214,7 @@ export class Hub {
     this.teams = data.teams;
     this.projects = data.projects;
     this.workstreams = data.workstreams;
-    this.tasks = data.tasks;
+    this.tasks = data.tasks.map((task) => ({ archived: false, ...task }));
     this.sessions = data.sessions;
     this.dispatches = data.dispatches;
     this.asks = data.asks;

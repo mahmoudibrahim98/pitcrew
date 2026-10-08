@@ -7,12 +7,12 @@ import {
   useEffect,
   useId,
   useState,
-  type FormEvent,
   type KeyboardEvent,
   type PointerEvent,
   type ReactNode,
 } from 'react';
 import { Button } from '../design/index.ts';
+import { useShell } from '../shell/store.ts';
 import {
   keys,
   type Member,
@@ -27,7 +27,6 @@ import {
 } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import {
-  useCreateTask,
   useInbox,
   useMemberMap,
   useMoveTask,
@@ -41,7 +40,7 @@ import { useOptimisticMoves } from './moves.ts';
 import { useProjectsNav } from './nav.tsx';
 import { TaskCard } from './task-card.tsx';
 import { TaskDrawer } from './task-drawer.tsx';
-import { ErrorNote, VisuallyHidden, inputClass } from './ui.tsx';
+import { ErrorNote, VisuallyHidden } from './ui.tsx';
 import { CardList } from './virtual-list.tsx';
 
 export type BoardGrouping = 'status' | 'workstream';
@@ -104,7 +103,7 @@ export function Board({ project, workstream, assignee, groupBy = 'status', title
   const workstreams = useWorkstreams(project);
   const parent = useOptionalWorkstream(project === undefined ? workstream : undefined);
   const move = useMoveTask();
-  const create = useCreateTask();
+  const setCreating = useShell((s) => s.setCreating);
   const moves = useOptimisticMoves({
     // `mutateAsync`, not `mutate`: per-call callbacks of `mutate` fire only for the latest call, and
     // several cards can be in flight at once.
@@ -116,7 +115,7 @@ export function Board({ project, workstream, assignee, groupBy = 'status', title
   const [drawerTask, setDrawerTask] = useState<TaskId | null>(null);
 
   const workstreamNames = new Map((workstreams.data ?? []).map((w) => [w.id, w.name]));
-  const list = tasks.data ?? [];
+  const list = (tasks.data ?? []).filter((task) => !task.archived);
   const lanes: Lane[] = [];
   if (grouping === 'status') {
     lanes.push({ id: 'all' });
@@ -131,17 +130,18 @@ export function Board({ project, workstream, assignee, groupBy = 'status', title
   }
 
   const projectId = project ?? parent.data?.project;
-  const createIn =
+  // A column's "+" opens the shell's "+ New" → Task dialog, starting in this project, the lane's
+  // (or the board's) workstream and the column's status; focus goes back to the "+" after.
+  const newTaskIn =
     projectId === undefined
       ? undefined
-      : (status: TaskStatus, lane: string, text: string, done: () => void) => {
+      : (status: TaskStatus, lane: string, from: Element) => {
           const inWorkstream = lane !== 'all' && lane !== NO_WORKSTREAM ? lane : workstream;
-          create.mutate(
-            inWorkstream === undefined
-              ? { project: projectId, title: text, status }
-              : { project: projectId, workstream: inWorkstream, title: text, status },
-            { onSuccess: done },
-          );
+          setCreating('task', from, {
+            project: projectId,
+            status,
+            ...(inWorkstream === undefined ? {} : { workstream: inWorkstream }),
+          });
         };
 
   const openTask = onOpenTask ?? nav.openTask;
@@ -187,7 +187,6 @@ export function Board({ project, workstream, assignee, groupBy = 'status', title
         </div>
       ))}
       {tasks.error !== null && <ErrorNote error={tasks.error} what="load the tasks" />}
-      {create.error !== null && <ErrorNote error={create.error} what="add the task" />}
       {tasks.isPending && tasks.error === null && <p className="text-sm text-ink-2">Loading tasks…</p>}
 
       {tasks.data !== undefined && (
@@ -202,7 +201,7 @@ export function Board({ project, workstream, assignee, groupBy = 'status', title
           laneOf={(task) => (grouping === 'status' ? 'all' : (task.workstream ?? NO_WORKSTREAM))}
           onMove={moves.move}
           onOpen={open}
-          {...(createIn === undefined ? {} : { onCreate: createIn })}
+          {...(newTaskIn === undefined ? {} : { onNewTask: newTaskIn })}
         />
       )}
 
@@ -235,7 +234,8 @@ export interface BoardViewProps {
   laneOf: (task: Task) => string;
   onMove: (task: Task, to: TaskStatus) => void;
   onOpen: (task: Task) => void;
-  onCreate?: (status: TaskStatus, lane: string, title: string, done: () => void) => void;
+  /** A column's "+": a new task in that lane and status, opened from `from`. */
+  onNewTask?: (status: TaskStatus, lane: string, from: Element) => void;
 }
 
 const cellKey = (lane: string, status: TaskStatus) => `${lane}/${status}`;
@@ -252,7 +252,7 @@ export function BoardView({
   laneOf,
   onMove,
   onOpen,
-  onCreate,
+  onNewTask,
 }: BoardViewProps) {
   const instructionsId = useId();
   const [drag, setDrag] = useState<Drag | null>(null);
@@ -262,7 +262,6 @@ export function BoardView({
   // where it was if the hub says no), it takes focus once per column.
   const [keepFocus, setKeepFocus] = useState<{ task: TaskId; tookIn?: TaskStatus } | null>(null);
   const [announcement, setAnnouncement] = useState('');
-  const [adding, setAdding] = useState<string | null>(null);
 
   const columns = STATUS_ORDER.filter((s) => s !== 'canceled' || tasks.some((t) => statusOf(t) === 'canceled'));
   const cells = new Map<string, Task[]>();
@@ -433,14 +432,7 @@ export function BoardView({
                   onPointerEnter={hover(lane.id, status)}
                   onPointerMove={hover(lane.id, status)}
                   onPointerUp={drop(lane.id, status)}
-                  adding={adding === key}
-                  onAdd={onCreate === undefined ? undefined : () => setAdding(key)}
-                  onCancelAdd={() => setAdding(null)}
-                  onSubmitAdd={
-                    onCreate === undefined
-                      ? undefined
-                      : (title) => onCreate(status, lane.id, title, () => setAdding(null))
-                  }
+                  onAdd={onNewTask === undefined ? undefined : (from) => onNewTask(status, lane.id, from)}
                 >
                   <CardList
                     items={cards}
@@ -480,10 +472,7 @@ function Column({
   onPointerEnter,
   onPointerMove,
   onPointerUp,
-  adding,
   onAdd,
-  onCancelAdd,
-  onSubmitAdd,
   children,
 }: {
   status: TaskStatus;
@@ -493,10 +482,7 @@ function Column({
   onPointerEnter: () => void;
   onPointerMove: () => void;
   onPointerUp: () => void;
-  adding: boolean;
-  onAdd: (() => void) | undefined;
-  onCancelAdd: () => void;
-  onSubmitAdd: ((title: string) => void) | undefined;
+  onAdd: ((from: Element) => void) | undefined;
   children: ReactNode;
 }) {
   const headingId = useId();
@@ -523,10 +509,10 @@ function Column({
           {count}
           <span className="sr-only"> tasks</span>
         </span>
-        {onAdd !== undefined && !adding && (
+        {onAdd !== undefined && (
           <button
             type="button"
-            onClick={onAdd}
+            onClick={(event) => onAdd(event.currentTarget)}
             aria-label={`Add a task to ${label}`}
             className="ml-auto inline-flex size-6 items-center justify-center rounded-sm text-ink-2 hover:bg-hover hover:text-ink"
           >
@@ -534,35 +520,7 @@ function Column({
           </button>
         )}
       </div>
-      {adding && onSubmitAdd !== undefined && <AddTask label={label} onSubmit={onSubmitAdd} onCancel={onCancelAdd} />}
       {children}
     </div>
-  );
-}
-
-function AddTask({ label, onSubmit, onCancel }: { label: string; onSubmit: (title: string) => void; onCancel: () => void }) {
-  const [title, setTitle] = useState('');
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
-    if (title.trim() !== '') onSubmit(title.trim());
-  };
-  return (
-    <form onSubmit={submit} className="flex flex-col gap-1.5">
-      <input
-        aria-label={`New task in ${label}`}
-        autoFocus
-        value={title}
-        placeholder="Title"
-        onChange={(e) => setTitle(e.target.value)}
-        onKeyDown={(e) => e.key === 'Escape' && onCancel()}
-        className={inputClass}
-      />
-      <div className="flex gap-1.5">
-        <Button type="submit" variant="primary">
-          Add
-        </Button>
-        <Button onClick={onCancel}>Cancel</Button>
-      </div>
-    </form>
   );
 }

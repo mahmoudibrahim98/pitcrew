@@ -1,5 +1,15 @@
 # design (stream L)
 
+`SideDrawer` is a Radix modal anchored to the right edge. It traps focus, closes on Escape,
+and restores the opener; consumers supply `SideDrawerTitle` and `SideDrawerClose`.
+`toast(text, { error?, action?, key? })` posts a shared notification; a new one with the same
+`key` replaces the old, and `dismissToast(id or key)` takes one away. Mount one `Toaster` in the
+workspace shell. Errors announce as alerts; other messages as status. Actions remain for
+20 seconds (timers wait while a notification is pointed at or focused), an action's button is
+disabled while it runs, and a failed action stays with a retry instruction. While a `SideDrawer`
+is open its `ToastHost` shows the notifications inside it, so they stay reachable with Tab (F8
+focuses them) and clicking one never closes the drawer.
+
 `EngineLogo` draws a neutral glyph per engine (a ringed dot for Claude Code, a hexagon for Codex,
 a triangle for OpenCode), inline and in the text colour. They are not the vendors' marks: those
 are trademarks whose terms restrict their use, and this repository is public.

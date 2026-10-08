@@ -39,6 +39,10 @@ title: string,
  */
 description: string, 
 /**
+ * Hidden from work views; retained for history and reversible restoration.
+ */
+archived: boolean, 
+/**
  * Status.
  */
 status: TaskStatus, 

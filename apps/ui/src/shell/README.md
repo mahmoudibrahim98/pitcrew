@@ -277,6 +277,10 @@ Features register the items; the shell has none of its own. `dialog` is the body
 `close()`); the shell supplies the modal, its title (`title`, default "New <label>"), focus
 handling and a Suspense boundary. The palette lists every item as "New …". The projects tree's
 empty state offers "New project" only while an enabled `project` item is registered.
+Something that opens a dialog with values to start from calls
+`useShell.getState().setCreating(id, from, defaults)`; the body gets them as `defaults` (a
+`CreateDefaults` record it checks itself), and closing the dialog clears them. A board column's
+"+" opens `task` this way, with its project, workstream and status.
 
 An entry with `disabled` (a reason) shows in the menu disabled, with that reason as an accessible
 description; it stays focusable, so the reason is reachable from the keyboard, but selecting it

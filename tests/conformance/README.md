@@ -1,5 +1,10 @@
 # API v1 conformance
 
+The task tests include archive/restore, typed archival patches, authorization and their
+`task_updated` events, a `409` for dispatching an archived task, and dispatch reads by task
+key/id for people (`403` for an agent token). The mock's
+ending-session simulation records dispatch outcomes, including a failed start's reason.
+
 From the repository root, using Node 22.18+ and (for the daemon) Rust 1.88+:
 
 ```sh

@@ -279,4 +279,8 @@ A completed setup scan provisions one owned agent/persona per detected engine, m
 real hub. Repeated scans reuse them; a disconnected scan creates none. Fresh setup tests dispatch
 tasks through each generated agent.
 
+Onboarding hooks use synthetic in-memory configuration text, person/machine-bound previews, stale refusal and idempotent confirmation. The mock never opens agent homes. Device-only safety read/save validates the same settings as the daemon and appends `safety_changed` on change.
+
+Task patches support reversible archival through task_updated. Archived tasks remain readable for restoration and dependency resolution. Dispatching an archived task is 409. GET /v1/tasks/{id-or-key}/dispatches is device-only and returns both active and finished runs, leaving out a run whose session the import choice excludes; ending a starting session records a failed dispatch with its reason, and ending a running session cancels it.
+
 Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.

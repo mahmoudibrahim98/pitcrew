@@ -12,9 +12,10 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 /// The version of `work.tasks`, and every field path of a fully populated `Task` at that version.
-const PINNED_VERSION: u32 = 4;
+const PINNED_VERSION: u32 = 5;
 const PINNED_SHAPE: &[&str] = &[
     "accept_auto",
+    "archived",
     "assignee",
     "blocked_by",
     "blocked_by[]",
@@ -87,6 +88,7 @@ fn full_task() -> Task {
         due: Some(Date("2026-10-31".into())),
         blocked_by: vec![TaskId::new()],
         source: Some(full_external()),
+        archived: false,
         accept_auto: true,
         subtasks: vec![
             Subtask {

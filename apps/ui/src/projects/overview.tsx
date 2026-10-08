@@ -21,7 +21,7 @@ import { ErrorNote, MaybeLink, Panel } from './ui.tsx';
 import { WhereItStands } from './where-it-stands.tsx';
 
 const OPEN: readonly TaskStatus[] = ['backlog', 'todo', 'in_progress', 'review'];
-const isOpen = (task: Task) => OPEN.includes(task.status);
+const isOpen = (task: Task) => task.archived !== true && OPEN.includes(task.status);
 
 /** Workstreams with status, health, the next step from their brief, and open tasks. */
 export function WorkstreamsTable({ project }: { project: ProjectId }) {
@@ -171,7 +171,7 @@ export function WorkstreamOverviewBody({ workstream }: { workstream: WorkstreamI
   const tasks = useTasks({ workstream });
   const counts = STATUS_ORDER.map((status) => ({
     status,
-    count: (tasks.data ?? []).filter((t) => t.status === status).length,
+    count: (tasks.data ?? []).filter((t) => t.archived !== true && t.status === status).length,
   })).filter((c) => c.count > 0 || c.status !== 'canceled');
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">

@@ -16,11 +16,11 @@ export function Timeline({ project }: { project: string }) {
   const today = todayDate();
   const firstDay = weekStart();
   const axis = timelineAxis(tasks.data ?? [], today, zoom, firstDay);
-  const positions = new Map((tasks.data ?? []).map((task) => [task.id, axisPosition(task.due, axis, zoom, firstDay)]));
+  const positions = new Map((tasks.data ?? []).filter((task) => !task.archived).map((task) => [task.id, axisPosition(task.due, axis, zoom, firstDay)]));
   const todayColumn = axisPosition(today, axis, zoom, firstDay);
   const known = new Set(workstreams.data?.map((item) => item.id));
   const rows = [...(workstreams.data ?? []).map((item) => ({ id: item.id, name: item.name })), { id: '', name: 'Outside a workstream' }];
-  const rowTasks = (id: string) => (tasks.data ?? []).filter((task) => id === '' ? task.workstream === undefined || !known.has(task.workstream) : task.workstream === id);
+  const rowTasks = (id: string) => (tasks.data ?? []).filter((task) => !task.archived).filter((task) => id === '' ? task.workstream === undefined || !known.has(task.workstream) : task.workstream === id);
 
   return (
     <section className="schedule-page flex min-w-0 max-w-full flex-col gap-3" aria-label="Project timeline">

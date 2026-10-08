@@ -1,5 +1,8 @@
 # pitcrew-protocol
 
+Tasks carry `archived` (default false for older documents); `TaskPatch.archived` changes it
+through `task_updated`. Archival preserves the task for reversible restoration and history.
+
 Shared wire types, serde JSON and generated TypeScript. Files API types live in `src/files.rs`:
 `FileList`, `FileContent` and `WriteFile`. A write must include `revision`; null requests exclusive
 creation. File limits are shared constants. `ErrorCode` adds `too_large` (413) and `unsupported`

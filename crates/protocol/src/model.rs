@@ -543,6 +543,9 @@ pub struct Task {
     /// Description, which is also the brief an agent reads first.
     #[serde(default)]
     pub description: String,
+    /// Hidden from work views; retained for history and reversible restoration.
+    #[serde(default)]
+    pub archived: bool,
     /// Status.
     pub status: TaskStatus,
     /// Priority.
@@ -599,6 +602,10 @@ pub struct TaskPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub description: Option<String>,
+    /// Archive or restore the task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub archived: Option<bool>,
     /// New priority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
@@ -643,6 +650,9 @@ impl TaskPatch {
         }
         if let Some(description) = &self.description {
             task.description.clone_from(description);
+        }
+        if let Some(archived) = self.archived {
+            task.archived = archived;
         }
         if let Some(priority) = self.priority {
             task.priority = priority;
