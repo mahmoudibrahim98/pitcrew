@@ -95,6 +95,7 @@ export function CreateDialog() {
   const content = useRef<HTMLDivElement>(null);
   const creating = useShell((s) => s.creating);
   const from = useShell((s) => s.creatingFrom);
+  const defaults = useShell((s) => s.creatingDefaults);
   const setCreating = useShell((s) => s.setCreating);
   const entry = registry.create.find((e) => e.id === creating);
   // Defensive: the menu and the palette never open a disabled entry's dialog.
@@ -117,7 +118,7 @@ export function CreateDialog() {
         }}
       >
         <Suspense fallback={<p className="px-4 py-4 text-sm text-ink-2">Loading…</p>}>
-          <Body close={close} />
+          <Body close={close} defaults={defaults ?? undefined} />
         </Suspense>
       </DialogContent>
     </Dialog>

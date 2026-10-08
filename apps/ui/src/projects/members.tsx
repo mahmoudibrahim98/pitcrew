@@ -13,7 +13,7 @@ export function MembersPage() {
   const byId = new Map((members.data ?? []).map((m) => [m.id, m]));
   const openByMember = new Map<string, number>();
   for (const t of tasks.data ?? []) {
-    if (t.assignee === undefined || t.status === 'done' || t.status === 'canceled') continue;
+    if (t.assignee === undefined || t.archived === true || t.status === 'done' || t.status === 'canceled') continue;
     openByMember.set(t.assignee, (openByMember.get(t.assignee) ?? 0) + 1);
   }
   const rows = [...(members.data ?? [])].sort((a, b) =>

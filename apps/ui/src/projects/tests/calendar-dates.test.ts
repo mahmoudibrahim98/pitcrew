@@ -1,6 +1,8 @@
-import { describe, expect, it } from 'vitest';
+// @vitest-environment happy-dom
+import { act, renderHook } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Task } from '../../data/index.ts';
-import { addDays, axisFraction, axisPosition, keyboardDay, monthDays, shiftMonth, tasksByDay, timelineAxis, todayDate, weekStart } from '../calendar-dates.ts';
+import { addDays, axisFraction, axisPosition, keyboardDay, monthDays, shiftMonth, tasksByDay, timelineAxis, todayDate, untilMidnight, useToday, weekStart } from '../calendar-dates.ts';
 
 const task = (id: string, due?: string): Task => ({
   id, key: `PAP-${id}`, project: 'paper', title: id, description: '', status: 'todo', priority: 'none',
@@ -68,5 +70,25 @@ describe('timeline placement', () => {
     expect(axisPosition('2024-03-01', axis, 'weeks', 1)).toBe(0);
     expect(axisPosition('2024-03-04', axis, 'weeks', 1)).toBe(1);
     expect(timelineAxis([], '2024-03-04', 'weeks', 0)).toEqual(['2024-03-03']);
+  });
+});
+
+describe('useToday', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('turns over at the next local midnight while the page stays open', () => {
+    vi.useFakeTimers({ now: new Date(2026, 9, 1, 23, 59, 30) });
+    expect(untilMidnight()).toBe(30_000);
+    const { result } = renderHook(() => useToday());
+    expect(result.current).toBe('2026-10-01');
+    act(() => vi.advanceTimersByTime(29_000));
+    expect(result.current).toBe('2026-10-01');
+    act(() => vi.advanceTimersByTime(2_000));
+    expect(result.current).toBe('2026-10-02');
+    // And again the night after.
+    act(() => vi.advanceTimersByTime(86_400_000));
+    expect(result.current).toBe('2026-10-03');
   });
 });

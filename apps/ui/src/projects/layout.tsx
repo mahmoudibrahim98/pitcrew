@@ -6,7 +6,7 @@ import { Outlet, useRouter } from '@tanstack/react-router';
 import { useState } from 'react';
 import { TaskDrawer } from './task-drawer.tsx';
 import { paths, useWorkspaceId } from '../shell/index.ts';
-import { ProjectsNavProvider, type ProjectsNav } from './nav.tsx';
+import { ProjectsNavProvider, shareTaskLink, type ProjectsNav } from './nav.tsx';
 
 export function ProjectsLayout() {
   const router = useRouter();
@@ -15,7 +15,7 @@ export function ProjectsLayout() {
   const nav: ProjectsNav = {
     openTask: setTaskId,
     openTaskPage: (task) => { setTaskId(null); void router.navigate({ href: paths.task(ws, task) }); },
-    taskLink: (task) => new URL(paths.task(ws, task), window.location.origin).href,
+    taskLink: (task) => shareTaskLink(task, ws),
     openProject: (project) => void router.navigate({ href: paths.project(ws, project) }),
     // By id only: redirects to the project-scoped path once the workstream's project is known.
     openWorkstream: (workstream) => void router.navigate({ href: paths.workstreamById(ws, workstream) }),

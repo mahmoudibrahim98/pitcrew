@@ -2,10 +2,13 @@
 
 `SideDrawer` is a Radix modal anchored to the right edge. It traps focus, closes on Escape,
 and restores the opener; consumers supply `SideDrawerTitle` and `SideDrawerClose`.
-`toast(text, { error?, action? })` posts a shared notification. Mount one `Toaster` in the
+`toast(text, { error?, action?, key? })` posts a shared notification; a new one with the same
+`key` replaces the old, and `dismissToast(id or key)` takes one away. Mount one `Toaster` in the
 workspace shell. Errors announce as alerts; other messages as status. Actions remain for
-20 seconds, and failed actions show a retry instruction. Close a modal after archiving so
-its Undo notification is reachable.
+20 seconds (timers wait while a notification is pointed at or focused), an action's button is
+disabled while it runs, and a failed action stays with a retry instruction. While a `SideDrawer`
+is open its `ToastHost` shows the notifications inside it, so they stay reachable with Tab (F8
+focuses them) and clicking one never closes the drawer.
 
 Components built on `@pitcrew/tokens` and Radix primitives. Import from `index.ts`. Every one is
 keyboard operable, works light and dark (Tailwind classes resolve to the `--pc-*` tokens), and

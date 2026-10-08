@@ -3,7 +3,22 @@
 // it (recaps), and the task's history from activity.
 
 import { useId, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
-import { Button, StatusPill, SideDrawer, SideDrawerTitle, SideDrawerClose, toast, CheckCircleIcon, WorkstreamIcon, FolderIcon } from '../design/index.ts';
+import {
+  Button,
+  StatusPill,
+  SideDrawer,
+  SideDrawerTitle,
+  SideDrawerClose,
+  toast,
+  CalendarIcon,
+  CheckCircleIcon,
+  FlagIcon,
+  FolderIcon,
+  TagIcon,
+  UserIcon,
+  WorkstreamIcon,
+} from '../design/index.ts';
+import { ExternalLink, safeHref } from '../console/render/links.tsx';
 import type { Member, MemberId, Session, Subtask, Task, TaskId, TaskStatus } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import { AuthorAvatar, EventList } from './activity.tsx';
@@ -26,14 +41,14 @@ import {
   useTask,
   useTaskMap,
 } from './data.ts';
-import { PRIORITY, SESSION_STATE, STATUS_ORDER, TASK_STATUS, formatDay, formatWhen, isWebUrl } from './format.ts';
+import { PRIORITY, SESSION_STATE, STATUS_ORDER, TASK_STATUS, formatDay, formatWhen } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { MemberChip, memberLabel } from './people.tsx';
 import { WorkBlocks } from './recaps.tsx';
 import { ErrorNote, Field, MaybeLink, inputClass } from './ui.tsx';
 import { TaskEditor } from './task-editor.tsx';
 import { Markdown } from './markdown.tsx';
-import { taskLink } from './nav.tsx';
+import { shareTaskLink, taskLink } from './nav.tsx';
 import { TaskWrites } from './writes/task-writes.tsx';
 
 type TitleComponent = ComponentType<{ className?: string; children?: ReactNode }> | 'h2';
@@ -113,7 +128,7 @@ export function TaskDetail({
       </header>
       <div className="flex flex-wrap gap-2">
         {!combineHeading && <Button onClick={() => { if (nav.openTaskPage !== undefined) nav.openTaskPage(data.id); else window.location.assign(taskLink(data.id)); }}>Open full page</Button>}
-        <Button onClick={() => { navigator.clipboard.writeText(nav.taskLink?.(data.id) ?? taskLink(data.id)).then(() => toast('Task link copied')).catch(() => toast('Could not copy the link. Copy the address from the full page.', { error: true })); }}>Copy link</Button>
+        <Button onClick={() => { navigator.clipboard.writeText(nav.taskLink?.(data.id) ?? shareTaskLink(data.id)).then(() => toast('Task link copied')).catch(() => toast('Could not copy the link. Copy the address from the full page.', { error: true })); }}>Copy link</Button>
         {person && <>
           <Button onClick={() => setEditing(true)}>Edit task</Button>
           {data.status !== 'done' && <Button disabled={move.isPending} onClick={() => move.mutate({ task: data.id, to: 'done' })}>Mark complete</Button>}
@@ -209,9 +224,9 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
             <StatusPill tone={TASK_STATUS[status].tone}>{TASK_STATUS[status].label}</StatusPill>
           )}
         </dd>
-        <dt className="text-ink-2">Priority</dt>
+        <dt className="flex items-center gap-1 text-ink-2"><FlagIcon />Priority</dt>
         <dd>{PRIORITY[task.priority].label}</dd>
-        <dt className="text-ink-2">Assignee</dt>
+        <dt className="flex items-center gap-1 text-ink-2"><UserIcon />Assignee</dt>
         <dd>
           {person ? (
             <select
@@ -234,12 +249,12 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
             'Unassigned'
           )}
         </dd>
-        <dt className="text-ink-2">Start</dt><dd>{task.start === undefined ? 'No start date' : formatDay(task.start)}</dd>
-        <dt className="text-ink-2">Due</dt>
+        <dt className="flex items-center gap-1 text-ink-2"><CalendarIcon />Start</dt><dd>{task.start === undefined ? 'No start date' : formatDay(task.start)}</dd>
+        <dt className="flex items-center gap-1 text-ink-2"><CalendarIcon />Due</dt>
         <dd>{task.due === undefined ? 'No due date' : formatDay(task.due)}</dd>
         {task.labels.length > 0 && (
           <>
-            <dt className="text-ink-2">Labels</dt>
+            <dt className="flex items-center gap-1 text-ink-2"><TagIcon />Labels</dt>
             <dd className="flex flex-wrap gap-1">
               {task.labels.map((label) => (
                 <span key={label} className="rounded-pill bg-sunken px-2 text-xs text-ink-2">
@@ -269,13 +284,7 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
           <>
             <dt className="text-ink-2">Source</dt>
             <dd>
-              {task.source.url !== undefined && isWebUrl(task.source.url) ? (
-                <a href={task.source.url} target="_blank" rel="noopener noreferrer" className="text-accent-text underline">
-                  {task.source.system}: {task.source.key}
-                </a>
-              ) : (
-                `${task.source.system}: ${task.source.key}`
-              )}
+              <SourceLink system={task.source.system} sourceKey={task.source.key} url={task.source.url} />
             </dd>
           </>
         )}
@@ -284,6 +293,13 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
       {assign.error !== null && <ErrorNote error={assign.error} what="assign the task" />}
     </div>
   );
+}
+
+/** The upstream item, opened outside the app (the desktop shell's opener, else a new tab). */
+function SourceLink({ system, sourceKey, url }: { system: string; sourceKey: string; url: string | undefined }) {
+  const href = url === undefined ? undefined : safeHref(url);
+  const text = `${system}: ${sourceKey}`;
+  return href === undefined ? text : <ExternalLink href={href}>{text}</ExternalLink>;
 }
 
 function Subtasks({ task, person, level }: { task: Task; person: boolean; level: SectionLevel }) {
@@ -361,13 +377,20 @@ function Subtasks({ task, person, level }: { task: Task; person: boolean; level:
 
 function AgentRun({ task, person, level }: { task: Task; person: boolean; level: SectionLevel }) {
   const sessions = useSessions({ task: task.id });
-  const dispatches = useDispatches(task.id);
+  const dispatches = useDispatches(task.id, person);
   const members = useMemberMap();
   const all = [...(sessions.data ?? [])].sort(
     (a, b) => SESSION_STATE[a.state].rank - SESSION_STATE[b.state].rank || b.last_activity - a.last_activity,
   );
-  const finishedSessions = new Set((dispatches.data ?? []).filter((dispatch) => dispatch.ended !== undefined).map((dispatch) => dispatch.session));
-  const running = all.filter((s) => s.state !== 'ended' && !finishedSessions.has(s.id));
+  const finished = (dispatches.data ?? []).filter((dispatch) => dispatch.ended !== undefined);
+  // Runs that had already ended when the drawer opened: their failure is history, not news, so
+  // only a run that fails while it is open is announced as an alert.
+  const [before, setBefore] = useState<ReadonlySet<string>>();
+  if (before === undefined && dispatches.data !== undefined) setBefore(new Set(finished.map((dispatch) => dispatch.id)));
+  const finishedSessions = new Set(finished.map((dispatch) => dispatch.session));
+  // A session whose dispatch has ended still works on the task (a report for review ends the
+  // dispatch, not the session); only one still "starting" when its dispatch ended never will.
+  const running = all.filter((s) => s.state !== 'ended' && !(s.state === 'starting' && finishedSessions.has(s.id)));
   const ended = all.filter((s) => s.state === 'ended');
   return (
     <Section title="Agent run" level={level} className="rounded-md border border-line bg-card p-3">
@@ -376,7 +399,7 @@ function AgentRun({ task, person, level }: { task: Task; person: boolean; level:
         <p className="text-sm text-ink-2">No agent is working on this task.</p>
       )}
       {dispatches.error !== null && <ErrorNote error={dispatches.error} what="load the dispatch status" />}
-      {(dispatches.data ?? []).filter((dispatch) => dispatch.ended !== undefined).map((dispatch) => <p key={dispatch.id} role={dispatch.outcome === 'failed' ? 'alert' : undefined} className="text-sm">Run {dispatch.outcome}{dispatch.summary === undefined ? '' : `: ${dispatch.summary}`}</p>)}
+      {finished.map((dispatch) => <p key={dispatch.id} role={dispatch.outcome === 'failed' && before !== undefined && !before.has(dispatch.id) ? 'alert' : undefined} className="text-sm">Run {dispatch.outcome}{dispatch.summary === undefined ? '' : `: ${dispatch.summary}`}</p>)}
       {running.map((session) => (
         <RunRow key={session.id} session={session} members={members} />
       ))}
@@ -386,7 +409,9 @@ function AgentRun({ task, person, level }: { task: Task; person: boolean; level:
           {formatWhen(ended.reduce((at, s) => Math.max(at, s.last_activity), 0))}.
         </p>
       )}
-      {person && <DispatchForm task={task} />}
+      {person && (task.archived === true
+        ? <p className="text-sm text-ink-2">Restore the task to dispatch an agent to it.</p>
+        : <DispatchForm task={task} />)}
     </Section>
   );
 }

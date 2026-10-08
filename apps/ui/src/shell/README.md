@@ -269,6 +269,10 @@ The shell has placeholder dialogs for `task`, `agent`, `project` and `team`. A f
 `CreateEntry` with the same `id` replaces the placeholder; other ids add items. `dialog` is the
 body (it gets `close()`); the shell supplies the modal, its title (`title`, default "New
 <label>"), focus handling and a Suspense boundary. The palette lists every item as "New …".
+Something that opens a dialog with values to start from calls
+`useShell.getState().setCreating(id, from, defaults)`; the body gets them as `defaults` (a
+`CreateDefaults` record it checks itself), and closing the dialog clears them. A board column's
+"+" opens `task` this way, with its project, workstream and status.
 
 An entry with `disabled` (a reason) shows in the menu disabled, with that reason as an accessible
 description; it stays focusable, so the reason is reachable from the keyboard, but selecting it

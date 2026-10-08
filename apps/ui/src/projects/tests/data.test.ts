@@ -149,4 +149,12 @@ describe('describeEvent', () => {
       describeEvent({ ...event(1), body: { type: 'task_updated', data: { task: 'TASK0001', patch: { title: 'New' } } } }, plainNames),
     ).toBe('edited …0001');
   });
+
+  it('says archived and restored rather than edited', () => {
+    const updated = (patch: object) =>
+      describeEvent({ ...event(1), body: { type: 'task_updated', data: { task: 'TASK0001', patch } } }, plainNames);
+    expect(updated({ archived: true })).toBe('archived …0001');
+    expect(updated({ archived: false })).toBe('restored …0001');
+    expect(updated({ archived: true, title: 'New' })).toBe('edited and archived …0001');
+  });
 });

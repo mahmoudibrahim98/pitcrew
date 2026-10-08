@@ -4,6 +4,7 @@ export {
   defineFeature,
   type Command,
   type CommandContext,
+  type CreateDefaults,
   type CreateEntry,
   type Feature,
   type LayoutId,

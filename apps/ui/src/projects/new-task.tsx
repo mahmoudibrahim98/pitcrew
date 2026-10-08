@@ -7,9 +7,16 @@ import { useCreateTask, useMembers, useProjects, useWorkstreams } from './data.t
 import { useProjectsNav } from './nav.tsx';
 import { ErrorNote, Field, inputClass } from './ui.tsx';
 import type { Priority, TaskStatus } from '../data/index.ts';
+import type { CreateDefaults } from '../shell/index.ts';
 import { PRIORITY, TASK_STATUS, STATUS_ORDER } from './format.ts';
 
-export function NewTaskDialog({ close, defaults = {} }: { close(): void; defaults?: { project?: string; workstream?: string; status?: TaskStatus } }) {
+const isStatus = (value: string | undefined): value is TaskStatus => STATUS_ORDER.some((status) => status === value);
+
+/**
+ * The "+ New" → Task dialog. `defaults` come from where it was opened (a board column gives its
+ * project, workstream and `status`); without them the route's project and workstream are used.
+ */
+export function NewTaskDialog({ close, defaults = {} }: { close(): void; defaults?: CreateDefaults | undefined }) {
   const titleId = useId();
   const projects = useProjects();
   const members = useMembers();
@@ -24,7 +31,7 @@ export function NewTaskDialog({ close, defaults = {} }: { close(): void; default
   const [description, setDescription] = useState('');
   const [priority, setPriority] = useState<Priority>('none');
   const [labels, setLabels] = useState('');
-  const [status, setStatus] = useState<TaskStatus>(defaults.status ?? 'todo');
+  const [status, setStatus] = useState<TaskStatus>(isStatus(defaults.status) ? defaults.status : 'todo');
   const [assignee, setAssignee] = useState('');
   const [due, setDue] = useState('');
   const projectId = project !== '' ? project : (projects.data?.[0]?.id ?? '');

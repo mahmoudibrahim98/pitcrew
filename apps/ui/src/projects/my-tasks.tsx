@@ -3,7 +3,7 @@ import { Button, StatusPill } from '../design/index.ts';
 import type { Task } from '../data/index.ts';
 import { useMe, useTasks } from './data.ts';
 import { Board } from './board.tsx';
-import { todayDate } from './calendar-dates.ts';
+import { useToday } from './calendar-dates.ts';
 import { TASK_STATUS, PRIORITY } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { TaskDrawer } from './task-drawer.tsx';
@@ -23,7 +23,7 @@ function PersonTasks({ person }: { person: string }) {
   const [taskId, setTaskId] = useState<string | null>(null);
   const tasks = useTasks({ assignee: person });
   const nav = useProjectsNav();
-  const today = todayDate();
+  const today = useToday();
   const list = (tasks.data ?? []).filter((task) => !task.archived).sort((a, b) => (a.due ?? '').localeCompare(b.due ?? '') || PRIORITY[a.priority].rank - PRIORITY[b.priority].rank || a.key.localeCompare(b.key));
   return <>
     <div className="flex gap-2" role="group" aria-label="Task view">{['list', 'board'].map((value) => <Button key={value} aria-pressed={view === value} onClick={() => {

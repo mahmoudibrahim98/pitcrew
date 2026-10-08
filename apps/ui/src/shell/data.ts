@@ -12,8 +12,9 @@ import {
   type Workstream,
 } from '../data/index.ts';
 
+/** Still to do: not done, not canceled, and not archived (an archived task is out of the work). */
 export function isOpenTask(task: Task): boolean {
-  return task.status !== 'done' && task.status !== 'canceled';
+  return task.archived !== true && task.status !== 'done' && task.status !== 'canceled';
 }
 
 /** Open asks addressed to the signed-in member: the Inbox. */

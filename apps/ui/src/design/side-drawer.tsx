@@ -1,5 +1,6 @@
 import { Dialog } from 'radix-ui';
 import { useRef, type ComponentProps, type ReactNode } from 'react';
+import { ToastHost } from './toast.tsx';
 
 export const SideDrawerTitle = Dialog.Title;
 export const SideDrawerClose = Dialog.Close;
@@ -22,7 +23,11 @@ export function SideDrawer({ open, onOpenChange, children, onOpenAutoFocus, onCl
           if (!event.defaultPrevented && opener.current?.isConnected) { event.preventDefault(); opener.current.focus(); }
         }}
         className="fixed inset-y-0 right-0 z-50 flex w-full max-w-2xl flex-col overflow-y-auto border-l border-line bg-bg p-5 shadow-pop"
-        {...props}>{children}</Dialog.Content>
+        {...props}>
+        {children}
+        {/* Notifications show inside the open drawer, where focus and screen readers are. */}
+        <ToastHost />
+      </Dialog.Content>
     </Dialog.Portal>
   </Dialog.Root>;
 }

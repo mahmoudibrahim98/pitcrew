@@ -146,3 +146,39 @@ export const SplitDownIcon = icon(
     <path d="M2 8h12" />
   </>,
 );
+
+/** A priority: a flag on a pole. */
+export const FlagIcon = icon(
+  'Flag',
+  <>
+    <path d="M3.5 14V2.5" />
+    <path d="M3.5 3h8l-1.8 2.75L11.5 8.5h-8" />
+  </>,
+);
+
+/** A person: head and shoulders. */
+export const UserIcon = icon(
+  'User',
+  <>
+    <circle cx="8" cy="5.5" r="2.5" />
+    <path d="M3 13.5c.6-2.4 2.6-3.8 5-3.8s4.4 1.4 5 3.8" />
+  </>,
+);
+
+/** A date: a calendar page. */
+export const CalendarIcon = icon(
+  'Calendar',
+  <>
+    <rect x="2.5" y="3.5" width="11" height="10" rx="1.5" />
+    <path d="M2.5 6.5h11M5.5 2v3M10.5 2v3" />
+  </>,
+);
+
+/** A label: a tag with its hole. */
+export const TagIcon = icon(
+  'Tag',
+  <>
+    <path d="M2.5 3.5v4l6 6 5-5-6-6h-4a1 1 0 0 0-1 1Z" />
+    <circle cx="5.5" cy="5.5" r="0.75" />
+  </>,
+);

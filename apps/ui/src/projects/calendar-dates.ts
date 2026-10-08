@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import type { CalendarDate, Task } from '../data/index.ts';
 
 const DAY_MS = 86_400_000;
@@ -8,6 +9,23 @@ export const addDays = (date: CalendarDate, days: number): CalendarDate => dateK
 /** Today's calendar date in the viewer's location; arithmetic thereafter has no time zone. */
 export function todayDate(now = new Date()): CalendarDate {
   return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+/** Milliseconds from `now` to the next local midnight. */
+export function untilMidnight(now = new Date()): number {
+  const next = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+  return next.getTime() - now.getTime();
+}
+
+/** Today's date, which turns over at local midnight while the page stays open. */
+export function useToday(): CalendarDate {
+  const [today, setToday] = useState(() => todayDate());
+  useEffect(() => {
+    // A second past midnight, so a timer that fires a little early still lands on the new day.
+    const timer = setTimeout(() => setToday(todayDate()), untilMidnight() + 1000);
+    return () => clearTimeout(timer);
+  }, [today]);
+  return today;
 }
 
 export function weekStart(locale = new Intl.DateTimeFormat().resolvedOptions().locale): number {

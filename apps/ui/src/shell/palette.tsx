@@ -114,7 +114,8 @@ function useItems(opener: Element | null): Item[] {
       fields: [w.name, projectName.get(w.project) ?? ''],
       run: () => go(paths.workstream(ws, w.project, w.id)),
     })),
-    ...tasks.map<Item>((t) => ({
+    // Archived tasks are out of the work; their full page still opens by URL.
+    ...tasks.filter((t) => t.archived !== true).map<Item>((t) => ({
       id: `task:${t.id}`,
       kind: 'task',
       label: t.title,

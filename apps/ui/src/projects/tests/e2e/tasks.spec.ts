@@ -41,6 +41,13 @@ test('task drawer edits, traps keyboard focus, archives with Undo and retains a 
   await edited.getByRole('button', { name: 'Archive task' }).click();
   await expect(edited).not.toBeVisible();
   await expect(page.getByRole('button', { name: new RegExp(`${task.key}.*Edited in drawer`) })).toHaveCount(0);
+  // Search leaves the archived task out too (once the results have settled).
+  await page.keyboard.press('Control+KeyK');
+  await page.getByRole('combobox', { name: 'Search' }).fill('Edited in drawer');
+  await expect(page.getByText('No matches.').or(page.getByRole('option').first())).toBeVisible();
+  await expect(page.getByRole('option', { name: /Edited in drawer/ })).toHaveCount(0);
+  await page.keyboard.press('Control+KeyK');
+  await expect(page.getByRole('combobox', { name: 'Search' })).toHaveCount(0);
   await page.getByRole('button', { name: 'Undo', exact: true }).click();
   const restored = page.getByRole('button', { name: new RegExp(`${task.key}.*Edited in drawer`) });
   await expect(restored).toBeVisible();
@@ -51,10 +58,11 @@ test('task drawer edits, traps keyboard focus, archives with Undo and retains a 
   await expect(page.getByRole('heading', { level: 1, name: `${task.key} · Edited in drawer` })).toBeVisible();
 });
 
-test('board create dialog inherits project and column status', async ({ page }) => {
+test('a board column opens the New task dialog with its project and status, and Open stays in the app', async ({ page }) => {
   await page.goto(`/w/${WS}/projects/${PAPER}`);
   await page.getByRole('radio', { name: 'Board', exact: true }).click();
-  const button = page.getByRole('button', { name: 'New task in In progress', exact: true });
+  await expect(page.getByRole('button', { name: /^New task in/ })).toHaveCount(0);
+  const button = page.getByRole('button', { name: 'Add a task to In progress', exact: true });
   await expect(button).toBeVisible();
   await button.click();
   const dialog = page.getByRole('dialog', { name: 'New task' });
@@ -64,4 +72,10 @@ test('board create dialog inherits project and column status', async ({ page }) 
   await dialog.getByLabel('Title', { exact: true }).fill('Column defaults');
   await dialog.getByRole('button', { name: 'Create', exact: true }).click();
   await expect(page.getByRole('status').filter({ hasText: /created/ })).toBeVisible();
+  // "Open" navigates within the app: the document is not reloaded.
+  await page.evaluate(() => { (window as { e2eMarker?: boolean }).e2eMarker = true; });
+  await page.getByRole('button', { name: 'Open', exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`/w/${WS}/tasks/[0-9A-Z]{26}$`));
+  await expect(page.getByRole('heading', { level: 1, name: /Column defaults/ })).toBeVisible();
+  expect(await page.evaluate(() => (window as { e2eMarker?: boolean }).e2eMarker)).toBe(true);
 });

@@ -76,6 +76,12 @@ export interface Command {
   run(context: CommandContext): void;
 }
 
+/**
+ * Values a "+ New" dialog starts with, from where it was opened (a board column: its project,
+ * workstream and status). Each dialog reads the keys it knows and checks them.
+ */
+export type CreateDefaults = Readonly<Record<string, string>>;
+
 /** An item in the "+ New" menu. */
 export interface CreateEntry {
   /** `task`, `agent`, `project` and `team` replace the shell's placeholders. */
@@ -86,7 +92,7 @@ export interface CreateEntry {
   /** The dialog's title; default "New <label>". */
   title?: string;
   /** The dialog body. Wrap a heavy form in `React.lazy`; the shell adds the Suspense boundary. */
-  dialog: ComponentType<{ close(): void }>;
+  dialog: ComponentType<{ close(): void; defaults?: CreateDefaults | undefined }>;
   /** Lower comes first. The shell's own items use 10 to 40. Default 100. */
   order?: number;
   /**

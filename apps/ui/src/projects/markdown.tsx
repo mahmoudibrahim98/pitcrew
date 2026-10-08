@@ -1,14 +1,18 @@
 import type { ReactNode } from 'react';
-import { isWebUrl } from './format.ts';
+import { ExternalLink, safeHref } from '../console/render/links.tsx';
 
 // Render a conservative Markdown subset as React text. No HTML parser, raw HTML or image fetches.
+// Links (absolute http, https or mailto only) are the console's `ExternalLink`, as in transcripts:
+// they open through the host's opener when it provides one (the desktop window refuses a plain
+// `target="_blank"`), else in a new tab.
 function inline(text: string): ReactNode[] {
   return text.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^\s)]+\))/g).map((part, index) => {
     if (part.startsWith('`') && part.endsWith('`')) return <code key={index} className="rounded-sm bg-sunken px-1 font-mono">{part.slice(1, -1)}</code>;
     if (part.startsWith('**') && part.endsWith('**')) return <strong key={index}>{part.slice(2, -2)}</strong>;
     if (part.startsWith('*') && part.endsWith('*')) return <em key={index}>{part.slice(1, -1)}</em>;
     const link = part.match(/^\[([^\]]+)\]\(([^\s)]+)\)$/);
-    if (link !== null && isWebUrl(link[2] ?? '')) return <a key={index} href={link[2]} target="_blank" rel="noopener noreferrer" className="text-accent-text underline">{link[1]}</a>;
+    const href = link === null ? undefined : safeHref(link[2] ?? '');
+    if (link !== null && href !== undefined) return <ExternalLink key={index} href={href}>{link[1]}</ExternalLink>;
     return part;
   });
 }

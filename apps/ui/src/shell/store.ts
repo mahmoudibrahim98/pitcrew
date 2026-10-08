@@ -3,7 +3,7 @@
 
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { LayoutId } from './feature.ts';
+import type { CreateDefaults, LayoutId } from './feature.ts';
 
 export interface WorkspacePrefs {
   layout: LayoutId;
@@ -30,6 +30,8 @@ interface Transient {
   creating: string | null;
   /** What had focus before that dialog opened, to give focus back to. */
   creatingFrom: Element | null;
+  /** What that dialog starts with, from where it was opened. */
+  creatingDefaults: CreateDefaults | null;
   /** A brief message with nowhere better to show (an unknown-workspace deep link, say). */
   notice: string | null;
 }
@@ -43,8 +45,11 @@ interface Actions {
   setOrchestratorOpen(open: boolean): void;
   setOrchestratorWidth(width: number): void;
   setPaletteOpen(open: boolean): void;
-  /** Opens a "+ New" dialog, or closes it with null. `from` gets focus back when it closes. */
-  setCreating(id: string | null, from?: Element | null): void;
+  /**
+   * Opens a "+ New" dialog, or closes it with null. `from` gets focus back when it closes;
+   * `defaults` are what the dialog starts with.
+   */
+  setCreating(id: string | null, from?: Element | null, defaults?: CreateDefaults): void;
   setNotice(notice: string | null): void;
 }
 
@@ -60,6 +65,7 @@ export const initialShellState: Persisted & Transient = {
   paletteOpen: false,
   creating: null,
   creatingFrom: null,
+  creatingDefaults: null,
   notice: null,
 };
 
@@ -88,9 +94,13 @@ export const useShell = create<ShellState>()(
       setOrchestratorOpen: (orchestratorOpen) => set({ orchestratorOpen }),
       setOrchestratorWidth: (orchestratorWidth) => set({ orchestratorWidth }),
       setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
-      setCreating: (creating, from = null) =>
+      setCreating: (creating, from = null, defaults) =>
         // Closing keeps `creatingFrom`: the dialog reads it as it hands focus back.
-        set((s) => ({ creating, creatingFrom: creating === null ? s.creatingFrom : from })),
+        set((s) => ({
+          creating,
+          creatingFrom: creating === null ? s.creatingFrom : from,
+          creatingDefaults: creating === null ? null : (defaults ?? null),
+        })),
       setNotice: (notice) => set({ notice }),
     }),
     {

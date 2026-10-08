@@ -2,23 +2,33 @@
 
 ## Task editing and views
 
-Tasks opened from boards and lists use the shared side drawer; direct task URLs retain their
-full page. The drawer offers Open full page, Copy link, Mark complete and Edit task. Edit task
-updates title, description, priority, dates, labels, workstream and automatic acceptance together;
-dependency controls add and remove blockers through the hub's cycle validation. Archived tasks
-retain their id, key, plan and history, disappear from work views, and can be restored by the
-notification's Undo action or their full page. Archiving closes the drawer so Undo is reachable.
+Tasks opened from boards, lists, the calendar and the timeline use the projects layout's one side
+drawer (a task opened from inside it replaces it; drawers never stack); direct task URLs retain
+their full page. The drawer offers Open full page, Copy link (in the desktop app the
+`pitcrew://w/<ws>/task/<id>` deep link, since the window's own address opens nothing elsewhere),
+Mark complete and Edit task. Edit task sends only the fields changed in the form since it opened,
+so a concurrent edit or sync of another field is never put back. Dependency controls add and
+remove blockers through the hub's cycle validation. Archived tasks retain their id, key, plan and
+history, disappear from work views, open-task counts and search, cannot be dispatched, and can be
+restored by the notification's Undo or their full page. The Undo belongs to its archive: archiving
+again replaces it, restoring another way takes it away, and it is disabled while it runs.
 
 Description Markdown uses React text nodes: emphasis, code, fenced code, headings, bullet lists,
-quotes and HTTP(S) links. Raw HTML stays literal text; images never load and unsafe link schemes
-stay text. Agent run reads dispatches as well as sessions, shows terminal links only for sessions
-with terminals, and reports finished dispatch outcomes and summaries after live invalidation.
+quotes and links. Raw HTML stays literal text; images never load. Links are the console's
+`ExternalLink` with `safeHref` (absolute http, https or mailto; anything else stays text), opened
+through the host's opener when it provides one. Agent run reads dispatches (people only) as well
+as sessions, shows terminal links only for sessions with terminals, keeps a session that still
+works after its dispatch ended (a report for review), and reports finished dispatch outcomes and
+summaries after live invalidation; only a run that fails while the drawer is open is an alert.
 
 My tasks defaults to a list grouped Overdue, Today, Upcoming, No date and Completed (canceled
-tasks included in Completed), with a board alternative remembered in local storage per person.
-New task accepts explicit project/workstream/status defaults; board columns provide these.
-The shell dialog infers project/workstream from the current route. Workstream choices always
-belong to the selected project. Description, labels and priority are included on creation.
+tasks included in Completed), with a board alternative remembered in local storage per person;
+"today" turns over at local midnight while the page stays open. A board column's "+" opens the
+shell's "+ New" → Task dialog (`setCreating('task', from, defaults)`) with the column's project,
+workstream and status; it is the column's one create control. Without defaults the dialog infers
+project/workstream from the current route. Workstream choices always belong to the selected
+project. Description, labels and priority are included on creation. The create notification's
+Open goes to the new task's page through the router.
 
 Dispatchable-agent provisioning/selection uses the merged create-dialogs work. The shell's
 search/palette continues to navigate directly to a task page: this brief does not own the palette.

@@ -2,6 +2,7 @@
 // Reads wait for the stream; writes never touch the cache, the events they cause do.
 
 import { useMutation } from '@tanstack/react-query';
+import { useRouter } from '@tanstack/react-router';
 import { useState } from 'react';
 import {
   keys,
@@ -33,8 +34,9 @@ import {
   type WorkstreamId,
 } from '../data/index.ts';
 import { plainNames, type Names } from './format.ts';
-import { toast } from '../design/toast.tsx';
-import { taskLink, useProjectsNav } from './nav.tsx';
+import { dismissToast, toast } from '../design/toast.tsx';
+import { paths } from '../shell/paths.ts';
+import { taskLink, useProjectsNav, workspaceIn } from './nav.tsx';
 import type { TaskPatch } from '../data/index.ts';
 
 export {
@@ -276,12 +278,21 @@ export function useAssignTask() {
 export function useCreateTask() {
   const api = useApi();
   const nav = useProjectsNav();
+  // Outside the projects layout (the shell's "+ New" dialog) there is no drawer to open: "Open"
+  // goes to the task's page through the router, never by reloading the document.
+  const router = useRouter({ warn: false }) as ReturnType<typeof useRouter> | undefined;
+  const open = (task: Task) => {
+    if (nav.openTask !== undefined) {
+      nav.openTask(task.id);
+      return;
+    }
+    const ws = workspaceIn(router?.state.location.pathname ?? window.location.pathname);
+    if (router !== undefined && ws !== undefined) void router.navigate({ href: paths.task(ws, task.id) });
+    else window.location.assign(taskLink(task.id));
+  };
   return useMutation({
     mutationFn: (task: NewTask) => api.request<Task>('POST', '/v1/tasks', { body: task }),
-    onSuccess: (task) => toast(`${task.key} created`, { action: { label: 'Open', run: () => {
-      if (nav.openTask !== undefined) nav.openTask(task.id);
-      else window.location.assign(taskLink(task.id));
-    } } }),
+    onSuccess: (task) => toast(`${task.key} created`, { action: { label: 'Open', run: () => open(task) } }),
     onError: taskError,
   });
 }
@@ -290,24 +301,42 @@ export function taskError(error: Error) {
   toast(`${error instanceof Error ? error.message : String(error)} Check the task and try again.`, { error: true });
 }
 
+/** The notification key of a task's archive, whose Undo restores it. */
+export const archiveToastKey = (task: TaskId) => `archive:${task}`;
+
 export function usePatchTask() {
   const api = useApi();
   return useMutation({
     mutationFn: ({ task, patch }: { task: TaskId; patch: TaskPatch }) => api.patchTask(task, patch),
-    onSuccess: (task, { patch }) => toast(`${task.key} ${patch.archived === true ? 'archived' : patch.archived === false ? 'restored' : 'updated'}`,
-      patch.archived === true ? { action: { label: 'Undo', run: async () => {
-        await api.patchTask(task.id, { archived: false });
-        toast(`${task.key} restored`);
-      } } } : {}),
+    onSuccess: (task, { patch }) => {
+      if (patch.archived === true) {
+        // The Undo belongs to this archive: archiving again replaces it, restoring takes it away.
+        toast(`${task.key} archived`, {
+          key: archiveToastKey(task.id),
+          action: {
+            label: 'Undo',
+            run: async () => {
+              const restored = await api.patchTask(task.id, { archived: false });
+              toast(`${restored.key} restored`);
+            },
+          },
+        });
+        return;
+      }
+      if (patch.archived === false) dismissToast(archiveToastKey(task.id));
+      toast(`${task.key} ${patch.archived === false ? 'restored' : 'updated'}`);
+    },
     onError: taskError,
   });
 }
 
-export function useDispatches(task: TaskId) {
+/** A task's runs. People only: the hub refuses agents (`enabled: false` for one). */
+export function useDispatches(task: TaskId, enabled = true) {
   const api = useApi();
   return useLiveQuery({
     queryKey: [...keys.dispatches, { task }],
     queryFn: ({ signal }) => api.request<Dispatch[]>('GET', `/v1/tasks/${id(task)}/dispatches`, { signal }),
+    enabled,
   });
 }
 
