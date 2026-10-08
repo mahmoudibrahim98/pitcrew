@@ -503,9 +503,42 @@ remote records saved, reloaded, given their transport, renamed and removed, a re
 another workspace's id and the local daemon refused a remote's, the local workspace back once
 that remote is removed (or its claim undone), a claim undone only while its entry is its own
 (also after a connector was attached), and a remote's state setter that leaves the local
-workspace alone (`registry.rs`); and host names cleaned (`host.rs`).
+workspace alone (`registry.rs`); host names cleaned (`host.rs`); and a portable folder's
+layout: the four programs found and trusted, the marker, a missing program named, a program
+others can write (Unix) or one still marked as downloaded (Windows) refused (`portable.rs`), and
+a portable copy's update status and answer (`updater.rs`).
 
 The OS keychain test is `#[ignore]`d: it needs an unlocked keychain (`cargo test -- --ignored`).
+
+## A portable copy (`src/portable.rs`)
+
+The [portable Windows zip](../../../packaging/README.md#the-portable-windows-zip) is PitCrew to
+unzip and run from a folder: no installer, no administrator, no registry keys.
+
+- **Detected** by `portable.txt` next to the executable, which the zip ships.
+- **The installed layout.** The installer puts `pitcrewd.exe`, `pitcrew-ptyd.exe`,
+  `pitcrew-askpass.exe` and `pitcrew.exe` next to `pitcrew-desktop.exe`, and so does the zip, so
+  the usual lookups find them ("The local daemon"; `pitcrewd` finds `pitcrew-ptyd` and `pitcrew`
+  next to itself), with the same trust check: a program still marked as downloaded
+  (`Zone.Identifier`) is refused, so the zip must be unblocked before it is unzipped.
+- **State where the installed app keeps it:** the daemon's default state directory, the app's
+  config directory (`settings.json`, `preferences.json`) and its local data directory (the
+  workspace list, the webview's data) are the person's own folders, never the executable's, so
+  moving between the zip and the installer keeps them.
+- **Updates are shown, never installed** ([Updates](#updates)).
+- **Notifications** are sent as PowerShell's AppUserModelID, as a debug build's are: Windows shows
+  toasts only for an id a Start menu shortcut registers, and only the installer makes one.
+- **No remote helpers:** the zip carries none (`helpers/` is the installers'), so adding a machine
+  that needs one says so.
+- **WebView2** is assumed (Windows 10 and 11 ship it). Without it the app stops before starting the
+  daemon: Tauri's own dialog says so in plain words with Microsoft's download page, and the log
+  names the Evergreen Bootstrapper.
+
+**`pitcrew-desktop --check-layout`** (the only argument) prints what the app finds in its folder
+and exits 0 when it could run from there, 1 otherwise, without a window or a daemon: each
+program `ok` or why not, whether it is portable, the default state directory and (Windows) the
+WebView2 version. A release build on Windows has no console, so redirect it:
+`.\pitcrew-desktop.exe --check-layout | Out-String` in PowerShell.
 
 ## Updates
 
@@ -518,7 +551,11 @@ The [contract](../../../docs/build/contracts/desktop-gateway.md#desktop-updates)
 channel changes and status/events. Preferences add `updatePrereleases` (false by default).
 Startup and daily checks are independent of the webview; reloading retrieves the retained status.
 
-Builds without a configured public key disable update checks. Release packaging compiles the
+Builds without a configured public key disable update checks, except a portable copy's. A
+portable copy checks the same feed, with or without the key, but never downloads or installs:
+"Update" opens the portable workflow's successful runs on `main`, where the newest
+`pitcrew-windows-x64-portable.zip` is, and answers with a sentence saying so; its status has
+`portable: true` and that page as `downloadUrl` (see the contract). Release packaging compiles the
 public key from the repository variable only when signing is enabled. See
 [packaging](../../../packaging/README.md#signed-desktop-updates) for key setup, feed production
 and the AppImage/deb/rpm distinction. Never run the installed app in tests: `tests/updater.rs`

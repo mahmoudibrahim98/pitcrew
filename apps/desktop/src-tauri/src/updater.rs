@@ -1,4 +1,8 @@
 //! Signed desktop updates, held in Rust until the person accepts the displayed version.
+//!
+//! A portable copy ([`crate::portable`]) checks too, with or without a compiled public key, but
+//! never downloads or installs anything: accepting an update opens the page with the newest
+//! portable zip ([`PORTABLE_DOWNLOADS`]) instead.
 use crate::{app::MAIN, shell::Shell};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -10,12 +14,17 @@ use tauri_plugin_updater::{Update, UpdaterExt as _};
 const REPO: &str = "https://github.com/mahmoudibrahim98/pitcrew";
 const API: &str = "https://api.github.com/repos/mahmoudibrahim98/pitcrew/releases?per_page=100";
 const DAILY: Duration = Duration::from_secs(24 * 60 * 60);
+/// Where a portable copy's update comes from: the portable workflow's successful runs on `main`,
+/// each with `pitcrew-windows-x64-portable.zip` as its artifact.
+pub const PORTABLE_DOWNLOADS: &str = "https://github.com/mahmoudibrahim98/pitcrew/actions/workflows/release-portable.yml?query=branch%3Amain+is%3Asuccess";
 
 /// Serializes checks, channel changes and installation; the UI holds no update resource.
 #[derive(Default)]
 pub struct Updates {
     gate: tokio::sync::Mutex<()>,
     pending: Mutex<Option<Update>>,
+    /// A portable copy: it never installs an update.
+    portable: bool,
 }
 impl std::fmt::Debug for Updates {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -23,6 +32,14 @@ impl std::fmt::Debug for Updates {
     }
 }
 impl Updates {
+    /// No pending update yet; `portable` for a portable copy.
+    #[must_use]
+    pub fn new(portable: bool) -> Self {
+        Self {
+            portable,
+            ..Self::default()
+        }
+    }
     fn pending(&self) -> MutexGuard<'_, Option<Update>> {
         self.pending
             .lock()
@@ -36,10 +53,32 @@ impl Updates {
 pub struct Status {
     enabled: bool,
     prereleases: bool,
+    /// A portable copy: an update is shown, never installed.
+    portable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     notes_url: Option<String>,
+    /// A portable copy's pending update: where the newest portable zip is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_url: Option<String>,
+}
+impl Status {
+    fn new(enabled: bool, prereleases: bool, portable: bool, version: Option<String>) -> Self {
+        Self {
+            enabled,
+            prereleases,
+            portable,
+            notes_url: version
+                .as_ref()
+                .map(|v| format!("{REPO}/releases/tag/v{v}")),
+            download_url: version
+                .as_ref()
+                .filter(|_| portable)
+                .map(|_| PORTABLE_DOWNLOADS.to_owned()),
+            version,
+        }
+    }
 }
 fn public_key<R: Runtime>(app: &AppHandle<R>) -> &str {
     app.config()
@@ -50,21 +89,53 @@ fn public_key<R: Runtime>(app: &AppHandle<R>) -> &str {
         .and_then(|v| v.as_str())
         .unwrap_or("")
 }
+/// Whether checks run: a portable copy always checks (it only shows a version and a fixed
+/// GitHub page); an installed one needs the compiled public key, and on Linux an AppImage.
+fn checks(portable: bool, public_key: &str, appimage: bool) -> bool {
+    portable || (!public_key.is_empty() && (!cfg!(target_os = "linux") || appimage))
+}
 fn enabled<R: Runtime>(app: &AppHandle<R>) -> bool {
-    let key = public_key(app);
-    !key.is_empty() && (!cfg!(target_os = "linux") || std::env::var_os("APPIMAGE").is_some())
+    checks(
+        app.state::<Updates>().portable,
+        public_key(app),
+        std::env::var_os("APPIMAGE").is_some(),
+    )
 }
 fn status<R: Runtime>(app: &AppHandle<R>) -> Status {
-    let pending = app.state::<Updates>();
-    let version = pending.pending().as_ref().map(|u| u.version.clone());
-    Status {
-        enabled: enabled(app),
-        prereleases: app.state::<Shell>().preferences.get().update_prereleases,
-        notes_url: version
-            .as_ref()
-            .map(|v| format!("{REPO}/releases/tag/v{v}")),
+    let updates = app.state::<Updates>();
+    let version = updates.pending().as_ref().map(|u| u.version.clone());
+    Status::new(
+        enabled(app),
+        app.state::<Shell>().preferences.get().update_prereleases,
+        updates.portable,
         version,
-    }
+    )
+}
+/// What accepting an update says in a portable copy, once the download page is open.
+fn portable_answer(version: &str) -> String {
+    format!(
+        "PitCrew {version} is out. This portable copy does not install updates: the page with \
+         the newest portable zip is open in your browser. Download it, unzip it into a new \
+         folder and start PitCrew from there; your data stays where it is."
+    )
+}
+/// Opens `url`, a fixed GitHub page, in the system browser.
+fn open_in_browser(url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = std::process::Command::new("rundll32.exe");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("/usr/bin/open");
+    #[cfg(target_os = "linux")]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(url)
+        .spawn()
+        .map_err(|_| "Cannot open the page in the browser")?;
+    Ok(())
 }
 fn main_only<R: Runtime>(window: &tauri::WebviewWindow<R>) -> Result<(), String> {
     if window.label() == MAIN {
@@ -168,7 +239,7 @@ fn publish<R: Runtime>(app: &AppHandle<R>) -> Result<Status, String> {
 
 /// Starts the check loop; it never downloads or installs anything.
 pub fn start<R: Runtime>(app: &AppHandle<R>) {
-    app.manage(Updates::default());
+    app.manage(Updates::new(crate::portable::here()));
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
@@ -234,6 +305,10 @@ pub async fn gateway_update_install<R: Runtime>(
         .filter(|u| u.version == version)
         .cloned()
         .ok_or("This update is no longer available; check again")?;
+    if state.portable {
+        open_in_browser(PORTABLE_DOWNLOADS)?;
+        return Err(portable_answer(&update.version));
+    }
     if !enabled(&app) {
         return Err("Updates are disabled".into());
     }
@@ -296,21 +371,7 @@ pub fn gateway_update_notes<R: Runtime>(
         .filter(|u| u.version == version)
         .ok_or("Update no longer available")?;
     let url = format!("{REPO}/releases/tag/v{}", update.version);
-    #[cfg(windows)]
-    let mut command = {
-        let mut c = std::process::Command::new("rundll32.exe");
-        c.arg("url.dll,FileProtocolHandler");
-        c
-    };
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("/usr/bin/open");
-    #[cfg(target_os = "linux")]
-    let mut command = std::process::Command::new("xdg-open");
-    command
-        .arg(url)
-        .spawn()
-        .map_err(|_| "Cannot open release notes")?;
-    Ok(())
+    open_in_browser(&url).map_err(|_| "Cannot open release notes".to_owned())
 }
 
 #[cfg(test)]
@@ -332,6 +393,51 @@ mod tests {
                 expected
             );
         }
+    }
+    #[test]
+    fn a_portable_copy_checks_without_a_key_and_an_installed_one_needs_it() {
+        assert!(checks(true, "", false));
+        assert!(checks(true, "key", true));
+        assert!(!checks(false, "", true));
+        assert_eq!(checks(false, "key", false), !cfg!(target_os = "linux"));
+        assert!(checks(false, "key", true));
+    }
+    #[test]
+    fn a_portable_status_links_the_newest_portable_zip_and_never_offers_an_install_url() {
+        let portable =
+            serde_json::to_value(Status::new(true, false, true, Some("1.2.3".into()))).unwrap();
+        assert_eq!(
+            portable,
+            serde_json::json!({
+                "enabled": true,
+                "prereleases": false,
+                "portable": true,
+                "version": "1.2.3",
+                "notesUrl": format!("{REPO}/releases/tag/v1.2.3"),
+                "downloadUrl": PORTABLE_DOWNLOADS,
+            })
+        );
+        assert!(PORTABLE_DOWNLOADS.starts_with(&format!("{REPO}/actions/workflows/")));
+        // Nothing pending: no links at all.
+        assert_eq!(
+            serde_json::to_value(Status::new(true, true, true, None)).unwrap(),
+            serde_json::json!({ "enabled": true, "prereleases": true, "portable": true })
+        );
+        // Installed: the release notes, no download page.
+        assert_eq!(
+            serde_json::to_value(Status::new(true, false, false, Some("1.2.3".into()))).unwrap(),
+            serde_json::json!({
+                "enabled": true,
+                "prereleases": false,
+                "portable": false,
+                "version": "1.2.3",
+                "notesUrl": format!("{REPO}/releases/tag/v1.2.3"),
+            })
+        );
+        let answer = portable_answer("1.2.3");
+        assert!(answer.contains("PitCrew 1.2.3"), "{answer}");
+        assert!(answer.contains("does not install updates"), "{answer}");
+        assert!(Updates::new(true).portable && !Updates::default().portable);
     }
     #[test]
     fn release_list_ignores_drafts_missing_feeds_and_bad_tags() {

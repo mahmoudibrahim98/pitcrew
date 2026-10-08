@@ -243,6 +243,15 @@ pub fn remote_options(
 struct Daemon(Mutex<Option<Supervisor>>);
 
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+    // No WebView2 (a portable copy has no installer to bring it): stop before the daemon and the
+    // remote workspaces start. Making the window shows Tauri's own dialog, in plain words with
+    // Microsoft's download page; the log names the Evergreen Bootstrapper.
+    #[cfg(windows)]
+    if let Err(e) = tauri::webview_version() {
+        tracing::error!(error = %e, "{}", crate::portable::WEBVIEW2_MISSING);
+        let _ = main_window(app);
+        return Err(crate::portable::WEBVIEW2_MISSING.into());
+    }
     let handle = app.handle().clone();
     let paths = app.path();
     let config_dir = paths.app_config_dir()?;
