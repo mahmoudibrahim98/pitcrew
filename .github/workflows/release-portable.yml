@@ -1,22 +1,34 @@
 # Owned by stream P. The portable Windows build: pitcrew-windows-x64-portable.zip, to unzip into a
 # folder and run PitCrew from there, with no installer (docs/build/briefs/P-portable-windows.md).
 #
-# On demand, on every push to main, and on pull requests that touch packaging, the desktop shell
-# or this workflow: builds pitcrewd, pitcrew, pitcrew-ptyd and pitcrew-askpass as release.yml's
-# Windows build does, but with the C runtime linked in (no Visual C++ Redistributable to install),
-# then the desktop app, the third-party notices, README-portable.txt, portable.txt and SHA256SUMS
-# (packaging/portable/build.sh); unzips it into a fresh folder and smoke-tests it there
-# (packaging/portable/smoke.ps1); and uploads the zip itself as the run's artifact for 30 days.
-# Nothing is signed, attested or published as a release. See packaging/README.md, "The portable
-# Windows zip".
+# On demand, on every push to main, on pull requests that touch packaging, the desktop shell, the
+# toolchain or the lockfile, and from release.yml for a `v*` tag (workflow_call, with the tag):
+# - `helpers` builds the static Linux helpers (pitcrewd for x86_64 and aarch64 musl) as
+#   release.yml's build job does, with Zig, and checks them as it does;
+# - `zip` builds pitcrewd, pitcrew, pitcrew-ptyd and pitcrew-askpass as release.yml's Windows
+#   build does, but with the Visual C++ runtime linked in (no Redistributable to install; the
+#   UCRT stays Windows' own), then the desktop app with the helpers' checksums compiled in, the
+#   third-party notices, README-portable.txt, portable.txt and SHA256SUMS
+#   (packaging/portable/build.sh); unzips it into a fresh folder and smoke-tests it there
+#   (packaging/portable/smoke.ps1); and uploads the zip itself as the run's artifact for 30 days,
+#   except for a fork's pull request. A release's zip (channel=release, the tag's version) is
+#   attached to the draft release by release.yml; every other build is a development build
+#   (channel=main), offered no updates.
+# Nothing is signed or attested here. See packaging/README.md, "The portable Windows zip".
 #
 # As in release.yml: actions pinned by commit SHA, no default permissions and only reading the
 # repository in each job, no caches (setup-node's package-manager cache is off), the Rust channel
-# from rust-toolchain.toml, tools pinned by version, and no expression inside a script.
+# from rust-toolchain.toml, tools pinned by version or hash, and no expression inside a script.
 name: Portable Windows zip
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        description: The release tag (v1.2.3), from release.yml; empty for a development build
+        type: string
+        default: ""
   push:
     branches: [main]
   pull_request:
@@ -24,17 +36,25 @@ on:
       - "packaging/**"
       - "apps/desktop/**"
       - ".github/workflows/release-portable.yml"
+      # A toolchain or lockfile change can break the static-runtime build before main.
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
 
 permissions: {}
 
 concurrency:
-  group: portable-${{ github.event.pull_request.number || github.ref }}
-  # A pull request's newer push replaces its run; every push to main keeps its own zip.
+  # A pull request's newer push cancels its older run; every other run (each push to main, each
+  # release) is a group of its own, so none is cancelled or dropped.
+  group: portable-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # As in release.yml.
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
+  OLD_GLIBC_IMAGE: docker.io/library/centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
 
 jobs:
   # The packaging scripts' own tests (stand-ins only), the portable zip's and the notices' among
@@ -56,14 +76,72 @@ jobs:
       - name: The packaging scripts pass their tests
         run: bash packaging/test.sh
 
+  # The remote helpers the portable app deploys over SSH, built and checked as release.yml's build
+  # job builds the Linux ones.
+  helpers:
+    name: Remote helpers (static Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then echo "::error::no channel in rust-toolchain.toml"; exit 1; fi
+          rustup toolchain install "$channel" --profile minimal
+          rustup target add --toolchain "$channel" x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          rustc --version
+
+      # Zig from PyPI in a venv, pinned by hash; cargo-zigbuild runs `python3 -m ziglang`.
+      - name: Zig and cargo-zigbuild
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zig"
+          "$RUNNER_TEMP/zig/bin/pip" install --require-hashes -r packaging/zig-requirements.txt
+          echo "$RUNNER_TEMP/zig/bin" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --locked --version "${CARGO_ZIGBUILD_VERSION}"
+
+      - name: Build
+        run: bash packaging/build-release.sh --out dist --zig x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+      - name: The helpers are static
+        run: |
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            file "dist/pitcrewd-$target" | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
+          done
+
+      - name: The helper runs on an old glibc with no network
+        run: |
+          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$OLD_GLIBC_IMAGE" \
+            /dist/pitcrewd-x86_64-unknown-linux-musl --version
+
+      # Only for the zip job of this run.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: portable-helpers
+          path: |
+            dist/pitcrewd-x86_64-unknown-linux-musl
+            dist/pitcrewd-aarch64-unknown-linux-musl
+          if-no-files-found: error
+          retention-days: 1
+
   zip:
     name: Portable Windows zip
+    needs: helpers
     runs-on: windows-2025
     timeout-minutes: 120
     permissions:
       contents: read
     env:
       TARGET: x86_64-pc-windows-msvc
+      # A release's tag (from release.yml), else empty: a development build.
+      RELEASE_TAG: ${{ inputs.version }}
+      # The commit README-portable.txt names: a pull request's head, not the merge commit.
+      PORTABLE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -94,25 +172,37 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --filter @pitcrew/ui build
 
-      # The C runtime linked into each program (as tauri-build already links it into the desktop),
-      # so the zip runs where the Visual C++ Redistributable is not installed.
+      # The Visual C++ runtime linked into each program, as tauri-build links it into the desktop,
+      # so the zip runs where the Redistributable is not installed. The UCRT stays Windows' own
+      # (ucrt.lib, not libucrt.lib), so Windows Update keeps it current.
       - name: pitcrewd, pitcrew, pitcrew-ptyd and pitcrew-askpass
         shell: bash
         env:
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static -C link-arg=/NODEFAULTLIB:libucrt.lib -C link-arg=/DEFAULTLIB:ucrt.lib"
         run: bash packaging/build-release.sh --out dist "$TARGET"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: portable-helpers
+          path: dist
 
       - name: The desktop app, the notices and the zip
         shell: bash
-        run: bash packaging/portable/build.sh --dist dist --out dist/portable
+        run: |
+          flags=()
+          if [ -n "$RELEASE_TAG" ]; then flags+=(--channel release --version "${RELEASE_TAG#v}"); fi
+          bash packaging/portable/build.sh --dist dist --out dist/portable ${flags[@]+"${flags[@]}"}
 
       # Unzipped into a fresh folder outside the checkout: the files and their checksums, no
-      # Visual C++ runtime needed, the programs' versions, the desktop's --check-layout (no
-      # window), pitcrewd answering GET /v1/host/info with pitcrew-ptyd found, nothing written
-      # next to the programs. Adds the file list, size and SHA-256 to the job's summary.
+      # Visual C++ runtime needed, the programs' versions, the helpers and their compiled
+      # manifest, the desktop's --check-layout (no window), pitcrewd answering GET /v1/host/info
+      # with pitcrew-ptyd found, nothing written next to the programs. Adds the file list, size
+      # and SHA-256 to the job's summary.
       - name: Smoke test
         shell: pwsh
-        run: ./packaging/portable/smoke.ps1 -Zip dist/portable/pitcrew-windows-x64-portable.zip
+        run: |
+          $channel = if ($env:RELEASE_TAG) { 'release' } else { 'main' }
+          ./packaging/portable/smoke.ps1 -Zip dist/portable/pitcrew-windows-x64-portable.zip -Channel $channel
 
       # The zip itself, not zipped again: the artifact is pitcrew-windows-x64-portable.zip.
       # Never for a fork's pull request: its code is not this repository's, and its run's zip must
