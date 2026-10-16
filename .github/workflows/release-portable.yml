@@ -120,7 +120,7 @@ jobs:
             /dist/pitcrewd-x86_64-unknown-linux-musl --version
 
       # Only for the zip job of this run.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: portable-helpers
           path: |
@@ -208,7 +208,7 @@ jobs:
       # Never for a fork's pull request: its code is not this repository's, and its run's zip must
       # not sit among the builds people download.
       - if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           path: dist/portable/pitcrew-windows-x64-portable.zip
           archive: false
