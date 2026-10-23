@@ -27,7 +27,7 @@ serde_json.workspace = true
 # user's comments and layout). MIT OR Apache-2.0; not yet in the workspace table (stream I only).
 # The integrator should consider moving this to the root `[workspace.dependencies]` if another
 # stream needs it too.
-toml_edit = "=0.25.15"
+toml_edit = "=0.25.17"
 
 [target.'cfg(unix)'.dependencies]
 pitcrew-auth.workspace = true
