@@ -42,13 +42,13 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "
 getrandom = "=0.4.3"
 # Reading users' site recipes (~/.pitcrew/sites/*.toml) strictly, key by key. The version
 # stream I's pitcrew-cli already uses (MIT OR Apache-2.0); parsing only.
-toml_edit = { version = "=0.25.15", default-features = false, features = ["parse"] }
+toml_edit = { version = "=0.25.17", default-features = false, features = ["parse"] }
 
 [target.'cfg(unix)'.dependencies]
 # Effective uid, process groups, parent pid and pidfds without unsafe code; for the stdio
 # bridge, `poll` and pointing stdout at /dev/null; `flock` for the tunnel's directory locks.
 # The version tempfile already uses.
-rustix = { version = "=1.1.5", features = ["event", "fs", "process", "stdio"] }
+rustix = { version = "=1.1.6", features = ["event", "fs", "process", "stdio"] }
 
 [target.'cfg(windows)'.dependencies]
 # The askpass pipe's security descriptor (src/pipe_security.rs): the one copy of that Win32 code,

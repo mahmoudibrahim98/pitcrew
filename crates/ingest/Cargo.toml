@@ -19,7 +19,7 @@ rusqlite.workspace = true
 [target.'cfg(unix)'.dependencies]
 # `O_NOFOLLOW` and `O_NONBLOCK` when opening a transcript (`src/open.rs`), without unsafe code.
 # The version `pitcrew-auth` and `pitcrew-cli` already use.
-rustix = { version = "=1.1.5", features = ["fs"] }
+rustix = { version = "=1.1.6", features = ["fs"] }
 
 [dev-dependencies]
 pitcrew-fixtures.workspace = true
@@ -29,7 +29,7 @@ tempfile.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 # The effective uid: the unreadable-file test skips itself as root, who reads anything.
-rustix = { version = "=1.1.5", features = ["process"] }
+rustix = { version = "=1.1.6", features = ["process"] }
 
 [lints]
 workspace = true
