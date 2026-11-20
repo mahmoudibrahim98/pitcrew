@@ -29,7 +29,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 # Process groups and signals for kill, waiting without reaping (`waitid` with `WNOWAIT`),
 # `setsid`, and the lock file (`flock`, opened without following links), without unsafe code.
 # The version pitcrew-runtime and tempfile already use.
-rustix = { version = "=1.1.5", features = ["fs", "process"] }
+rustix = { version = "=1.1.6", features = ["fs", "process"] }
 
 [dev-dependencies]
 pitcrew-interfaces.workspace = true
