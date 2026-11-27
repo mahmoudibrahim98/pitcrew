@@ -22,7 +22,7 @@ ulid.workspace = true
 # `statfs` for filesystem detection, `uname` for the lease's host name, and a liveness check
 # (`kill(pid, 0)`) for the same-host pid-gone takeover, all without unsafe code. The exact version
 # `pitcrew-auth` already pins; we add the `system` feature it does not need (for `uname`).
-rustix = { version = "=1.1.5", features = ["fs", "process", "system"] }
+rustix = { version = "=1.1.6", features = ["fs", "process", "system"] }
 
 [dev-dependencies]
 pitcrew-fixtures.workspace = true
